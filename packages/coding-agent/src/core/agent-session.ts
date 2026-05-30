@@ -2157,13 +2157,22 @@ export class AgentSession {
 	 * function imported from `./compaction/index.ts`, unless the hook cancels or
 	 * supplies a custom result.
 	 *
-	 * Aborts the current agent operation first. Manual compaction never retries or
-	 * continues the interrupted agent turn.
+	 * Aborts the current agent operation first only when it is streaming. When the
+	 * agent is idle, compaction runs in-place without disconnecting or aborting.
+	 * The optional captured state avoids a deferred extension microtask observing
+	 * a newly-started stream and aborting it.
 	 *
 	 * @param customInstructions Optional instructions for the compaction summary
+	 * @param _capturedIsStreaming Pass from ctx.compact() to avoid the race where
+	 *   a deferred microtask runs after the agent has started its next LLM call.
+	 *   When omitted, uses this.isStreaming (safe for /compact command).
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
-		await this.abort();
+	async compact(customInstructions?: string, _capturedIsStreaming?: boolean): Promise<CompactionResult> {
+		const _isStreaming = _capturedIsStreaming !== undefined ? _capturedIsStreaming : this.isStreaming;
+		if (_isStreaming) {
+			this._disconnectFromAgent();
+			await this.abort();
+		}
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
@@ -2859,9 +2868,16 @@ export class AgentSession {
 				},
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
+					// Capture isStreaming synchronously while still inside the event
+					// handler (turn_end, agent_end, etc.). The microtask below may
+					// fire after the agent has already started its next LLM call,
+					// at which point this.isStreaming would be true — causing an
+					// unnecessary abort. Passing the captured value avoids this race.
+					const _capturedIsStreaming = this.isStreaming;
 					void (async () => {
+						if (this.isCompacting) return;
 						try {
-							const result = await this.compact(options?.customInstructions);
+							const result = await this.compact(options?.customInstructions, _capturedIsStreaming);
 							options?.onComplete?.(result);
 						} catch (error) {
 							const err = error instanceof Error ? error : new Error(String(error));
