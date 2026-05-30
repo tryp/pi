@@ -2616,9 +2616,13 @@ export class AgentSession {
 				return true;
 			}
 
-			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-			// Continue once so queued messages are delivered.
-			return this.agent.hasQueuedMessages();
+			// After successful threshold compaction, always continue the agent so its
+			// current task isn't interrupted mid-turn. The overflow path (willRetry=true)
+			// already returns true above — threshold should behave the same way.
+			// A simple this.agent.hasQueuedMessages() check here would stop the agent
+			// loop when no follow-up/steer messages are queued, dropping the session
+			// to the TUI prompt during active work.
+			return true;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			if (started) {
