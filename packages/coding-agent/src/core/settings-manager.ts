@@ -11,6 +11,7 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	maxContextTokens?: number; // if set, absolute threshold (model-independent)
 }
 
 export interface BranchSummarySettings {
@@ -774,11 +775,16 @@ export class SettingsManager {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	getCompactionMaxContextTokens(): number | undefined {
+		return this.settings.compaction?.maxContextTokens;
+	}
+
+	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number; maxContextTokens?: number } {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+			maxContextTokens: this.getCompactionMaxContextTokens(),
 		};
 	}
 
