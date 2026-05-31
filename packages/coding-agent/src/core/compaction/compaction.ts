@@ -127,12 +127,14 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	maxContextTokens?: number;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	maxContextTokens: undefined,
 };
 
 // ============================================================================
@@ -234,6 +236,12 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
+	// If maxContextTokens is set, use it as an absolute threshold (model-independent).
+	// This allows triggering compaction at a fixed token level regardless of the
+	// model's context window (e.g., compact at 180k whether model has 200k or 1M context).
+	if (settings.maxContextTokens != null) {
+		return contextTokens > settings.maxContextTokens;
+	}
 	return contextTokens > contextWindow - settings.reserveTokens;
 }
 
