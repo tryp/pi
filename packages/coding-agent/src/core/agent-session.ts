@@ -2040,9 +2040,15 @@ export class AgentSession {
 				return true;
 			}
 
-			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-			// Continue once so queued messages are delivered.
-			return this.agent.hasQueuedMessages();
+			// After threshold compaction, only continue if the agent can resume.
+			// If the last message is assistant and there are no queued steer/followup
+			// messages, continue() would throw. Let the turn end normally instead.
+			const msgs = this.agent.state.messages;
+			const last = msgs[msgs.length - 1];
+			if (last?.role !== "assistant" || this.agent.hasQueuedMessages()) {
+				return true;
+			}
+			return false;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			this._emit({
