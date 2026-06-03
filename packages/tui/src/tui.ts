@@ -1159,7 +1159,10 @@ export class TUI extends Container {
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			if (clear) {
 				buffer += this.deleteKittyImages(this.previousKittyImageIds);
-				buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
+				// Clear screen and home.  Deliberately omit \x1b[3J (clear scrollback)
+				// because it destroys tmux scrollback history.  The visible screen
+				// clear (\x1b[2J) combined with the full redraw below is sufficient.
+				buffer += "\x1b[2J\x1b[H";
 			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
