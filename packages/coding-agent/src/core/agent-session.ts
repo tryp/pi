@@ -29,9 +29,11 @@ import type {
 	AssistantMessage,
 	AuthResult,
 	ImageContent,
+	Message,
 	Model,
 	ProviderHeaders,
 	TextContent,
+	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import {
@@ -346,6 +348,12 @@ export class AgentSession {
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
+
+	/**
+	 * Track job IDs that have been reported as completed or killed in `jobs list` output.
+	 * Used to filter stale entries so completed/killed jobs are only shown once.
+	 */
+	private _reportedCompletedOrKilledJobs: Set<string> = new Set();
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
 	private _excludedToolNames?: Set<string>;
@@ -637,6 +645,10 @@ export class AgentSession {
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
+				// Filter stale completed/killed jobs from `jobs list` output
+				if (event.message.role === "toolResult") {
+					this._filterStaleJobListEntries(event.message);
+				}
 				// Regular LLM message - persist as SessionMessageEntry
 				this.sessionManager.appendMessage(event.message);
 			}
@@ -706,6 +718,62 @@ export class AgentSession {
 			delete targetRecord[key];
 		}
 		Object.assign(targetRecord, replacement);
+	}
+
+	/**
+	 * Filter stale completed/killed job entries from `jobs list` tool output.
+	 * Once a job has been reported as completed or killed, subsequent `jobs list`
+	 * calls should hide it to reduce noise. A compact summary line is added instead.
+	 */
+	private _filterStaleJobListEntries(message: { toolName?: string; content: (TextContent | ImageContent)[] }): void {
+		if (message.toolName !== "jobs") return;
+
+		// Build the full text from content blocks
+		const textParts: string[] = [];
+		for (const block of message.content) {
+			if (block.type === "text") {
+				textParts.push(block.text);
+			}
+		}
+		if (textParts.length === 0) return;
+
+		const lines = textParts.join("").split("\n");
+		const filteredLines: string[] = [];
+		let hiddenCount = 0;
+
+		// Match job status lines: "  job-XXX-YYY: ... - ✅ completed" or "  - ❌/🛑/⏹ killed"
+		const jobLineRe = /^\s*(job-\d+-\d+):.*[-]\s+(✅\s*completed|❌\s+killed|🛑\s+killed|⏹\s+killed)/;
+
+		for (const line of lines) {
+			const match = line.match(jobLineRe);
+			if (match) {
+				const jobId = match[1];
+				if (this._reportedCompletedOrKilledJobs.has(jobId)) {
+					// Already reported — suppress this line
+					hiddenCount++;
+					continue;
+				}
+				// First time seeing this completed/killed job — record it
+				this._reportedCompletedOrKilledJobs.add(jobId);
+			}
+			filteredLines.push(line);
+		}
+
+		if (hiddenCount === 0) return;
+
+		// Add a compact summary line if we hid something
+		// Insert it after the header, before the first job entry
+		// For now just add at the beginning of output
+		const summary = `  (${hiddenCount} previously reported completed/killed job${hiddenCount > 1 ? "s" : ""} hidden)\n`;
+
+		// Rebuild the content
+		const newText = summary + filteredLines.join("\n");
+		for (const block of message.content) {
+			if (block.type === "text") {
+				block.text = newText;
+				break;
+			}
+		}
 	}
 
 	/** Emit extension events based on agent events */

@@ -1174,6 +1174,15 @@ export class SessionManager {
 		display: boolean,
 		details?: T,
 	): string {
+		// Strip command duplication from job-completion messages.
+		// The command text appears in both `content` (for display) and `details.command` (structured).
+		// Keep only the first-line summary in content to reduce session log bloat.
+		if (customType === "job-completion" && typeof content === "string" && details && (details as any).command) {
+			const firstNewline = content.indexOf("\n");
+			if (firstNewline !== -1) {
+				content = content.substring(0, firstNewline);
+			}
+		}
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
 			customType,
