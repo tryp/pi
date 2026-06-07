@@ -213,7 +213,6 @@ export function createReadToolDefinition(
 		promptSnippet: "Read file contents",
 		promptGuidelines: [
 			"Use read to examine files instead of cat or sed.",
-			"Do NOT use read for discovering file structure (functions, classes, variables, imports). Use lsp_document_symbols first — it is cheaper (~30 tokens vs ~300+) and returns structure directly. Only read specific line ranges after you know what to look for.",
 		],
 		parameters: readSchema,
 		async execute(
