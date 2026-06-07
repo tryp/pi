@@ -101,6 +101,80 @@ tmux send-keys -t pi-test Escape               # special keys (also C-o for ctrl
 tmux kill-session -t pi-test
 ```
 
+## Local Development Workflow
+
+### Build
+
+From the repo root, run the full build chain (tui -> ai -> agent -> coding-agent):
+
+```bash
+npm run build
+```
+
+Or build individual packages:
+
+```bash
+cd packages/agent && npm run build     # pi-agent-core (npm dependency)
+cd packages/coding-agent && npm run build  # pi binary dist
+```
+
+The coding-agent build outputs to `packages/coding-agent/dist/`.
+
+### Deploy (local dev build)
+
+The `pi` binary resolves to `/home/dev/.pi/local/pi-coding-agent/dist/cli.js` via symlink.
+Copy the build output there:
+
+```bash
+rsync -a packages/coding-agent/dist/ /home/dev/.pi/local/pi-coding-agent/dist/
+```
+
+### Test during development
+
+**Unit tests** (compaction, estimation, serialization):
+
+```bash
+# Quick edge-case test against the deployed module directly
+node -e "
+const { estimateContextTokens } = require('/home/dev/.pi/local/pi-coding-agent/dist/core/compaction/compaction.js');
+// Test with string content (common runtime edge case)
+const result = estimateContextTokens([
+  { role: 'assistant', content: 'string response' },
+]);
+console.log(result.tokens);
+"
+```
+
+**Full test suite:**
+
+```bash
+cd packages/coding-agent && node ../../node_modules/vitest/dist/cli.js --run test/path/to/specific.test.ts
+```
+
+**Smoke test via serve API:**
+
+```bash
+# Start pi in serve mode on a free port
+PI_SERVE_PORT=4199 pi -p "test" &
+sleep 5
+curl http://127.0.0.1:4199/health
+# Kill when done
+kill %1
+```
+
+The serve API registers an `lsp` command (visible in startup logs) for integration testing.
+
+### Extensions
+
+Extensions are discovered from `~/.pi/agent/extensions/`. To test a local extension:
+
+```bash
+pi --extension /path/to/my-extension.ts -p "test prompt"
+```
+
+Extension CLI flags (e.g. `--serve-port`) come from loaded extensions; they are unavailable
+when running with `--no-extensions`.
+
 ## Changelog
 
 Location: `packages/*/CHANGELOG.md` (one per package).
