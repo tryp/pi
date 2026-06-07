@@ -2596,10 +2596,16 @@ export class AgentSession {
 				})
 				.filter((entry): entry is readonly [string, string] => entry !== undefined),
 		);
+		// Merge extension-contributed prompt guidelines into tool definitions.
+		// Extensions use registerToolPromptGuidelines to add relative guidance
+		// about core tools (e.g., LSP guidelines for the read tool).
+		const extensionContributions = this._extensionRunner.getToolPromptGuidelineContributions();
 		this._toolPromptGuidelines = new Map(
 			Array.from(definitionRegistry.values())
 				.map(({ definition }) => {
-					const guidelines = this._normalizePromptGuidelines(definition.promptGuidelines);
+					const own = this._normalizePromptGuidelines(definition.promptGuidelines);
+					const contributed = extensionContributions.get(definition.name) ?? [];
+					const guidelines = this._normalizePromptGuidelines([...own, ...contributed]);
 					return guidelines.length > 0 ? ([definition.name, guidelines] as const) : undefined;
 				})
 				.filter((entry): entry is readonly [string, string[]] => entry !== undefined),
