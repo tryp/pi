@@ -775,10 +775,14 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		role: "toolResult",
 		toolCallId: finalized.toolCall.id,
 		toolName: finalized.toolCall.name,
-		// Untyped tools (JS extensions) can return results without content; normalize
-		// so the null never enters session history or provider payloads.
-		content: finalized.result.content ?? [],
-		details: finalized.result.details,
+		content: Array.isArray(finalized.result.content)
+			? finalized.result.content
+			: typeof finalized.result.content === "string"
+				? [{ type: "text", text: finalized.result.content }]
+				: typeof finalized.result === "string"
+					? [{ type: "text", text: finalized.result }]
+					: [{ type: "text", text: String(finalized.result?.content ?? finalized.result ?? "") }],
+		details: finalized.result.details ?? {},
 		isError: finalized.isError,
 		timestamp: Date.now(),
 	};

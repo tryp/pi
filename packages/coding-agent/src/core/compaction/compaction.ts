@@ -277,10 +277,6 @@ export function estimateTokens(message: AgentMessage): number {
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
-			if (typeof assistant.content === "string") {
-				chars = assistant.content.length;
-				return Math.ceil(chars / 4);
-			}
 			if (!Array.isArray(assistant.content)) {
 				return 0;
 			}
