@@ -692,6 +692,18 @@ export class AgentSession {
 		return false;
 	}
 
+	/** Extract text content from a message */
+	private _getUserMessageText(message: Message): string {
+		if (message.role !== "user") return "";
+		const content = message.content;
+		if (typeof content === "string") return content;
+		if (Array.isArray(content)) {
+			const textBlocks = content.filter((c) => c.type === "text");
+			return textBlocks.map((c) => (c as TextContent).text).join("");
+		}
+		return "";
+	}
+
 	/** Find the last assistant message in agent state (including aborted ones) */
 	private _findLastAssistantMessage(): AssistantMessage | undefined {
 		const messages = this.agent.state.messages;
@@ -727,6 +739,7 @@ export class AgentSession {
 	 */
 	private _filterStaleJobListEntries(message: { toolName?: string; content: (TextContent | ImageContent)[] }): void {
 		if (message.toolName !== "jobs") return;
+		if (!Array.isArray(message.content)) return;
 
 		// Build the full text from content blocks
 		const textParts: string[] = [];
@@ -1547,7 +1560,7 @@ export class AgentSession {
 
 		if (typeof content === "string") {
 			text = content;
-		} else {
+		} else if (Array.isArray(content)) {
 			const textParts: string[] = [];
 			images = [];
 			for (const part of content) {
@@ -1559,6 +1572,10 @@ export class AgentSession {
 			}
 			text = textParts.join("\n");
 			if (images.length === 0) images = undefined;
+		} else {
+			// Defensive: non-iterable content from extension callers
+			text = String(content);
+			images = undefined;
 		}
 
 		// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
@@ -3371,16 +3388,19 @@ export class AgentSession {
 				if (m.role !== "assistant") return false;
 				const msg = m as AssistantMessage;
 				// Skip aborted messages with no content
+				if (!Array.isArray(msg.content)) return false;
 				if (msg.stopReason === "aborted" && msg.content.length === 0) return false;
 				return true;
 			});
 
 		if (!lastAssistant) return undefined;
+		const content = (lastAssistant as AssistantMessage).content;
+		if (!Array.isArray(content)) return undefined;
 
 		let text = "";
-		for (const content of (lastAssistant as AssistantMessage).content) {
-			if (content.type === "text") {
-				text += content.text;
+		for (const block of content) {
+			if (block.type === "text") {
+				text += block.text;
 			}
 		}
 
