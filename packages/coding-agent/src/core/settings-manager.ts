@@ -92,6 +92,7 @@ export interface Settings {
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
 	externalEditor?: string; // Command for Ctrl+G external editor; takes precedence over VISUAL/EDITOR
+	hideQueuePanel?: boolean;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
 	defaultProjectTrust?: DefaultProjectTrust; // default: "ask"; global setting only
@@ -843,6 +844,16 @@ export class SettingsManager {
 
 	getWebSocketConnectTimeoutMs(): number | undefined {
 		return parseTimeoutSetting(this.settings.websocketConnectTimeoutMs, "websocketConnectTimeoutMs");
+	}
+
+	getHideQueuePanel(): boolean {
+		return this.settings.hideQueuePanel ?? true;
+	}
+
+	setHideQueuePanel(hide: boolean): void {
+		this.globalSettings.hideQueuePanel = hide;
+		this.markModified("hideQueuePanel");
+		this.save();
 	}
 
 	getHideThinkingBlock(): boolean {
