@@ -606,9 +606,16 @@ async function prepareToolCall(
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
 	if (!tool) {
+		const availableTools = currentContext.tools
+			?.map((t) => t.name)
+			.sort()
+			.join(", ");
+		const msg = availableTools
+			? `Tool "${toolCall.name}" not found. Available tools: ${availableTools}.`
+			: `Tool "${toolCall.name}" not found.`;
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			result: createErrorToolResult(msg),
 			isError: true,
 		};
 	}
