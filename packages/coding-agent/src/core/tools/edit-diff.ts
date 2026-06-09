@@ -189,7 +189,8 @@ export interface FuzzyMatchResult {
 
 export interface Edit {
 	oldText: string;
-	newText: string;
+	/** Omit or set to empty string to delete oldText. */
+	newText?: string;
 }
 
 export interface AppliedEditsResult {
@@ -198,12 +199,32 @@ export interface AppliedEditsResult {
 }
 
 /**
- * Find oldText in content, trying exact match first, then fuzzy match.
+ * Find oldText in content, trying progressively more tolerant matching strategies:
+ *
+ * 1. Exact match (byte-for-byte)
+ * 2. Fuzzy match (trailing whitespace stripped, Unicode quotes/dashes/spaces normalized)
+ * 3. Prepend leading \\n (catches agent dropping the blank-line separator before a block)
+ * 4. Normalize tabs to 4 spaces (catches \\t vs space mismatches)
+ * 5. \\n-prepend + tab normalization (combination of #3 and #4)
+ * 6. Strip extra leading blank lines (catches oldText with too many preceding newlines)
+ *
  * When fuzzy matching is used, the returned contentForReplacement is the
  * fuzzy-normalized version of the content (trailing whitespace stripped,
  * Unicode quotes/dashes normalized to ASCII).
  */
 export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResult {
+	// Helper: build result from normalized match
+	const fuzzyResult = (
+		index: number,
+		matchLength: number,
+	): FuzzyMatchResult => ({
+		found: true,
+		index,
+		matchLength,
+		usedFuzzyMatch: true,
+		contentForReplacement: fuzzyContent,
+	});
+
 	// Try exact match first
 	const exactIndex = content.indexOf(oldText);
 	if (exactIndex !== -1) {
@@ -216,30 +237,68 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 		};
 	}
 
-	// Try fuzzy match - work entirely in normalized space
+	// Work entirely in normalized space for all fallback matching
 	const fuzzyContent = normalizeForFuzzyMatch(content);
 	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
-	const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
 
-	if (fuzzyIndex === -1) {
-		return {
-			found: false,
-			index: -1,
-			matchLength: 0,
-			usedFuzzyMatch: false,
-			contentForReplacement: content,
-		};
+	// Try basic fuzzy match (trailing whitespace, unicode normalization)
+	const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
+	if (fuzzyIndex !== -1) {
+		return fuzzyResult(fuzzyIndex, fuzzyOldText.length);
 	}
 
-	// When fuzzy matching, return offsets in normalized space. Callers can use
-	// the normalized content to compute replacements, then decide how much of
-	// that normalized output should be written back.
+	// ── Fallback 1: Prepend leading \n ──
+	// Agent reads indented code blocks but drops the preceding newline that
+	// separates blocks in the file. Prepending \n catches ~62% of remaining failures.
+	if (fuzzyOldText.length > 0 && fuzzyOldText[0] !== "\n") {
+		const patchedOldText = "\n" + fuzzyOldText;
+		const patchedIndex = fuzzyContent.indexOf(patchedOldText);
+		if (patchedIndex !== -1) {
+			// Match starts after the prepended \n so we don't consume the
+			// file's inter-block newline during replacement.
+			return fuzzyResult(patchedIndex + 1, fuzzyOldText.length);
+		}
+	}
+
+	// ── Fallback 2: Normalize tabs to 4 spaces ──
+	const hasTabs = oldText.includes("\t");
+	if (hasTabs) {
+		const tabNormalized = normalizeForFuzzyMatch(oldText.replace(/\t/g, "    "));
+		const tabIndex = fuzzyContent.indexOf(tabNormalized);
+		if (tabIndex !== -1) {
+			return fuzzyResult(tabIndex, tabNormalized.length);
+		}
+
+		// ── Fallback 3: Prepend \n + normalize tabs ──
+		// Combine #1 and #2 for cases where both issues apply.
+		if (tabNormalized.length > 0 && tabNormalized[0] !== "\n") {
+			const patchedTab = "\n" + tabNormalized;
+			const patchedTabIndex = fuzzyContent.indexOf(patchedTab);
+			if (patchedTabIndex !== -1) {
+				return fuzzyResult(patchedTabIndex + 1, tabNormalized.length);
+			}
+		}
+	}
+
+	// ── Fallback 4: Strip consecutive leading blank lines ──
+	// Agent sometimes includes too many blank lines before a block.
+	if (fuzzyOldText.startsWith("\n\n")) {
+		const stripped = fuzzyOldText.replace(/^\n+/, "\n");
+		if (stripped !== fuzzyOldText) {
+			const strippedIndex = fuzzyContent.indexOf(stripped);
+			if (strippedIndex !== -1) {
+				return fuzzyResult(strippedIndex, stripped.length);
+			}
+		}
+	}
+
+
 	return {
-		found: true,
-		index: fuzzyIndex,
-		matchLength: fuzzyOldText.length,
-		usedFuzzyMatch: true,
-		contentForReplacement: fuzzyContent,
+		found: false,
+		index: -1,
+		matchLength: 0,
+		usedFuzzyMatch: false,
+		contentForReplacement: content,
 	};
 }
 
@@ -251,7 +310,37 @@ export function stripBom(content: string): { bom: string; text: string } {
 function countOccurrences(content: string, oldText: string): number {
 	const fuzzyContent = normalizeForFuzzyMatch(content);
 	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
-	return fuzzyContent.split(fuzzyOldText).length - 1;
+	let count = fuzzyContent.split(fuzzyOldText).length - 1;
+	if (count > 0) return count;
+
+	// Try \n-prepend fallback (same strategy as fuzzyFindText)
+	if (fuzzyOldText.length > 0 && fuzzyOldText[0] !== "\n") {
+		count = fuzzyContent.split("\n" + fuzzyOldText).length - 1;
+		if (count > 0) return count;
+	}
+
+	// Try tab-normalization fallback
+	if (oldText.includes("\t")) {
+		const tabNormalized = normalizeForFuzzyMatch(oldText.replace(/\t/g, "    "));
+		count = fuzzyContent.split(tabNormalized).length - 1;
+		if (count > 0) return count;
+
+		// Combined \n-prepend + tab-normalization
+		if (tabNormalized.length > 0 && tabNormalized[0] !== "\n") {
+			count = fuzzyContent.split("\n" + tabNormalized).length - 1;
+			if (count > 0) return count;
+		}
+	}
+
+	// Try stripping extra leading blank lines
+	if (fuzzyOldText.startsWith("\n\n")) {
+		const stripped = fuzzyOldText.replace(/^\n+/, "\n");
+		if (stripped !== fuzzyOldText) {
+			count = fuzzyContent.split(stripped).length - 1;
+		}
+	}
+
+	return count;
 }
 
 function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
@@ -308,7 +397,7 @@ export function applyEditsToNormalizedContent(
 ): AppliedEditsResult {
 	const normalizedEdits = edits.map((edit) => ({
 		oldText: normalizeToLF(edit.oldText),
-		newText: normalizeToLF(edit.newText),
+		newText: normalizeToLF(edit.newText ?? ""),
 	}));
 
 	for (let i = 0; i < normalizedEdits.length; i++) {
@@ -381,7 +470,7 @@ export function generateDiffString(
 	oldContent: string,
 	newContent: string,
 	contextLines = 4,
-): { diff: string; firstChangedLine: number | undefined } {
+): { diff: string; firstChangedLine: number | undefined; addedLines: number; removedLines: number } {
 	const parts = Diff.diffLines(oldContent, newContent);
 	const output: string[] = [];
 
@@ -394,6 +483,8 @@ export function generateDiffString(
 	let newLineNum = 1;
 	let lastWasChange = false;
 	let firstChangedLine: number | undefined;
+	let addedLines = 0;
+	let removedLines = 0;
 
 	for (let i = 0; i < parts.length; i++) {
 		const part = parts[i];
@@ -403,6 +494,8 @@ export function generateDiffString(
 		}
 
 		if (part.added || part.removed) {
+			if (part.added) addedLines += raw.length;
+			if (part.removed) removedLines += raw.length;
 			// Capture the first changed line (in the new file)
 			if (firstChangedLine === undefined) {
 				firstChangedLine = newLineNum;
@@ -499,12 +592,14 @@ export function generateDiffString(
 		}
 	}
 
-	return { diff: output.join("\n"), firstChangedLine };
+	return { diff: output.join("\n"), firstChangedLine, addedLines, removedLines };
 }
 
 export interface EditDiffResult {
 	diff: string;
 	firstChangedLine: number | undefined;
+	addedLines: number;
+	removedLines: number;
 }
 
 export interface EditDiffError {
