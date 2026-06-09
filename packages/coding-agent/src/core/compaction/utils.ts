@@ -2,6 +2,7 @@
  * Shared utilities for compaction and branch summarization.
  */
 
+import { readFileSync, statSync } from "fs";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { contentText, type Message } from "@earendil-works/pi-ai";
 
@@ -66,13 +67,50 @@ export function computeFileLists(fileOps: FileOperations): { readFiles: string[]
 	return { readFiles: readOnly, modifiedFiles };
 }
 
+/** Maximum file bytes to inline in read-files. Files above this threshold
+ * are listed by path only to avoid bloat. */
+const MAX_INLINE_FILE_SIZE = 5 * 1024;
+
+/** Maximum files to inline per compaction to prevent unbounded growth. */
+const MAX_INLINE_COUNT = 20;
+
+/**
+ * Try to read a small file's content for inlining in the compaction summary.
+ * Returns null if the file is too large, doesn't exist, or is unreadable.
+ */
+function readSmallFile(path: string): string | null {
+	try {
+		const st = statSync(path, { throwIfNoEntry: false });
+		if (!st || !st.isFile()) return null;
+		if (st.size > MAX_INLINE_FILE_SIZE) return null;
+		return readFileSync(path, "utf-8");
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Format file operations as XML tags for summary.
+ * For small read-only files, the actual content is inlined so the LLM
+ * doesn't need to re-read them after compaction.
  */
 export function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
 	const sections: string[] = [];
 	if (readFiles.length > 0) {
-		sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
+		const lines: string[] = [];
+		let inlined = 0;
+		for (const f of readFiles) {
+			if (inlined < MAX_INLINE_COUNT) {
+				const content = readSmallFile(f);
+				if (content !== null) {
+					lines.push(`---\npath: ${f}\n---\n${content}\n---`);
+					inlined++;
+					continue;
+				}
+			}
+			lines.push(f);
+		}
+		sections.push(`<read-files>\n${lines.join("\n\n")}\n</read-files>`);
 	}
 	if (modifiedFiles.length > 0) {
 		sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);

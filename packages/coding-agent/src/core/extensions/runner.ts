@@ -747,6 +747,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				runner.shutdownHandler();
 			},
+			reload: () => {
+				runner.assertActive();
+				return runner.reloadHandler();
+			},
 			getContextUsage: () => {
 				runner.assertActive();
 				return runner.getContextUsageFn();
@@ -793,10 +797,6 @@ export class ExtensionRunner {
 		context.switchSession = (sessionPath, options) => {
 			this.assertActive();
 			return this.switchSessionHandler(sessionPath, options);
-		};
-		context.reload = () => {
-			this.assertActive();
-			return this.reloadHandler();
 		};
 		return context;
 	}

@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter } from "node:path";
 import { spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.ts";
@@ -176,15 +176,67 @@ export function sanitizeBinaryOutput(str: string): string {
 /**
  * Detached child processes must be tracked so they can be killed on parent
  * shutdown signals (SIGHUP/SIGTERM).
+ *
+ * PIDs are persisted to a companion file so orphaned processes survive
+ * pi process crashes and can be cleaned up on session restore.
  */
 const trackedDetachedChildPids = new Set<number>();
 
+/**
+ * Companion file path for persisting tracked PIDs across pi process restarts.
+ * Set by setDetachedPidFilePath() in session-manager.ts.
+ * Format: one PID per line.
+ */
+let persistedPidFilePath: string | undefined;
+
+/**
+ * Register the companion file path for PID persistence.
+ * On call, loads any existing PIDs from the file into the tracking set.
+ */
+export function setDetachedPidFilePath(filePath: string): void {
+	persistedPidFilePath = filePath;
+	loadPersistedPids();
+}
+
+/** Load PIDs from the companion file into the tracking set. */
+function loadPersistedPids(): void {
+	if (!persistedPidFilePath) return;
+	try {
+		const data = readFileSync(persistedPidFilePath, "utf-8").trim();
+		if (data) {
+			for (const line of data.split("\n")) {
+				const pid = Number(line);
+				if (!isNaN(pid)) trackedDetachedChildPids.add(pid);
+			}
+		}
+	} catch {
+		// File doesn't exist yet — nothing to load
+	}
+}
+
+/** Write the current tracking set to the companion file. */
+function persistTrackedPids(): void {
+	if (!persistedPidFilePath) return;
+	try {
+		const pids = Array.from(trackedDetachedChildPids);
+		if (pids.length === 0) {
+			writeFileSync(persistedPidFilePath, "", "utf-8");
+		} else {
+			writeFileSync(persistedPidFilePath, pids.join("\n") + "\n", "utf-8");
+		}
+	} catch {
+		// Best-effort persistence
+	}
+}
+
 export function trackDetachedChildPid(pid: number): void {
 	trackedDetachedChildPids.add(pid);
+	persistTrackedPids();
 }
 
 export function untrackDetachedChildPid(pid: number): void {
 	trackedDetachedChildPids.delete(pid);
+	persistTrackedPids();
 }
 
 export function killTrackedDetachedChildren(): void {
@@ -192,6 +244,7 @@ export function killTrackedDetachedChildren(): void {
 		killProcessTree(pid);
 	}
 	trackedDetachedChildPids.clear();
+	persistTrackedPids();
 }
 
 /**

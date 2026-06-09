@@ -18,6 +18,7 @@ import { join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
+import { killTrackedDetachedChildren, setDetachedPidFilePath } from "../utils/shell.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import {
 	type BashExecutionMessage,
@@ -394,9 +395,20 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		return [message];
 	}
 	if (entry.type === "custom_message") {
-		return [
-			createCustomMessage(entry.customType, entry.content ?? [], entry.display, entry.details, entry.timestamp),
-		];
+		// Skip ephemeral notification types — they were delivered
+		// in real-time and become stale noise on session restore/fork.
+		// auto_diag: transient LSP diagnostics, stale on next edit.
+		// subagent-notify / subagent_control_notice: subagent lifecycle,
+		//   orchestrations are complete on restore.
+		// pi-memory-context: memory injection, re-injected fresh on restore.
+		if (
+			entry.customType === "job-completion" ||
+			entry.customType === "auto_diag" ||
+			entry.customType === "subagent-notify" ||
+			entry.customType === "subagent_control_notice" ||
+			entry.customType === "pi-memory-context"
+		) return [];
+		return [createCustomMessage(entry.customType, entry.content ?? [], entry.display, entry.details, entry.timestamp)];
 	}
 	if (entry.type === "branch_summary" && entry.summary) {
 		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
@@ -894,6 +906,7 @@ export class SessionManager {
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
+		setDetachedPidFilePath(this.sessionFile + ".pids");
 		if (existsSync(this.sessionFile)) {
 			this.fileEntries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
 
@@ -920,6 +933,15 @@ export class SessionManager {
 
 			this._buildIndex();
 			this.flushed = true;
+
+			// Kill orphaned subprocesses from the previous session incarnation.
+			// Synchronous bash tool subprocesses are useless without their parent
+			// — the stdout/stderr pipes are dead. Orphans that hold locks, GPUs,
+			// or ports would block the restored session's own commands.
+			// Background jobs (bash_bg/agent_bg) are NOT affected: they persist
+			// their output to disk independently and are not spawned via the
+			// synchronous bash tool's detached-child path.
+			killTrackedDetachedChildren();
 		} else {
 			const explicitPath = this.sessionFile;
 			this.newSession();
@@ -951,6 +973,7 @@ export class SessionManager {
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 			this.sessionFile = join(this.getSessionDir(), `${fileTimestamp}_${this.sessionId}.jsonl`);
+			setDetachedPidFilePath(this.sessionFile + ".pids");
 		}
 		return this.sessionFile;
 	}
@@ -1472,6 +1495,7 @@ export class SessionManager {
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
+			setDetachedPidFilePath(this.sessionFile + ".pids");
 			this._buildIndex();
 
 			// Only write the file now if it contains an assistant message.

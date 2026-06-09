@@ -1883,6 +1883,7 @@ export class InteractiveMode {
 			shutdown: () => {
 				this.shutdownRequested = true;
 			},
+			reload: () => this.session.reload(),
 			getContextUsage: () => this.session.getContextUsage(),
 			compact: (options) => {
 				void (async () => {

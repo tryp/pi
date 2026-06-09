@@ -338,6 +338,8 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown pi and exit. Available in all contexts. */
 	shutdown(): void;
+	/** Reload extensions, skills, prompts, and themes. Available in all contexts. */
+	reload(): Promise<void>;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
 	/** Trigger compaction without awaiting completion. */
