@@ -18,6 +18,7 @@ import {
 import {
 	buildSessionContext,
 	type CompactionEntry,
+	type CustomMessageEntry,
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	parseSessionEntries,
@@ -102,6 +103,21 @@ function createCompactionEntry(summary: string, firstKeptEntryId: string): Compa
 		summary,
 		firstKeptEntryId,
 		tokensBefore: 10000,
+	};
+	lastId = id;
+	return entry;
+}
+
+function createCustomMessageEntry(customType: string, content: string): CustomMessageEntry {
+	const id = `test-id-${entryCounter++}`;
+	const entry: CustomMessageEntry = {
+		type: "custom_message",
+		id,
+		parentId: lastId,
+		timestamp: new Date().toISOString(),
+		customType,
+		content,
+		display: true,
 	};
 	lastId = id;
 	return entry;
@@ -424,9 +440,47 @@ describe("buildSessionContext", () => {
 		expect(loaded.model).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
 		expect(loaded.thinkingLevel).toBe("high");
 	});
+
+	it("should omit stale job-completion custom messages from context", () => {
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("before")),
+			createCustomMessageEntry("job-completion", "failed job should not re-enter context"),
+			createCustomMessageEntry("handoff", "durable custom context"),
+		];
+
+		const loaded = buildSessionContext(entries);
+		const text = extractText(loaded.messages);
+		expect(text).not.toContain("failed job should not re-enter context");
+		expect(text).toContain("durable custom context");
+	});
 });
 
 describe("prepareCompaction with previous compaction", () => {
+	it("should omit stale job-completion custom messages from summaries", () => {
+		const staleJob = createCustomMessageEntry(
+			"job-completion",
+			"stale failed job should not be summarized"
+		);
+		const durable = createCustomMessageEntry("handoff", "durable custom message should be summarized");
+		const u1 = createMessageEntry(createUserMessage("user msg 1 ".repeat(40)));
+		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1 ".repeat(40), createMockUsage(5000, 1000)));
+		const u2 = createMessageEntry(createUserMessage("recent user msg"));
+		const a2 = createMessageEntry(createAssistantMessage("recent assistant msg", createMockUsage(5000, 1000)));
+
+		const settings: CompactionSettings = {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 10,
+		};
+		const preparation = prepareCompaction([u1, staleJob, durable, a1, u2, a2], settings);
+
+		expect(preparation).toBeDefined();
+		const summarizedText = extractText([
+			...preparation!.messagesToSummarize,
+			...preparation!.turnPrefixMessages,
+		]);
+		expect(summarizedText).not.toContain("stale failed job should not be summarized");
+	});
+
 	it("should skip repeated compactions when kept messages still fit", () => {
 		const u1 = createMessageEntry(createUserMessage("user msg 1 (summarized by compaction1)"));
 		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1"));

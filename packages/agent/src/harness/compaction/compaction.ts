@@ -56,11 +56,22 @@ function extractFileOperations(
 
 	return fileOps;
 }
+function isEphemeralCustomMessage(customType: string): boolean {
+	return (
+		customType === "job-completion" ||
+		customType === "auto_diag" ||
+		customType === "subagent-notify" ||
+		customType === "subagent_control_notice" ||
+		customType === "pi-memory-context"
+	);
+}
+
 function getMessageFromEntry(entry: SessionTreeEntry): AgentMessage | undefined {
 	if (entry.type === "message") {
 		return entry.message as AgentMessage;
 	}
 	if (entry.type === "custom_message") {
+		if (isEphemeralCustomMessage(entry.customType)) return undefined;
 		return createCustomMessage(
 			entry.customType,
 			entry.content as string | (TextContent | ImageContent)[],
@@ -272,7 +283,6 @@ export function estimateTokens(message: AgentMessage): number {
 		}
 	}
 
-	return 0;
 }
 function findValidCutPoints(entries: SessionTreeEntry[], startIndex: number, endIndex: number): number[] {
 	const cutPoints: number[] = [];

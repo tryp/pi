@@ -8,13 +8,13 @@
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import { convertToLlm } from "../messages.ts";
 import {
-	convertToLlm,
-	createBranchSummaryMessage,
-	createCompactionSummaryMessage,
-	createCustomMessage,
-} from "../messages.ts";
-import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.ts";
+	buildSessionContext,
+	sessionEntryToContextMessages,
+	type CompactionEntry,
+	type SessionEntry,
+} from "../session-manager.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -77,19 +77,7 @@ function extractFileOperations(
  * Returns undefined for entries that don't contribute to LLM context.
  */
 function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
-	if (entry.type === "message") {
-		return entry.message;
-	}
-	if (entry.type === "custom_message") {
-		return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
-	}
-	if (entry.type === "branch_summary") {
-		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
-	}
-	if (entry.type === "compaction") {
-		return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
-	}
-	return undefined;
+	return sessionEntryToContextMessages(entry)[0];
 }
 
 function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | undefined {
@@ -307,7 +295,6 @@ export function estimateTokens(message: AgentMessage): number {
 		}
 	}
 
-	return 0;
 }
 
 /**

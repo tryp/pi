@@ -19,6 +19,16 @@ import type {
 } from "../types.ts";
 import { SessionError } from "../types.ts";
 
+function isEphemeralCustomMessage(customType: string): boolean {
+	return (
+		customType === "job-completion" ||
+		customType === "auto_diag" ||
+		customType === "subagent-notify" ||
+		customType === "subagent_control_notice" ||
+		customType === "pi-memory-context"
+	);
+}
+
 export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionContext {
 	let thinkingLevel = "off";
 	let model: { provider: string; modelId: string } | null = null;
@@ -44,6 +54,7 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
 		if (entry.type === "message") {
 			messages.push(entry.message as AgentMessage);
 		} else if (entry.type === "custom_message") {
+			if (isEphemeralCustomMessage(entry.customType)) return;
 			messages.push(
 				createCustomMessage(
 					entry.customType,
