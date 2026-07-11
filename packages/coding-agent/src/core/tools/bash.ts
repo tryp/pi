@@ -13,6 +13,7 @@ import {
 	getShellEnv,
 	getSurvivingChildren,
 	killProcessTree,
+	readGpuInfo,
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
@@ -21,7 +22,7 @@ import { OutputAccumulator } from "./output-accumulator.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult } from "./truncate.ts";
-import type { ProcInfo, SurvivingChild } from "../../utils/shell.ts";
+import type { GpuInfo, ProcInfo, SurvivingChild } from "../../utils/shell.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
@@ -55,6 +56,8 @@ export interface BashToolDetails {
 	survivingChildren?: SurvivingChild[];
 	/** CPU / memory / I/O data for the command's main process and its waited-for children. */
 	proc?: ProcInfo;
+	/** GPU utilization, memory, temperature, power from sysfs. */
+	gpu?: GpuInfo[];
 }
 
 /**
@@ -371,7 +374,7 @@ export function createBashToolDefinition(
 	return {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 100 lines or 10KB (whichever is hit first). Full output is saved to a temp file and the path is shown in the truncation footer. Process accounting data (CPU, RSS, I/O) is available in details.proc. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 100 lines or 10KB (whichever is hit first). Full output is saved to a temp file and the path is shown in the truncation footer. Process accounting data (CPU, RSS, I/O) is available in details.proc, GPU data in details.gpu. Optionally provide a timeout in seconds.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: bashSchema,
 		async execute(
@@ -524,6 +527,13 @@ export function createBashToolDefinition(
 
 				const snapshot = await finishOutput();
 				const { text: outputText, details } = formatOutput(snapshot, exitCode, "", survivingChildren, procData);
+
+				// Snapshot GPU state from sysfs
+				const gpuInfo = readGpuInfo();
+				if (gpuInfo.length > 0) {
+					details.gpu = gpuInfo;
+				}
+
 				if (exitCode !== 0 && exitCode !== null) {
 					throw Object.assign(new Error(outputText), { details });
 				}

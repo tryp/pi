@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { accessSync, existsSync, readFileSync, readdirSync, readlinkSync, writeFileSync } from "node:fs";
 import { delimiter } from "node:path";
 import { spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.ts";
@@ -472,4 +472,142 @@ export function readProcResourceData(pid: number): ProcInfo | null {
 	} catch {
 		return null;
 	}
+}
+
+// ─── GPU info ────────────────────────────────────────────────
+
+const GPU_VENDOR_NAMES: Record<string, string> = {
+	"0x1002": "AMD",
+	"0x8086": "Intel",
+	"0x10de": "NVIDIA",
+};
+
+/**
+ * Snapshot of GPU utilization, memory, temperature, and power
+ * read from sysfs at the end of a command.
+ */
+export interface GpuInfo {
+	/** GPU index (card0, card1, …). */
+	index: number;
+	/** Vendor name (AMD, Intel, NVIDIA) or device path. */
+	name?: string;
+	/** GPU engine utilization percent (0–100). */
+	utilizationPercent?: number;
+	/** Total VRAM in KB. */
+	memoryTotalKb?: number;
+	/** Used VRAM in KB. */
+	memoryUsedKb?: number;
+	/** Temperature in Celsius. */
+	temperatureCelsius?: number;
+	/** Power draw in watts. */
+	powerWatts?: number;
+}
+
+/**
+ * Read GPU state from sysfs for every GPU on the system.
+ *
+ * Works with any vendor that exposes standard drm device
+ * attributes under /sys/class/drm/cardN/device/.  Verified on
+ * AMD (amdgpu), also works for Intel (i915) and others.
+ */
+export function readGpuInfo(): GpuInfo[] {
+	const gpus: GpuInfo[] = [];
+	try {
+		const drmEntries = readdirSync("/sys/class/drm");
+		for (const entry of drmEntries) {
+			// Only physical cards, skip connectors (card0-DP-1, etc.)
+			if (!entry.startsWith("card") || entry.includes("-")) continue;
+
+			const deviceDir = `/sys/class/drm/${entry}/device`;
+			// Check it's a GPU and not an audio/other device
+			try {
+				accessSync(`${deviceDir}/gpu_busy_percent`);
+			} catch {
+				continue;
+			}
+
+			const index = parseInt(entry.replace("card", ""), 10);
+			const gpu: GpuInfo = { index };
+
+			try {
+				const vendor = readFileSync(`${deviceDir}/vendor`, "utf-8").trim();
+				gpu.name = GPU_VENDOR_NAMES[vendor] ?? vendor;
+			} catch {
+				// No vendor file
+			}
+
+			try {
+				gpu.utilizationPercent = parseInt(
+					readFileSync(`${deviceDir}/gpu_busy_percent`, "utf-8").trim(),
+					10,
+				);
+			} catch {
+				// busy_percent not available on this kernel
+			}
+
+			try {
+				const total = parseInt(
+					readFileSync(`${deviceDir}/mem_info_vram_total`, "utf-8").trim(),
+					10,
+				);
+				gpu.memoryTotalKb = Math.round(total / 1024);
+			} catch {
+				// No discrete VRAM (integrated GPU)
+			}
+
+			try {
+				const used = parseInt(
+					readFileSync(`${deviceDir}/mem_info_vram_used`, "utf-8").trim(),
+					10,
+				);
+				gpu.memoryUsedKb = Math.round(used / 1024);
+			} catch {
+				// No discrete VRAM
+			}
+
+			// Find matching hwmon by resolving the device symlink
+			try {
+				const realDevicePath = readlinkSync(deviceDir);
+				const hwmonEntries = readdirSync("/sys/class/hwmon");
+				for (const hwmonName of hwmonEntries) {
+					if (!hwmonName.startsWith("hwmon")) continue;
+					try {
+						const hwmonDeviceLink = readlinkSync(`/sys/class/hwmon/${hwmonName}/device`);
+						// Some hwmon devices nest deeper (e.g. amdgpu hwmon lives at
+						// a sub-path of the GPU device).  Match by prefix.
+						if (hwmonDeviceLink === realDevicePath || hwmonDeviceLink.startsWith(`${realDevicePath}/`)) {
+							try {
+								const temp = parseInt(
+									readFileSync(`/sys/class/hwmon/${hwmonName}/temp1_input`, "utf-8").trim(),
+									10,
+								);
+								gpu.temperatureCelsius = temp / 1000;
+							} catch {
+								// No temperature sensor
+							}
+							try {
+								const power = parseInt(
+									readFileSync(`/sys/class/hwmon/${hwmonName}/power1_input`, "utf-8").trim(),
+									10,
+								);
+								gpu.powerWatts = power / 1_000_000;
+							} catch {
+								// No power sensor
+							}
+							break;
+						}
+					} catch {
+						// Not a device-backed hwmon
+					}
+				}
+			} catch {
+				// Could not resolve device path
+			}
+
+			gpus.push(gpu);
+		}
+	} catch {
+		// /sys/class/drm not available or not readable
+	}
+	return gpus;
 }
