@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, readFileSync } from "node:fs";
 import { access as fsAccess } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
@@ -11,6 +11,7 @@ import { waitForChildProcess } from "../../utils/child-process.ts";
 import {
 	getShellConfig,
 	getShellEnv,
+	getSurvivingChildren,
 	killProcessTree,
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
@@ -19,7 +20,8 @@ import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/type
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
+import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult } from "./truncate.ts";
+import type { ProcInfo, SurvivingChild } from "../../utils/shell.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
@@ -47,6 +49,12 @@ export type BashToolInput = Static<typeof bashSchema>;
 export interface BashToolDetails {
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
+	/** Exit code of the command. null if killed by signal. */
+	exitCode?: number | null;
+	/** Processes spawned by this command that are still alive after it completed. */
+	survivingChildren?: SurvivingChild[];
+	/** CPU / memory / I/O data for the command's main process and its waited-for children. */
+	proc?: ProcInfo;
 }
 
 /**
@@ -70,7 +78,7 @@ export interface BashOperations {
 			timeout?: number;
 			env?: NodeJS.ProcessEnv;
 		},
-	) => Promise<{ exitCode: number | null }>;
+	) => Promise<{ exitCode: number | null; survivingChildren?: SurvivingChild[]; proc?: ProcInfo }>;
 }
 
 /**
@@ -108,8 +116,65 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 			if (child.pid) trackDetachedChildPid(child.pid);
 			let timedOut = false;
 			let timeoutHandle: NodeJS.Timeout | undefined;
+			let procData: ProcInfo | undefined;
+			let resourceSampleTimer: NodeJS.Timeout | undefined;
+
+			// Periodically sample /proc/<pid>/stat while the process is alive.
+			// The process is reaped by Node before the \`exit\` event fires, so
+			// we cannot read /proc after it completes.  Sampling every 200ms
+			// captures the last known state, including peak RSS.
+			if (child.pid !== undefined) {
+				const pid = child.pid;
+				const sampleResource = () => {
+					try {
+						const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+						const closeParen = stat.lastIndexOf(")");
+						if (closeParen === -1) return;
+						const parts = stat.slice(closeParen + 2).split(" ");
+						if (parts.length < 22) return;
+
+						const utime = parseInt(parts[11], 10) || 0;
+						const stime = parseInt(parts[12], 10) || 0;
+						const cutime = parseInt(parts[13], 10) || 0;
+						const cstime = parseInt(parts[14], 10) || 0;
+						const rssPages = parseInt(parts[21], 10) || 0;
+
+						// Total CPU time: process + waited-for children
+						const cpuMs = ((utime + stime + cutime + cstime) / 100) * 1000;
+
+						// Take the max RSS across samples (peak resident memory)
+						const rssKb = rssPages * 4;
+						if (!procData || rssKb > procData.maxRssKb) {
+							const prev = procData;
+							procData = {
+								cpuTimeMs: prev ? prev.cpuTimeMs : cpuMs,
+								maxRssKb: rssKb,
+								virtualSizeKb: Math.round((parseInt(parts[20], 10) || 0) / 1024),
+								majorFaults: parseInt(parts[9], 10) || 0,
+								minorFaults: parseInt(parts[7], 10) || 0,
+							};
+						} else {
+							// RSS didn't peak, but CPU is still accumulating
+							procData.cpuTimeMs = cpuMs;
+						}
+					} catch {
+						// Process may have exited
+					}
+				};
+
+				// Take an initial sample, then sample every 200ms
+				sampleResource();
+				resourceSampleTimer = setInterval(sampleResource, 200).unref();
+			}
+
+			const destroyPipes = () => {
+				child.stdout?.destroy();
+				child.stderr?.destroy();
+			};
+
 			const onAbort = () => {
 				if (child.pid) killProcessTree(child.pid);
+				destroyPipes();
 			};
 
 			try {
@@ -118,6 +183,7 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
 						if (child.pid) killProcessTree(child.pid);
+						destroyPipes();
 					}, timeoutMs);
 				}
 				// Stream stdout and stderr.
@@ -131,16 +197,23 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 				// Handle shell spawn errors and wait for the process to terminate without hanging
 				// on inherited stdio handles held by detached descendants.
 				const exitCode = await waitForChildProcess(child);
+
+				// Capture any processes that survived in our process group
+				const survivingChildren = child.pid
+					? getSurvivingChildren(child.pid, child.pid)
+					: undefined;
+
 				if (signal?.aborted) {
 					throw new Error("aborted");
 				}
 				if (timedOut) {
 					throw new Error(`timeout:${timeout}`);
 				}
-				return { exitCode };
+				return { exitCode, survivingChildren, proc: procData };
 			} finally {
 				if (child.pid) untrackDetachedChildPid(child.pid);
 				if (timeoutHandle) clearTimeout(timeoutHandle);
+				if (resourceSampleTimer) clearInterval(resourceSampleTimer);
 				if (signal) signal.removeEventListener("abort", onAbort);
 			}
 		},
@@ -298,7 +371,7 @@ export function createBashToolDefinition(
 	return {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 100 lines or 10KB (whichever is hit first). Full output is saved to a temp file and the path is shown in the truncation footer. Process accounting data (CPU, RSS, I/O) is available in details.proc. Optionally provide a timeout in seconds.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		parameters: bashSchema,
 		async execute(
@@ -310,7 +383,7 @@ export function createBashToolDefinition(
 		) {
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
-			const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
+			const output = new OutputAccumulator({ tempFilePrefix: "pi-bash", maxLines: 100, maxBytes: 10 * 1024 });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
 			let updateDirty = false;
@@ -372,30 +445,59 @@ export function createBashToolDefinition(
 				return snapshot;
 			};
 
-			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
+			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, exitCode: number | null, signalCause = "", survivingChildren?: SurvivingChild[], procData?: ProcInfo) => {
 				const truncation = snapshot.truncation;
-				let text = snapshot.content || emptyText;
-				let details: BashToolDetails | undefined;
+				let text = snapshot.content || "(no output)";
+
+				const details: BashToolDetails = { exitCode };
+
 				if (truncation.truncated) {
-					details = { truncation, fullOutputPath: snapshot.fullOutputPath };
+					details.truncation = truncation;
+					details.fullOutputPath = snapshot.fullOutputPath;
 					const startLine = truncation.totalLines - truncation.outputLines + 1;
 					const endLine = truncation.totalLines;
+					const limitInfo = formatSize(truncation.maxBytes ?? 10 * 1024);
+					const readCmd = `read/bash the full output: ${snapshot.fullOutputPath}`;
 					if (truncation.lastLinePartial) {
-						const lastLineSize = formatSize(output.getLastLineBytes());
-						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing truncated last ${formatSize(truncation.outputBytes)} of line ${endLine} (${limitInfo} limit). ${readCmd}]`;
 					} else if (truncation.truncatedBy === "lines") {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${limitInfo} limit). ${readCmd}]`;
 					} else {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${limitInfo} limit). ${readCmd}]`;
 					}
 				}
+
+				// Exit code or signal cause
+				const exitLine = exitCode === null
+					? (signalCause || "[Killed by signal]")
+					: `[exit: ${exitCode}]`;
+				text += `\n${exitLine}`;
+
+				// Process accounting data lives in details.proc (not shown inline)
+				if (procData) {
+					details.proc = procData;
+				}
+
+				// Append surviving children info
+				if (survivingChildren && survivingChildren.length > 0) {
+					details.survivingChildren = survivingChildren;
+					const label = survivingChildren.length === 1 ? "process" : "processes";
+					text += `\n[Surviving children: ${survivingChildren.length} ${label}]`;
+					for (const sc of survivingChildren) {
+						const cmdPreview = sc.command.length > 80
+							? sc.command.slice(0, 77) + "..."
+							: sc.command;
+						text += `\n  ${sc.pid} ${sc.state} ${cmdPreview}`;
+					}
+				}
+
 				return { text, details };
 			};
 
-			const appendStatus = (text: string, status: string) => `${text ? `${text}\n\n` : ""}${status}`;
-
 			try {
 				let exitCode: number | null;
+				let survivingChildren: SurvivingChild[] | undefined;
+				let procData: ProcInfo | undefined;
 				try {
 					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
@@ -404,23 +506,26 @@ export function createBashToolDefinition(
 						env: spawnContext.env,
 					});
 					exitCode = result.exitCode;
+					survivingChildren = result.survivingChildren;
+					procData = result.proc;
 				} catch (err) {
 					const snapshot = await finishOutput();
-					const { text } = formatOutput(snapshot, "");
 					if (err instanceof Error && err.message === "aborted") {
-						throw new Error(appendStatus(text, "Command aborted"));
+						const { text, details } = formatOutput(snapshot, null, "[Command aborted]");
+						throw Object.assign(new Error(text), { details });
 					}
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
 						const timeoutSecs = err.message.split(":")[1];
-						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+						const { text, details } = formatOutput(snapshot, null, `[Command timed out after ${timeoutSecs}s]`);
+						throw Object.assign(new Error(text), { details });
 					}
 					throw err;
 				}
 
 				const snapshot = await finishOutput();
-				const { text: outputText, details } = formatOutput(snapshot);
+				const { text: outputText, details } = formatOutput(snapshot, exitCode, "", survivingChildren, procData);
 				if (exitCode !== 0 && exitCode !== null) {
-					throw new Error(appendStatus(outputText, `Command exited with code ${exitCode}`));
+					throw Object.assign(new Error(outputText), { details });
 				}
 				return { content: [{ type: "text", text: outputText }], details };
 			} finally {

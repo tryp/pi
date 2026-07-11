@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { delimiter } from "node:path";
 import { spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.ts";
@@ -248,7 +248,12 @@ export function killTrackedDetachedChildren(): void {
 }
 
 /**
- * Kill a process and all its children (cross-platform)
+ * Kill a process and all its children (cross-platform).
+ *
+ * On Unix: sends SIGTERM to the process group first, giving the parent shell
+ * a chance to propagate the signal to its children (e.g., a foreground `sleep`
+ * forked by `bash -c`). After 200ms, sends SIGKILL to ensure termination.
+ * This two-phase approach avoids orphaned subprocesses holding pipes open.
  */
 export function killProcessTree(pid: number): void {
 	if (process.platform === "win32") {
@@ -263,16 +268,208 @@ export function killProcessTree(pid: number): void {
 			// Ignore errors if taskkill fails
 		}
 	} else {
-		// Use SIGKILL on Unix/Linux/Mac
+		// Phase 1: SIGTERM to process group — bash propagates to children.
+		let groupKillWorked = false;
 		try {
-			process.kill(-pid, "SIGKILL");
+			process.kill(-pid, "SIGTERM");
+			groupKillWorked = true;
 		} catch {
-			// Fallback to killing just the child if process group kill fails
 			try {
-				process.kill(pid, "SIGKILL");
+				process.kill(pid, "SIGTERM");
 			} catch {
 				// Process already dead
+				return;
 			}
 		}
+
+		// Phase 2: After 200ms grace, SIGKILL anything still alive.
+		// The timer is unref'd so it doesn't keep the event loop alive.
+		setTimeout(() => {
+			try {
+				if (groupKillWorked) {
+					process.kill(-pid, "SIGKILL");
+				} else {
+					process.kill(pid, "SIGKILL");
+				}
+			} catch {
+				// Process already dead — expected after SIGTERM.
+			}
+		}, 200).unref();
+	}
+}
+
+// ─── Surviving child detection ────────────────────────────────
+
+/**
+ * A process spawned by a bash command that is still alive after the
+ * command's main child process has exited.
+ */
+export interface SurvivingChild {
+	pid: number;
+	/** Process command line (comm name or full cmdline). */
+	command: string;
+	/** Single-character process state (R, S, D, Z, T, etc.). */
+	state: string;
+}
+
+/**
+ * Find all processes in the given process group that are still alive
+ * (excluding the group leader itself).
+ *
+ * On Unix, when a process is spawned with `detached: true`, it becomes
+ * a new process group leader with PGID equal to its PID.  All descendants
+ * inherit that PGID, so scanning `/proc` for matching PGIDs finds any
+ * surviving children or grandchildren even after they have been
+ * re-parented to init (PID 1).
+ *
+ * This is the foundation for native process accounting: instead of
+ * running `ps aux | grep` to discover orphans, the bash tool can
+ * report them directly in its result.
+ */
+export function getSurvivingChildren(pgid: number, excludePid: number): SurvivingChild[] {
+	if (process.platform === "win32") return [];
+
+	const children: SurvivingChild[] = [];
+
+	try {
+		const entries = readdirSync("/proc");
+		for (const entry of entries) {
+			if (!/^\d+$/.test(entry)) continue;
+			const pid = parseInt(entry, 10);
+			if (pid === excludePid) continue;
+
+			try {
+				const stat = readFileSync(`/proc/${entry}/stat`, "utf-8");
+				// Field layout: pid (comm) state ppid pgrp ...
+				// comm is in parentheses and may contain spaces/parens.
+				const m = stat.match(/^(\d+)\s+\((.+)\)\s+(\S)\s+(\d+)\s+(\d+)/);
+				if (!m) continue;
+
+				const processPgid = parseInt(m[5], 10);
+				if (processPgid !== pgid) continue;
+
+				let command = m[2]; // kernel-truncated comm name (15 chars)
+				const rawState = m[3];
+
+				// Try to get the full command line
+				try {
+					const cmdline = readFileSync(`/proc/${entry}/cmdline`, "utf-8");
+					if (cmdline) {
+						command = cmdline.replace(/\0/g, " ").trim();
+					}
+				} catch {
+					// Best-effort; fall back to comm name
+				}
+
+				children.push({
+					pid,
+					command: command.slice(0, 200),
+					state: rawState,
+				});
+			} catch {
+				// Process exited between readdir and readFile
+			}
+		}
+	} catch {
+		// /proc not available on this platform
+	}
+
+	return children;
+}
+
+// ─── Process resource data ──────────────────────────────
+
+/**
+ * CPU / memory / I/O data captured for a just-exited process.
+ * Read from /proc/<pid>/{stat,io,status} while the zombie
+ * still exists (between the `exit` and `close` events).
+ */
+export interface ProcInfo {
+	/** CPU time in milliseconds (user + system, including waited-for children). */
+	cpuTimeMs: number;
+	/** Peak resident set size in KB (from VmRSS in status, or RSS * page size). */
+	maxRssKb: number;
+	/** Virtual memory size in KB at exit. */
+	virtualSizeKb?: number;
+	/** Major page faults (disk-backed paging I/O). */
+	majorFaults?: number;
+	/** Minor page faults (in-memory COW / lazy allocation). */
+	minorFaults?: number;
+	/** Bytes read from storage (from /proc/<pid>/io). */
+	ioReadBytes?: number;
+	/** Bytes written to storage. */
+	ioWriteBytes?: number;
+}
+
+/**
+ * Read resource usage data from /proc for a just-exited process.
+ * Must be called while the process is still in zombie state
+ * (after `exit` event but before `close` / waitpid reap).
+ *
+ * Returns null when /proc is unavailable or the process has
+ * already been reaped.
+ */
+export function readProcResourceData(pid: number): ProcInfo | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+		// Find the closing paren of the comm field.
+		const closeParen = stat.lastIndexOf(")");
+		if (closeParen === -1) return null;
+
+		const parts = stat.slice(closeParen + 2).split(" ");
+		// Field indices (0-based after comm):
+		//  0:state  1:ppid  2:pgrp  3:session  4:tty_nr  5:tpgid  6:flags
+		//  7:minflt  8:cminflt  9:majflt  10:cmajflt
+		// 11:utime  12:stime  13:cutime  14:cstime
+		// 17:num_threads  19:starttime  20:vsize  21:rss
+		// 37:nvcsw  38:nivcsw
+
+		if (parts.length < 22) return null;
+
+		const utime = parseInt(parts[11], 10) || 0;
+		const stime = parseInt(parts[12], 10) || 0;
+		const CLK_TCK = 100; // Linux default jiffy rate
+		const cpuTimeMs = ((utime + stime) / CLK_TCK) * 1000;
+
+		const data: ProcInfo = {
+			cpuTimeMs,
+			maxRssKb: 0, // will be overwritten by VmRSS if available
+			virtualSizeKb: Math.round((parseInt(parts[20], 10) || 0) / 1024),
+			majorFaults: parseInt(parts[9], 10) || 0,
+			minorFaults: parseInt(parts[7], 10) || 0,
+		};
+
+		// RSS from stat is in pages → KB (typical page = 4096 bytes = 4 KB)
+		const rssPages = parseInt(parts[21], 10) || 0;
+		data.maxRssKb = rssPages * 4;
+
+		// Try /proc/<pid>/status for more accurate VmRSS
+		try {
+			const status = readFileSync(`/proc/${pid}/status`, "utf-8");
+			const vmRssMatch = status.match(/^VmRSS:\s+(\d+)/m);
+			if (vmRssMatch) {
+				data.maxRssKb = parseInt(vmRssMatch[1], 10);
+			}
+		} catch {
+			// Best-effort; fall back to stat-based RSS
+		}
+
+		// Try /proc/<pid>/io for I/O stats
+		try {
+			const io = readFileSync(`/proc/${pid}/io`, "utf-8");
+			for (const line of io.split("\n")) {
+				if (line.startsWith("read_bytes:"))
+					data.ioReadBytes = parseInt(line.split(":")[1], 10);
+				if (line.startsWith("write_bytes:"))
+					data.ioWriteBytes = parseInt(line.split(":")[1], 10);
+			}
+		} catch {
+			// Best-effort; /proc/<pid>/io requires CAP_SYS_ADMIN or
+			// root on some systems
+		}
+
+		return data;
+	} catch {
+		return null;
 	}
 }
