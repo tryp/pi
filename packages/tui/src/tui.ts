@@ -1462,8 +1462,18 @@ export class TUI extends Container {
 		}
 
 		// Render from first changed line to end
-		// Build buffer with all updates wrapped in synchronized output
-		let buffer = "\x1b[?2026h"; // Begin synchronized output
+		// Build buffer with all updates wrapped in synchronized output.
+		// Single-line updates without images or content shrinking don't
+		// need the \x1b[?2026h/\x1b[?2026l wrapper — the \x1b[2K + write
+		// in a single stdout.write() is already visually atomic and removing
+		// the markers reduces the window where tmux could intercept a mid-sync
+		// terminal state (which can interfere with copy mode and selection).
+		const isSimpleUpdate = firstChanged === lastChanged
+			&& this.previousKittyImageIds.size === 0
+			&& !isImageLine(newLines[firstChanged])
+			&& this.previousLines.length <= newLines.length;
+		const useSync = !isSimpleUpdate;
+		let buffer = useSync ? "\x1b[?2026h" : ""; // Begin synchronized output
 		buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
 		const prevViewportBottom = prevViewportTop + height - 1;
 		const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged;
@@ -1570,7 +1580,7 @@ export class TUI extends Container {
 			buffer += `\x1b[${extraLines}A`;
 		}
 
-		buffer += "\x1b[?2026l"; // End synchronized output
+		buffer += useSync ? "\x1b[?2026l" : ""; // End synchronized output
 
 		if (process.env.PI_TUI_DEBUG === "1") {
 			const debugDir = "/tmp/tui";
