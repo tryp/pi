@@ -374,7 +374,7 @@ export function createEditToolDefinition(
 			"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 			"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
 			"On failure: the error message tells you exactly what went wrong (text not found, ambiguous match, overlapping edits, etc.). The file was not modified.",
-			"On partial success: some edits are applied and some are not. The result shows which edits failed and why, along with the diff of what was applied.",
+			"On partial success: isError will be true, but some edits were applied. The diff/patch is in details.diff and details.patch. The error message lists which edits failed.",
 			"On success: the result shows a git-style diffstat (e.g. 'src/file.ts | 5 ++---') confirming the exact scope of changes.",
 		],
 		parameters: editSchema,
@@ -433,19 +433,31 @@ export function createEditToolDefinition(
 				const remChars = barWidth - addChars;
 				const diffstat = `${path} | ${total} ${'+'.repeat(addChars)}${'-'.repeat(remChars)}`;
 
-				let statusLine = `${diffstat}\n${matchedEditsCount} block(s) replaced.`;
 				if (failedEdits && failedEdits.length > 0) {
 					const failLines = failedEdits
 						.map((f) => `  edits[${f.index}]: ${f.reason}`)
 						.join("\n");
 					const nFailed = failedEdits.length;
-					statusLine += `\n${nFailed} edit(s) failed:\n${failLines}`;
+					const errorMessage =
+						`${diffstat}\n${matchedEditsCount} block(s) replaced. ` +
+						`The diff is in details.diff (full patch in details.patch).\n` +
+						`${nFailed} edit(s) failed:\n${failLines}`;
+					const err = new Error(errorMessage);
+					(err as any).details = {
+						diff: diffResult.diff,
+						patch,
+						firstChangedLine: diffResult.firstChangedLine,
+						addedLines: diffResult.addedLines,
+						removedLines: diffResult.removedLines,
+						failedEdits,
+					};
+					throw err;
 				}
 				return {
 					content: [
 						{
 							type: "text",
-							text: statusLine,
+							text: `${diffstat}\n${edits.length} block(s) replaced.`,
 						},
 					],
 					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine, addedLines: diffResult.addedLines, removedLines: diffResult.removedLines },

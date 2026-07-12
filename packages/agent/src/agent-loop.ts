@@ -706,8 +706,15 @@ async function executePreparedToolCall(
 	} catch (error) {
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
+		const message = error instanceof Error ? error.message : String(error);
+		// Preserve structured details from the error object if present
+		// (used by tools like edit to report partial success with diff info)
+		const details =
+			error && typeof error === "object" && "details" in error
+				? (error as any).details
+				: {};
 		return {
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			result: { content: [{ type: "text", text: message }], details },
 			isError: true,
 		};
 	} finally {
