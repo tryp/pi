@@ -361,27 +361,50 @@ function getNotFoundError(path: string, editIndex: number, totalEdits: number): 
  * wasn't found. Uses line-level Jaccard similarity on word tokens.
  * Returns a 1-based line range suggestion, or null if no useful match found.
  */
-export /** Common programming keywords to exclude from similarity scoring. */
-const COMMON_SIMILARITY_KEYWORDS = new Set([
-	"import", "from", "def", "class", "return", "if", "else", "elif",
-	"for", "while", "break", "continue", "try", "except", "finally",
-	"with", "as", "pass", "raise", "yield", "lambda", "self",
-	"true", "false", "none", "and", "or", "not", "in", "is", "assert",
-	"del", "global", "nonlocal", "async", "await", "match", "case",
-	"print", "len", "range", "type", "super", "property",
-	"int", "str", "float", "bool", "list", "dict", "tuple", "set",
-	"true", "false", "null", "undefined", "const", "let", "var",
-	"function", "void", "static", "public", "private", "protected",
-	"namespace", "template", "typename", "struct", "enum", "union",
-	"include", "pragma", "define", "endif", "ifdef", "ifndef",
-]);
+const RARITY_THRESHOLD = 0.10;
 
-/** Filter words to keep only significant, non-keyword tokens. */
-function significantWords(text: string): string[] {
-	return text
-		.toLowerCase()
-		.split(/\s+/)
-		.filter((w) => w.length > 2 && !COMMON_SIMILARITY_KEYWORDS.has(w));
+/**
+ * Return words from oldText that are "rare" in content — appear in at most
+ * RARITY_THRESHOLD fraction of lines. Words that appear everywhere (like
+ * keywords in any language) are useless for pinpoint matching.
+ *
+ * This is language-agnostic: it doesn't hardcode a keyword list for any
+ * particular language. Instead it relies on the statistical property that
+ * common language keywords (import, def, return, if, for, struct, etc.)
+ * appear in many lines of any real source file, while domain-specific
+ * identifiers (function names, variable names, type names) appear in few.
+ */
+function rareWords(content: string, oldText: string): string[] {
+	const fileLines = content.split("\n");
+	const totalLines = fileLines.length;
+	if (totalLines === 0) return [];
+
+	// Count line frequency for every word in the file
+	const lineFreq: Map<string, number> = new Map();
+	for (const line of fileLines) {
+		const seen = new Set<string>();
+		const words = line.toLowerCase().split(/\s+/);
+		for (const w of words) {
+			if (w.length <= 2) continue;
+			if (!seen.has(w)) {
+				seen.add(w);
+				lineFreq.set(w, (lineFreq.get(w) ?? 0) + 1);
+			}
+		}
+	}
+
+	// Filter oldText words to only those rare in the file
+	const maxLineOccurrences = Math.max(1, Math.floor(totalLines * RARITY_THRESHOLD));
+	const result: string[] = [];
+	const oldWords = oldText.toLowerCase().split(/\s+/);
+	for (const w of oldWords) {
+		if (w.length <= 2) continue;
+		const freq = lineFreq.get(w) ?? 0;
+		if (freq <= maxLineOccurrences) {
+			result.push(w);
+		}
+	}
+	return result;
 }
 
 export function findClosestLineRange(
@@ -391,67 +414,70 @@ export function findClosestLineRange(
 	const contentLines = content.split("\n");
 	const oldLines = oldText.split("\n").filter((l) => l.trim().length > 0);
 
-	// Not enough signal for a useful suggestion
 	if (oldLines.length === 0 || contentLines.length === 0) return null;
 
-	// Compute significant word count; skip if too short (< 4 sig words)
-	const sigWords = significantWords(oldText);
-	if (sigWords.length < 4) return null;
+	// For files under 30 lines, line-frequency filtering doesn't work well:
+	// even common keywords like "import" or "return" appear in few lines and
+	// pass the rarity filter, producing false matches. The file is small enough
+	// that the agent can re-read it directly.
+	if (contentLines.length < 30) return null;
+
+	// Compute words from oldText that are rare in this file
+	const oldRare = rareWords(content, oldText);
+	if (oldRare.length < 4) return null;
+	const oldRareSet = new Set(oldRare);
 
 	// Avoid scanning very large files
 	const maxLines = 5000;
 	const scanLines = contentLines.length > maxLines ? contentLines.slice(0, maxLines) : contentLines;
 
 	// For each oldText line, find the best-matching content line
-	const matches: Array<{ contentLine: number; score: number; bestWord: string }> = [];
+	const matches: Array<{ contentLine: number; score: number }> = [];
 
 	for (let oi = 0; oi < oldLines.length; oi++) {
-		const oldSig = significantWords(oldLines[oi]);
-		if (oldSig.length === 0) continue;
-		const oldSigSet = new Set(oldSig);
+		// Which rare words appear on this oldText line?
+		const oldLineRare = oldLines[oi]
+			.toLowerCase()
+			.split(/\s+/)
+			.filter((w) => oldRareSet.has(w));
+		if (oldLineRare.length === 0) continue;
+		const oldLineRareSet = new Set(oldLineRare);
 
 		let bestScore = 0;
 		let bestLine = -1;
-		let bestWord = "";
 
 		for (let ci = 0; ci < scanLines.length; ci++) {
-			const cSig = significantWords(scanLines[ci]);
-			if (cSig.length === 0) continue;
-			const cSigSet = new Set(cSig);
+			const cRare = scanLines[ci]
+				.toLowerCase()
+				.split(/\s+/)
+				.filter((w) => oldRareSet.has(w));
+			if (cRare.length === 0) continue;
+			const cRareSet = new Set(cRare);
 
-			// Jaccard similarity on significant words only
+			// Jaccard similarity on rare words only
 			let intersectionSize = 0;
-			let bestIntersectWord = "";
-			for (const w of oldSig) {
-				if (cSigSet.has(w)) {
-					intersectionSize++;
-					if (w.length > bestIntersectWord.length) {
-						bestIntersectWord = w;
-					}
-				}
+			for (const w of oldLineRare) {
+				if (cRareSet.has(w)) intersectionSize++;
 			}
-			const unionSize = oldSigSet.size + cSigSet.size - intersectionSize;
+			const unionSize = oldLineRareSet.size + cRareSet.size - intersectionSize;
 			const score = unionSize > 0 ? intersectionSize / unionSize : 0;
 
 			if (score > bestScore) {
 				bestScore = score;
 				bestLine = ci;
-				bestWord = bestIntersectWord;
 			}
 		}
 
-		// Require a meaningful overlap on significant words
 		if (bestLine >= 0 && bestScore >= 0.4) {
-			matches.push({ contentLine: bestLine, score: bestScore, bestWord });
+			matches.push({ contentLine: bestLine, score: bestScore });
 		}
 	}
 
 	if (matches.length === 0) return null;
 
-	// Sort by content line
 	matches.sort((a, b) => a.contentLine - b.contentLine);
 
-	// Find the best cluster (consecutive matches within a small gap)
+	// Find the best cluster
 	let bestCluster: { start: number; end: number } | null = null;
 	let bestAvgScore = 0;
 
@@ -481,7 +507,6 @@ export function findClosestLineRange(
 
 	if (!bestCluster) return null;
 
-	// Expand by a few context lines (1-based)
 	const contextLines = 2;
 	return {
 		startLine: Math.max(1, bestCluster.start + 1 - contextLines),
