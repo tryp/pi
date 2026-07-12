@@ -361,7 +361,30 @@ function getNotFoundError(path: string, editIndex: number, totalEdits: number): 
  * wasn't found. Uses line-level Jaccard similarity on word tokens.
  * Returns a 1-based line range suggestion, or null if no useful match found.
  */
-function findClosestLineRange(
+export /** Common programming keywords to exclude from similarity scoring. */
+const COMMON_SIMILARITY_KEYWORDS = new Set([
+	"import", "from", "def", "class", "return", "if", "else", "elif",
+	"for", "while", "break", "continue", "try", "except", "finally",
+	"with", "as", "pass", "raise", "yield", "lambda", "self",
+	"true", "false", "none", "and", "or", "not", "in", "is", "assert",
+	"del", "global", "nonlocal", "async", "await", "match", "case",
+	"print", "len", "range", "type", "super", "property",
+	"int", "str", "float", "bool", "list", "dict", "tuple", "set",
+	"true", "false", "null", "undefined", "const", "let", "var",
+	"function", "void", "static", "public", "private", "protected",
+	"namespace", "template", "typename", "struct", "enum", "union",
+	"include", "pragma", "define", "endif", "ifdef", "ifndef",
+]);
+
+/** Filter words to keep only significant, non-keyword tokens. */
+function significantWords(text: string): string[] {
+	return text
+		.toLowerCase()
+		.split(/\s+/)
+		.filter((w) => w.length > 2 && !COMMON_SIMILARITY_KEYWORDS.has(w));
+}
+
+export function findClosestLineRange(
 	content: string,
 	oldText: string,
 ): { startLine: number; endLine: number } | null {
@@ -370,47 +393,56 @@ function findClosestLineRange(
 
 	// Not enough signal for a useful suggestion
 	if (oldLines.length === 0 || contentLines.length === 0) return null;
-	// Compute total word count across oldText; skip if too short (< 3 words)
-	const totalWords = oldLines.reduce((s, l) => s + l.trim().split(/\s+/).filter(Boolean).length, 0);
-	if (totalWords < 3) return null;
+
+	// Compute significant word count; skip if too short (< 4 sig words)
+	const sigWords = significantWords(oldText);
+	if (sigWords.length < 4) return null;
 
 	// Avoid scanning very large files
 	const maxLines = 5000;
 	const scanLines = contentLines.length > maxLines ? contentLines.slice(0, maxLines) : contentLines;
 
 	// For each oldText line, find the best-matching content line
-	const matches: Array<{ contentLine: number; score: number }> = [];
+	const matches: Array<{ contentLine: number; score: number; bestWord: string }> = [];
 
 	for (let oi = 0; oi < oldLines.length; oi++) {
-		const oldTrimmed = oldLines[oi].trim();
-		const oldWords = oldTrimmed.toLowerCase().split(/\s+/).filter(Boolean);
-		if (oldWords.length === 0) continue;
-		const oldWordSet = new Set(oldWords);
+		const oldSig = significantWords(oldLines[oi]);
+		if (oldSig.length === 0) continue;
+		const oldSigSet = new Set(oldSig);
 
 		let bestScore = 0;
 		let bestLine = -1;
+		let bestWord = "";
 
 		for (let ci = 0; ci < scanLines.length; ci++) {
-			const cWords = scanLines[ci].trim().toLowerCase().split(/\s+/).filter(Boolean);
-			if (cWords.length === 0) continue;
-			const cWordSet = new Set(cWords);
+			const cSig = significantWords(scanLines[ci]);
+			if (cSig.length === 0) continue;
+			const cSigSet = new Set(cSig);
 
-			// Jaccard similarity
+			// Jaccard similarity on significant words only
 			let intersectionSize = 0;
-			for (const w of oldWords) {
-				if (cWordSet.has(w)) intersectionSize++;
+			let bestIntersectWord = "";
+			for (const w of oldSig) {
+				if (cSigSet.has(w)) {
+					intersectionSize++;
+					if (w.length > bestIntersectWord.length) {
+						bestIntersectWord = w;
+					}
+				}
 			}
-			const unionSize = oldWordSet.size + cWordSet.size - intersectionSize;
+			const unionSize = oldSigSet.size + cSigSet.size - intersectionSize;
 			const score = unionSize > 0 ? intersectionSize / unionSize : 0;
 
 			if (score > bestScore) {
 				bestScore = score;
 				bestLine = ci;
+				bestWord = bestIntersectWord;
 			}
 		}
 
-		if (bestLine >= 0 && bestScore >= 0.3) {
-			matches.push({ contentLine: bestLine, score: bestScore });
+		// Require a meaningful overlap on significant words
+		if (bestLine >= 0 && bestScore >= 0.4) {
+			matches.push({ contentLine: bestLine, score: bestScore, bestWord });
 		}
 	}
 
