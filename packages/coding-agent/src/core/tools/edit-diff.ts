@@ -410,15 +410,29 @@ export function applyEditsToNormalizedContent(
 	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
 	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
 
+	// When the replacement base is fuzzy-normalized, pre-normalize every edit's
+	// oldText so the second fuzzyFindText search operates in the same normalization
+	// space. This avoids mismatches where non-normalized oldText searches
+	// already-stripped content (trailing whitespace, unicode, etc.).
+	// Without this alignment, the exact-match shortcut inside fuzzyFindText uses an
+	// un-normalized needle against a normalized haystack and misses, and even the
+	// fuzzy fallback ladder can miss when line-boundary normalization shifts content.
+	const normalizedOldTexts = usedFuzzyMatch
+		? normalizedEdits.map((e) => normalizeForFuzzyMatch(e.oldText))
+		: null;
+
 	const matchedEdits: MatchedEdit[] = [];
 	for (let i = 0; i < normalizedEdits.length; i++) {
 		const edit = normalizedEdits[i];
-		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
+		// Use fuzzy-normalized oldText when searching in fuzzy-normalized content
+		const searchOldText = normalizedOldTexts ? normalizedOldTexts[i] : edit.oldText;
+
+		const matchResult = fuzzyFindText(replacementBaseContent, searchOldText);
 		if (!matchResult.found) {
 			throw getNotFoundError(path, i, normalizedEdits.length);
 		}
 
-		const occurrences = countOccurrences(replacementBaseContent, edit.oldText);
+		const occurrences = countOccurrences(replacementBaseContent, searchOldText);
 		if (occurrences > 1) {
 			throw getDuplicateError(path, i, normalizedEdits.length, occurrences);
 		}
