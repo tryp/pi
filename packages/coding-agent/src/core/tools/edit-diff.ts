@@ -356,6 +356,129 @@ function getNotFoundError(path: string, editIndex: number, totalEdits: number): 
 	);
 }
 
+/**
+ * Find the closest matching line range in content for a given oldText that
+ * wasn't found. Uses line-level Jaccard similarity on word tokens.
+ * Returns a 1-based line range suggestion, or null if no useful match found.
+ */
+function findClosestLineRange(
+	content: string,
+	oldText: string,
+): { startLine: number; endLine: number } | null {
+	const contentLines = content.split("\n");
+	const oldLines = oldText.split("\n").filter((l) => l.trim().length > 0);
+
+	// Not enough signal for a useful suggestion
+	if (oldLines.length === 0 || contentLines.length === 0) return null;
+	// Compute total word count across oldText; skip if too short (< 3 words)
+	const totalWords = oldLines.reduce((s, l) => s + l.trim().split(/\s+/).filter(Boolean).length, 0);
+	if (totalWords < 3) return null;
+
+	// Avoid scanning very large files
+	const maxLines = 5000;
+	const scanLines = contentLines.length > maxLines ? contentLines.slice(0, maxLines) : contentLines;
+
+	// For each oldText line, find the best-matching content line
+	const matches: Array<{ contentLine: number; score: number }> = [];
+
+	for (let oi = 0; oi < oldLines.length; oi++) {
+		const oldTrimmed = oldLines[oi].trim();
+		const oldWords = oldTrimmed.toLowerCase().split(/\s+/).filter(Boolean);
+		if (oldWords.length === 0) continue;
+		const oldWordSet = new Set(oldWords);
+
+		let bestScore = 0;
+		let bestLine = -1;
+
+		for (let ci = 0; ci < scanLines.length; ci++) {
+			const cWords = scanLines[ci].trim().toLowerCase().split(/\s+/).filter(Boolean);
+			if (cWords.length === 0) continue;
+			const cWordSet = new Set(cWords);
+
+			// Jaccard similarity
+			let intersectionSize = 0;
+			for (const w of oldWords) {
+				if (cWordSet.has(w)) intersectionSize++;
+			}
+			const unionSize = oldWordSet.size + cWordSet.size - intersectionSize;
+			const score = unionSize > 0 ? intersectionSize / unionSize : 0;
+
+			if (score > bestScore) {
+				bestScore = score;
+				bestLine = ci;
+			}
+		}
+
+		if (bestLine >= 0 && bestScore >= 0.3) {
+			matches.push({ contentLine: bestLine, score: bestScore });
+		}
+	}
+
+	if (matches.length === 0) return null;
+
+	// Sort by content line
+	matches.sort((a, b) => a.contentLine - b.contentLine);
+
+	// Find the best cluster (consecutive matches within a small gap)
+	let bestCluster: { start: number; end: number } | null = null;
+	let bestAvgScore = 0;
+
+	for (let i = 0; i < matches.length; i++) {
+		let clusterStart = matches[i].contentLine;
+		let clusterEnd = clusterStart;
+		let totalScore = matches[i].score;
+		let count = 1;
+
+		for (let j = i + 1; j < matches.length; j++) {
+			const gap = matches[j].contentLine - clusterEnd;
+			if (gap <= 5) {
+				clusterEnd = matches[j].contentLine;
+				totalScore += matches[j].score;
+				count++;
+			} else {
+				break;
+			}
+		}
+
+		const avgScore = totalScore / count;
+		if (avgScore > bestAvgScore) {
+			bestAvgScore = avgScore;
+			bestCluster = { start: clusterStart, end: clusterEnd };
+		}
+	}
+
+	if (!bestCluster) return null;
+
+	// Expand by a few context lines (1-based)
+	const contextLines = 2;
+	return {
+		startLine: Math.max(1, bestCluster.start + 1 - contextLines),
+		endLine: Math.min(scanLines.length, bestCluster.end + 1 + contextLines),
+	};
+}
+
+/**
+ * Format a "text not found" error, optionally including a closest-match line range suggestion.
+ */
+function formatNotFoundWithSuggest(
+	path: string,
+	content: string,
+	oldText: string,
+	editIndex: number,
+	totalEdits: number,
+): string {
+	const baseMsg =
+		totalEdits === 1
+			? `Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`
+			: `Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`;
+
+	const range = findClosestLineRange(content, oldText);
+	if (!range) return baseMsg;
+
+	const lineRange = range.startLine === range.endLine ? `line ${range.startLine}` : `lines ${range.startLine}-${range.endLine}`;
+	return `${baseMsg} Closest match at ${lineRange} — read the file to find exact text.`;
+}
+
 function getDuplicateError(path: string, editIndex: number, totalEdits: number, occurrences: number): Error {
 	if (totalEdits === 1) {
 		return new Error(
@@ -444,9 +567,13 @@ export function applyEditsToNormalizedContent(
 
 		const matchResult = fuzzyFindText(replacementBaseContent, searchOldText);
 		if (!matchResult.found) {
-			const msg = normalizedEdits.length === 1
-				? `Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`
-				: `Could not find edits[${i}] in ${path}. The oldText must match exactly including all whitespace and newlines.`;
+			const msg = formatNotFoundWithSuggest(
+				path,
+				normalizedContent,
+				edit.oldText,
+				i,
+				normalizedEdits.length,
+			);
 			failedEdits.push({ index: i, reason: msg });
 			continue;
 		}
