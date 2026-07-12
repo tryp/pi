@@ -104,30 +104,96 @@ function prepareEditArguments(input: unknown): EditToolInput {
 
 	const args = input as Record<string, unknown>;
 
-	// Some models (Opus 4.6, GLM-5.1) send edits as a JSON string instead of an array
+	// Handle edits as JSON string (some models send string-serialized arrays).
+	// Mutate in-place for the fast-path check below.
+	let editsJsonParsed = false;
 	if (typeof args.edits === "string") {
 		try {
 			const parsed = JSON.parse(args.edits);
-			if (Array.isArray(parsed)) args.edits = parsed;
-		} catch {}
+			if (Array.isArray(parsed)) {
+				args.edits = parsed;
+				editsJsonParsed = true;
+			}
+		} catch {
+			// String wasn't valid JSON; leave edits as-is (will fail fast-path
+			// and be handled by validateEditInput).
+		}
 	}
 
 	const legacy = args as LegacyEditToolInput;
-	if (typeof legacy.oldText !== "string" || typeof legacy.newText !== "string") {
-		return args as EditToolInput;
+	const hasRootOldText = typeof legacy.oldText === "string";
+	const editsArray = Array.isArray(args.edits) ? (args.edits as unknown[]) : null;
+
+	// Fast path: input is already structurally valid, no transformation needed.
+	// Preserve object identity for existing callers.
+	if (!editsJsonParsed && editsArray && !hasRootOldText) {
+		const allValid = editsArray.every(
+			(e) =>
+				e !== null &&
+				typeof e === "object" &&
+				!Array.isArray(e) &&
+				typeof (e as Record<string, unknown>).oldText === "string" &&
+				// No extra properties beyond oldText/newText
+				Object.keys(e as Record<string, unknown>).every(
+					(k) => k === "oldText" || k === "newText",
+				),
+		);
+		if (allValid) return args as EditToolInput;
 	}
 
-	const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : [];
-	edits.push({ oldText: legacy.oldText, newText: legacy.newText });
-	const { oldText: _oldText, newText: _newText, ...rest } = legacy;
-	return { ...rest, edits } as EditToolInput;
+	// Build a clean edits array, filtering out malformed entries.
+	const rawEditEntries: Array<{ oldText: string; newText?: string }> = [];
+
+	if (editsArray) {
+		for (const e of editsArray) {
+			// Skip non-dict entries (string_edit_element, null, number, array)
+			if (e === null || typeof e !== "object" || Array.isArray(e)) continue;
+			const dict = e as Record<string, unknown>;
+			// Skip entries without a valid oldText (empty objects, missing_oldText)
+			if (typeof dict.oldText !== "string" || dict.oldText.length === 0) continue;
+			rawEditEntries.push({
+				oldText: dict.oldText as string,
+				newText: typeof dict.newText === "string" ? dict.newText : undefined,
+			});
+		}
+	}
+
+	// Handle legacy flat-args pattern: root-level oldText/newText alongside edits
+	if (hasRootOldText) {
+		const rootOldText = legacy.oldText as string;
+		const rootNewText = typeof legacy.newText === "string" ? legacy.newText : undefined;
+		rawEditEntries.push({ oldText: rootOldText, newText: rootNewText });
+	}
+
+	// Detect misplaced path inside an edit entry (extra_root_property pattern)
+	// when no root-level path exists.
+	let path = typeof args.path === "string" ? args.path : undefined;
+	if (!path && editsArray) {
+		for (const e of editsArray) {
+			if (e && typeof e === "object" && !Array.isArray(e)) {
+				const dict = e as Record<string, unknown>;
+				if (typeof dict.path === "string") {
+					path = dict.path;
+					break;
+				}
+			}
+		}
+	}
+
+	const result: Record<string, unknown> = { edits: rawEditEntries };
+	if (path) result.path = path;
+
+	return result as EditToolInput;
 }
 
 function validateEditInput(input: EditToolInput): { path: string; edits: Edit[] } {
 	if (!Array.isArray(input.edits) || input.edits.length === 0) {
-		throw new Error("Edit tool input is invalid. edits must contain at least one replacement.");
+		throw new Error(
+			"Edit tool input is invalid. edits must contain at least one replacement with a valid oldText.",
+		);
 	}
-	// Normalize: absent newText means deletion (empty string replacement)
+	// All edits from prepareEditArguments already have oldText, so map directly
+	// newText defaults to "" (deletion) but the field is already populated above.
 	const edits: Edit[] = input.edits.map((e) => ({ oldText: e.oldText, newText: e.newText ?? "" }));
 	return { path: input.path, edits };
 }

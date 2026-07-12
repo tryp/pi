@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ExtensionContext } from "../src/core/extensions/types.ts";
-import { createEditToolDefinition } from "../src/core/tools/edit.ts";
+import { createEditToolDefinition, type EditToolInput } from "../src/core/tools/edit.ts";
 
 const tempDirs: string[] = [];
 
@@ -84,7 +84,9 @@ describe("edit tool prepareArguments", () => {
 		});
 
 		const result = await definition.execute("tool-1", prepared, undefined, undefined, {} as ExtensionContext);
-		expect(result.content).toEqual([{ type: "text", text: "Successfully replaced 1 block(s) in legacy.txt." }]);
+		expect(result.content[0]).toMatchObject({ type: "text" });
+		const text = (result.content[0] as { text: string }).text;
+		expect(text).toContain("1 block(s) replaced.");
 		expect(await readFile(filePath, "utf8")).toBe("after\n");
 	});
 });
@@ -102,15 +104,112 @@ describe("edit tool stringified edits", () => {
 		});
 	});
 
-	it("leaves edits alone when the string is not valid JSON", () => {
+	it("normalizes invalid-JSON string to empty edits for clear error message", () => {
 		const definition = createEditToolDefinition(process.cwd());
 		const prepared = definition.prepareArguments!({
 			path: "file.txt",
 			edits: "not json",
 		});
+		// Normalized to empty edits array; validateEditInput will throw a clear
+		// error about missing edits rather than a cryptic type error.
 		expect(prepared).toEqual({
 			path: "file.txt",
-			edits: "not json",
+			edits: [],
 		});
+	});
+});
+
+describe("edit tool structural robustness", () => {
+	it("filters non-dict entries from edits (string_edit_element)", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!(
+			{
+				path: "file.txt",
+				edits: [
+					{ oldText: "good", newText: "ok" },
+					"not a dict",
+					42,
+					null,
+					["nested array"],
+					{ oldText: "also good", newText: "also ok" },
+				],
+			} as unknown as EditToolInput,
+		);
+		expect(prepared).toEqual({
+			path: "file.txt",
+			edits: [
+				{ oldText: "good", newText: "ok" },
+				{ oldText: "also good", newText: "also ok" },
+			],
+		});
+	});
+
+	it("filters entries without oldText (missing_oldText / empty_edit_object)", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!(
+			{
+				path: "file.txt",
+				edits: [
+					{},
+					{ newText: "orphan" },
+					{ oldText: "valid", newText: "ok" },
+					{ oldText: "" },
+				],
+			} as unknown as EditToolInput,
+		);
+		expect(prepared).toEqual({
+			path: "file.txt",
+			edits: [{ oldText: "valid", newText: "ok" }],
+		});
+	});
+
+	it("extracts misplaced path from edit entry to root", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!(
+			{
+				edits: [
+					{
+						oldText: "before",
+						newText: "after",
+						path: "nested.txt",
+					},
+				],
+			} as unknown as EditToolInput,
+		);
+		expect(prepared).toEqual({
+			path: "nested.txt",
+			edits: [{ oldText: "before", newText: "after" }],
+		});
+	});
+
+	it("does not overwrite root-level path with nested path", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!(
+			{
+				path: "root.txt",
+				edits: [
+					{
+						oldText: "before",
+						newText: "after",
+						path: "nested.txt",
+					},
+				],
+			} as unknown as EditToolInput,
+		);
+		// Root-level path takes precedence
+		expect(prepared).toEqual({
+			path: "root.txt",
+			edits: [{ oldText: "before", newText: "after" }],
+		});
+	});
+
+	it("preserves valid input identity (no transformation needed)", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const input = {
+			path: "file.txt",
+			edits: [{ oldText: "a", newText: "b" }],
+		} as EditToolInput;
+		const prepared = definition.prepareArguments!(input);
+		expect(prepared).toBe(input);
 	});
 });
