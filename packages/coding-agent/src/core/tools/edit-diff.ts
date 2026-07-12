@@ -196,6 +196,8 @@ export interface Edit {
 export interface AppliedEditsResult {
 	baseContent: string;
 	newContent: string;
+	/** Edits that could not be applied. Present only on partial success. */
+	failedEdits?: Array<{ index: number; reason: string }>;
 }
 
 /**
@@ -402,7 +404,11 @@ export function applyEditsToNormalizedContent(
 
 	for (let i = 0; i < normalizedEdits.length; i++) {
 		if (normalizedEdits[i].oldText.length === 0) {
-			throw getEmptyOldTextError(path, i, normalizedEdits.length);
+			// Single empty-oldText edit: fatal (nothing to match)
+			// Multi-edit with one empty: skip it and report as failure
+			if (normalizedEdits.length === 1) {
+				throw getEmptyOldTextError(path, i, normalizedEdits.length);
+			}
 		}
 	}
 
@@ -422,19 +428,36 @@ export function applyEditsToNormalizedContent(
 		: null;
 
 	const matchedEdits: MatchedEdit[] = [];
+	const failedEdits: Array<{ index: number; reason: string }> = [];
+
 	for (let i = 0; i < normalizedEdits.length; i++) {
 		const edit = normalizedEdits[i];
+
+		// Empty oldText — skip
+		if (!edit.oldText) {
+			failedEdits.push({ index: i, reason: "oldText is empty" });
+			continue;
+		}
+
 		// Use fuzzy-normalized oldText when searching in fuzzy-normalized content
 		const searchOldText = normalizedOldTexts ? normalizedOldTexts[i] : edit.oldText;
 
 		const matchResult = fuzzyFindText(replacementBaseContent, searchOldText);
 		if (!matchResult.found) {
-			throw getNotFoundError(path, i, normalizedEdits.length);
+			const msg = normalizedEdits.length === 1
+				? `Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`
+				: `Could not find edits[${i}] in ${path}. The oldText must match exactly including all whitespace and newlines.`;
+			failedEdits.push({ index: i, reason: msg });
+			continue;
 		}
 
 		const occurrences = countOccurrences(replacementBaseContent, searchOldText);
 		if (occurrences > 1) {
-			throw getDuplicateError(path, i, normalizedEdits.length, occurrences);
+			const msg = normalizedEdits.length === 1
+				? `Found ${occurrences} occurrences of the text in ${path}. The text must be unique.`
+				: `Found ${occurrences} occurrences of edits[${i}] in ${path}. Each oldText must be unique.`;
+			failedEdits.push({ index: i, reason: msg });
+			continue;
 		}
 
 		matchedEdits.push({
@@ -445,7 +468,15 @@ export function applyEditsToNormalizedContent(
 		});
 	}
 
+	// No edits matched at all — throw the original failure
+	if (matchedEdits.length === 0 && failedEdits.length > 0) {
+		throw new Error(failedEdits[0].reason);
+	}
+
+	// Sort successful matches by position
 	matchedEdits.sort((a, b) => a.matchIndex - b.matchIndex);
+
+	// Check overlaps only among SUCCESSFUL edits
 	for (let i = 1; i < matchedEdits.length; i++) {
 		const previous = matchedEdits[i - 1];
 		const current = matchedEdits[i];
@@ -462,10 +493,16 @@ export function applyEditsToNormalizedContent(
 		: applyReplacements(replacementBaseContent, matchedEdits);
 
 	if (baseContent === newContent) {
+		// If some edits succeeded but produced no net change, that's a conflict.
+		// If ALL edits failed (shouldn't reach here), this is a no-change.
 		throw getNoChangeError(path, normalizedEdits.length);
 	}
 
-	return { baseContent, newContent };
+	const result: AppliedEditsResult = { baseContent, newContent };
+	if (failedEdits.length > 0) {
+		result.failedEdits = failedEdits;
+	}
+	return result;
 }
 
 /** Generate a standard unified patch. */

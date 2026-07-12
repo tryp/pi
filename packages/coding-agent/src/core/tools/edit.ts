@@ -374,6 +374,7 @@ export function createEditToolDefinition(
 			"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 			"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
 			"On failure: the error message tells you exactly what went wrong (text not found, ambiguous match, overlapping edits, etc.). The file was not modified.",
+			"On partial success: some edits are applied and some are not. The result shows which edits failed and why, along with the diff of what was applied.",
 			"On success: the result shows a git-style diffstat (e.g. 'src/file.ts | 5 ++---') confirming the exact scope of changes.",
 		],
 		parameters: editSchema,
@@ -414,7 +415,8 @@ export function createEditToolDefinition(
 				const { bom, text: content } = stripBom(rawContent);
 				const originalEnding = detectLineEnding(content);
 				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				const { baseContent, newContent, failedEdits } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				const matchedEditsCount = edits.length - (failedEdits?.length ?? 0);
 				throwIfAborted();
 
 				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
@@ -431,11 +433,19 @@ export function createEditToolDefinition(
 				const remChars = barWidth - addChars;
 				const diffstat = `${path} | ${total} ${'+'.repeat(addChars)}${'-'.repeat(remChars)}`;
 
+				let statusLine = `${diffstat}\n${matchedEditsCount} block(s) replaced.`;
+				if (failedEdits && failedEdits.length > 0) {
+					const failLines = failedEdits
+						.map((f) => `  edits[${f.index}]: ${f.reason}`)
+						.join("\n");
+					const nFailed = failedEdits.length;
+					statusLine += `\n${nFailed} edit(s) failed:\n${failLines}`;
+				}
 				return {
 					content: [
 						{
 							type: "text",
-							text: `${diffstat}\n${edits.length} block(s) replaced.`,
+							text: statusLine,
 						},
 					],
 					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine, addedLines: diffResult.addedLines, removedLines: diffResult.removedLines },

@@ -255,7 +255,7 @@ function buildChatPayload(
 	if (options?.toolChoice) payload.toolChoice = mapToolChoice(options.toolChoice);
 	if (options?.promptMode) payload.promptMode = options.promptMode;
 	if (options?.reasoningEffort) payload.reasoningEffort = options.reasoningEffort;
-	if (shouldUsePromptCaching(options)) payload.promptCacheKey = options.sessionId;
+	if (shouldUsePromptCaching(options)) (payload as Record<string, unknown>).promptCacheKey = options.sessionId;
 
 	if (context.systemPrompt) {
 		payload.messages.unshift({
