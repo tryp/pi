@@ -8,11 +8,15 @@
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
-			"import": "./dist/index.js"
+			"import": "./dist/index.js",
+			"require": "./dist/index.js",
+			"default": "./dist/index.js"
 		},
 		"./node": {
 			"types": "./dist/node.d.ts",
-			"import": "./dist/node.js"
+			"import": "./dist/node.js",
+			"require": "./dist/node.js",
+			"default": "./dist/node.js"
 		},
 		"./package.json": "./package.json"
 	},
