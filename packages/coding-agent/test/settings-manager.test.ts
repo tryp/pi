@@ -354,6 +354,27 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("hideQueuePanel", () => {
+		it("should default to hidden (true)", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getHideQueuePanel()).toBe(true);
+		});
+
+		it("should respect global setting", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ hideQueuePanel: false }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getHideQueuePanel()).toBe(false);
+		});
+
+		it("should persist setHideQueuePanel to global settings", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setHideQueuePanel(false);
+			await manager.flush();
+			const reloaded = SettingsManager.create(projectDir, agentDir);
+			expect(reloaded.getHideQueuePanel()).toBe(false);
+		});
+	});
+
 	describe("externalEditor", () => {
 		const originalVisual = process.env.VISUAL;
 		const originalEditor = process.env.EDITOR;
