@@ -270,7 +270,7 @@ describe("Coding Agent Tools", () => {
 				edits: [{ oldText: "world", newText: "testing" }],
 			});
 
-			expect(getTextOutput(result)).toContain("Successfully replaced");
+			expect(getTextOutput(result)).toContain("block(s) replaced");
 			expect(result.details).toBeDefined();
 			expect(result.details.diff).toBeDefined();
 			expect(typeof result.details.diff).toBe("string");
@@ -332,7 +332,7 @@ describe("Coding Agent Tools", () => {
 				],
 			});
 
-			expect(getTextOutput(result)).toContain("Successfully replaced 2 block(s)");
+			expect(getTextOutput(result)).toContain("2 block(s) replaced");
 			expect(readFileSync(testFile, "utf-8")).toBe("ALPHA\nbeta\nGAMMA\ndelta\n");
 			expect(result.details?.diff).toContain("ALPHA");
 			expect(result.details?.diff).toContain("GAMMA");
@@ -914,7 +914,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "line one\nline two\n", newText: "replaced\n" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("replaced\nline three\n");
 	});
@@ -928,7 +928,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "你好,世界\n你好(世界)\n", newText: "你好，pi\n你好(pi)\n" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("你好，pi\n你好(pi)\n");
 	});
@@ -942,7 +942,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "ABC123\ncafé\n", newText: "XYZ789\ncoffee\n" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("XYZ789\ncoffee\n");
 	});
@@ -958,7 +958,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "console.log('hello');", newText: "console.log('world');" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toContain("world");
 	});
@@ -974,7 +974,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: 'const msg = "Hello World";', newText: 'const msg = "Goodbye";' }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toContain("Goodbye");
 	});
@@ -990,7 +990,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "range: 1-5\nbreak-here", newText: "range: 10-50\nbreak--here" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toContain("10-50");
 	});
@@ -1006,7 +1006,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "hello world", newText: "hello universe" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toContain("universe");
 	});
@@ -1021,7 +1021,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "const x = 'exact';", newText: "const x = 'changed';" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("const x = 'changed';\nconst y = 'other';\n");
 	});
@@ -1140,7 +1140,7 @@ describe("edit tool CRLF handling", () => {
 			edits: [{ oldText: "line two\n", newText: "replaced line\n" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 	});
 
 	it("should preserve CRLF line endings after edit", async () => {
