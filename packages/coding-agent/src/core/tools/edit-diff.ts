@@ -247,17 +247,24 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 		return fuzzyResult(fuzzyIndex, fuzzyOldText.length);
 	}
 
-	// ── Fallback 1: Prepend leading \n ──
-	// Agent reads indented code blocks but drops the preceding newline that
-	// separates blocks in the file. Prepending \n catches ~62% of remaining failures.
-	if (fuzzyOldText.length > 0 && fuzzyOldText[0] !== "\n") {
-		const patchedOldText = "\n" + fuzzyOldText;
-		const patchedIndex = fuzzyContent.indexOf(patchedOldText);
-		if (patchedIndex !== -1) {
-			// Match starts after the prepended \n so we don't consume the
-			// file's inter-block newline during replacement.
-			return fuzzyResult(patchedIndex + 1, fuzzyOldText.length);
+	// ── Fallback 1: reinsert a dropped blank-line separator ──
+	// Agent copies an indented block but drops the blank line separating it
+	// from the preceding line (oldText = "prev\nblock", file = "prev\n\nblock").
+	// Try matching with a blank line reinserted after each line boundary.
+	const withBlankLineInserted = (text: string): number => {
+		const lines = text.split("\n");
+		for (let i = 0; i < lines.length - 1; i++) {
+			const candidate = [...lines.slice(0, i + 1), "", ...lines.slice(i + 1)].join("\n");
+			if (candidate === text) continue;
+			const idx = fuzzyContent.indexOf(candidate);
+			if (idx !== -1) return idx;
 		}
+		return -1;
+	};
+	let fallbackIndex = withBlankLineInserted(fuzzyOldText);
+	if (fallbackIndex !== -1) {
+		// The match includes the reinserted blank line (+1 char)
+		return fuzzyResult(fallbackIndex, fuzzyOldText.length + 1);
 	}
 
 	// ── Fallback 2: Normalize tabs to 4 spaces ──
@@ -269,14 +276,11 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 			return fuzzyResult(tabIndex, tabNormalized.length);
 		}
 
-		// ── Fallback 3: Prepend \n + normalize tabs ──
+		// ── Fallback 3: blank-line reinsertion + tab normalization ──
 		// Combine #1 and #2 for cases where both issues apply.
-		if (tabNormalized.length > 0 && tabNormalized[0] !== "\n") {
-			const patchedTab = "\n" + tabNormalized;
-			const patchedTabIndex = fuzzyContent.indexOf(patchedTab);
-			if (patchedTabIndex !== -1) {
-				return fuzzyResult(patchedTabIndex + 1, tabNormalized.length);
-			}
+		fallbackIndex = withBlankLineInserted(tabNormalized);
+		if (fallbackIndex !== -1) {
+			return fuzzyResult(fallbackIndex, tabNormalized.length + 1);
 		}
 	}
 
@@ -313,23 +317,29 @@ function countOccurrences(content: string, oldText: string): number {
 	let count = fuzzyContent.split(fuzzyOldText).length - 1;
 	if (count > 0) return count;
 
-	// Try \n-prepend fallback (same strategy as fuzzyFindText)
-	if (fuzzyOldText.length > 0 && fuzzyOldText[0] !== "\n") {
-		count = fuzzyContent.split("\n" + fuzzyOldText).length - 1;
-		if (count > 0) return count;
-	}
+	// Blank-line reinsertion fallback (same strategy as fuzzyFindText)
+	const countWithBlankLineInserted = (text: string): number => {
+		const lines = text.split("\n");
+		for (let i = 0; i < lines.length - 1; i++) {
+			const candidate = [...lines.slice(0, i + 1), "", ...lines.slice(i + 1)].join("\n");
+			if (candidate === text) continue;
+			const c = fuzzyContent.split(candidate).length - 1;
+			if (c > 0) return c;
+		}
+		return 0;
+	};
+	count = countWithBlankLineInserted(fuzzyOldText);
+	if (count > 0) return count;
 
-	// Try tab-normalization fallback
+	// Tab-normalization fallback
 	if (oldText.includes("\t")) {
 		const tabNormalized = normalizeForFuzzyMatch(oldText.replace(/\t/g, "    "));
 		count = fuzzyContent.split(tabNormalized).length - 1;
 		if (count > 0) return count;
 
-		// Combined \n-prepend + tab-normalization
-		if (tabNormalized.length > 0 && tabNormalized[0] !== "\n") {
-			count = fuzzyContent.split("\n" + tabNormalized).length - 1;
-			if (count > 0) return count;
-		}
+		// Combined blank-line reinsertion + tab-normalization
+		count = countWithBlankLineInserted(tabNormalized);
+		if (count > 0) return count;
 	}
 
 	// Try stripping extra leading blank lines
