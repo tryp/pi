@@ -132,6 +132,62 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
+	it("should not continue after threshold compaction when last message is assistant and nothing is queued", async () => {
+		settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+		const model = session.model!;
+		const now = Date.now();
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "message to compact" }],
+			timestamp: now - 1000,
+		});
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "assistant response to compact" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 100,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: now - 500,
+		});
+		session.agent.state.messages = sessionManager.buildSessionContext().messages;
+		session.agent.streamFunction = () => {
+			const stream = createAssistantMessageEventStream();
+			void Promise.resolve().then(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: fauxAssistantMessage("compacted"),
+				});
+			});
+			return stream;
+		};
+
+		// No queued follow-up/steering messages: agent cannot resume from an
+		// assistant last message, so _runAutoCompaction must let the turn end.
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		const runAutoCompaction = (
+			session as unknown as {
+				_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
+			}
+		)._runAutoCompaction.bind(session);
+
+		await expect(runAutoCompaction("threshold", false)).resolves.toBe(false);
+
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
 	it("should not compact repeatedly after overflow recovery already attempted", async () => {
 		const model = session.model!;
 		const overflowMessage: AssistantMessage = {
