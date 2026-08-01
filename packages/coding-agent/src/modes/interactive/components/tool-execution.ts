@@ -180,7 +180,7 @@ export class ToolExecutionComponent extends Container {
 		if (caps.images !== "kitty") return;
 		if (!this.result) return;
 
-		const imageBlocks = this.result.content.filter((c) => c.type === "image");
+		const imageBlocks = this.resultContent().filter((c) => c.type === "image");
 		for (let i = 0; i < imageBlocks.length; i++) {
 			const img = imageBlocks[i];
 			if (!img.data || !img.mimeType) continue;
@@ -328,7 +328,7 @@ export class ToolExecutionComponent extends Container {
 		this.imageSpacers = [];
 
 		if (this.result) {
-			const imageBlocks = this.result.content.filter((c) => c.type === "image");
+			const imageBlocks = this.resultContent().filter((c) => c.type === "image");
 			const caps = getCapabilities();
 			for (let i = 0; i < imageBlocks.length; i++) {
 				const img = imageBlocks[i];
@@ -360,6 +360,10 @@ export class ToolExecutionComponent extends Container {
 
 	private getTextOutput(): string {
 		return getRenderedTextOutput(this.result, this.showImages);
+	}
+
+	private resultContent(): Array<{ type: string; text?: string; data?: string; mimeType?: string }> {
+		return Array.isArray(this.result?.content) ? this.result.content : [];
 	}
 
 	private formatToolExecution(): string {
