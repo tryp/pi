@@ -7,7 +7,7 @@
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { contentText, type RetryCallbacks, type RetryPolicy, retryAssistantCall, uuidv7 } from "@earendil-works/pi-ai";
-import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, Context, Model, SimpleStreamOptions, TextContent, ThinkingContent, ToolCall, Usage } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { convertToLlm } from "../messages.ts";
 import {
@@ -287,14 +287,17 @@ export function estimateTokens(message: AgentMessage): number {
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
-			if (typeof assistant.content === "string") {
-				chars = assistant.content.length;
+			const assistantContent = assistant.content as
+				| string
+				| Array<TextContent | ThinkingContent | ToolCall>;
+			if (typeof assistantContent === "string") {
+				chars = assistantContent.length;
 				return Math.ceil(chars / 4);
 			}
-			if (!Array.isArray(assistant.content)) {
+			if (!Array.isArray(assistantContent)) {
 				return 0;
 			}
-			for (const block of assistant.content) {
+			for (const block of assistantContent) {
 				if (block.type === "text") {
 					chars += block.text.length;
 				} else if (block.type === "thinking") {
