@@ -1780,9 +1780,20 @@ export class AgentSession {
 	 * Aborts current agent operation first.
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
-		this._disconnectFromAgent();
-		await this.abort();
+	async compact(customInstructions?: string, _capturedIsStreaming?: boolean): Promise<CompactionResult> {
+		// Use the captured streaming state if provided (from ctx.compact()),
+		// otherwise check for an actual active LLM stream or tool execution.
+		// We CANNOT use this.isStreaming here — it is true throughout the
+		// agent's run (including between turns), which causes the compaction
+		// to abort the *next* turn's LLM request if steering/follow-up
+		// messages arrive before the compaction microtask runs.
+		const _isStreaming = _capturedIsStreaming !== undefined ? _capturedIsStreaming :
+			this.agent.state.streamingMessage !== undefined ||
+			(this.agent.state.pendingToolCalls?.size ?? 0) > 0;
+		if (_isStreaming) {
+			this._disconnectFromAgent();
+			await this.abort();
+		}
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 
@@ -2190,9 +2201,15 @@ export class AgentSession {
 				return true;
 			}
 
-			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-			// Continue once so queued messages are delivered.
-			return this.agent.hasQueuedMessages();
+			// After threshold compaction, only continue if the agent can resume.
+			// If the last message is assistant and there are no queued steer/followup
+			// messages, continue() would throw. Let the turn end normally instead.
+			const msgs = this.agent.state.messages;
+			const last = msgs[msgs.length - 1];
+			if (last?.role !== "assistant" || this.agent.hasQueuedMessages()) {
+				return true;
+			}
+			return false;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			if (started) {

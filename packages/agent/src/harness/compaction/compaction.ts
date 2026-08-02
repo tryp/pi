@@ -272,6 +272,10 @@ function estimateTextAndImageContentChars(content: string | Array<{ type: string
 		return content.length;
 	}
 
+	if (!Array.isArray(content)) {
+		return 0;
+	}
+
 	let chars = 0;
 	for (const block of content) {
 		if (block.type === "text" && block.text) {
@@ -296,7 +300,15 @@ export function estimateTokens(message: AgentMessage): number {
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
-			for (const block of assistant.content) {
+			const content = assistant.content as unknown;
+			if (typeof content === "string") {
+				chars = content.length;
+				return Math.ceil(chars / 4);
+			}
+			if (!Array.isArray(content)) {
+				return 0;
+			}
+			for (const block of content) {
 				if (block.type === "text") {
 					chars += block.text.length;
 				} else if (block.type === "thinking") {
