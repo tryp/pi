@@ -113,10 +113,11 @@ export class FooterComponent implements Component {
 		// Replace home directory with ~
 		let pwd = formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
 
-		// Add git branch if available
+		// Add git branch, and identify linked worktrees when applicable.
 		const branch = this.footerData.getGitBranch();
 		if (branch) {
-			pwd = `${pwd} (${branch})`;
+			const worktree = this.footerData.getGitWorktree();
+			pwd = `${pwd} (${branch}${worktree ? ` @ ${worktree}` : ""})`;
 		}
 
 		// Add session name if set

@@ -1,12 +1,13 @@
 import { type ExecFileException, execFile, spawnSync } from "child_process";
 import { existsSync, type FSWatcher, readFileSync, type Stats, statSync, unwatchFile, watchFile } from "fs";
-import { dirname, join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 import { closeWatcher, FS_WATCH_RETRY_DELAY_MS, watchWithErrorHandler } from "../utils/fs-watch.ts";
 
 export type GitPaths = {
 	repoDir: string;
 	commonGitDir: string;
 	headPath: string;
+	worktreeName: string | null;
 };
 
 /**
@@ -27,15 +28,22 @@ export function findGitPaths(cwd: string): GitPaths | null {
 						const headPath = join(gitDir, "HEAD");
 						if (!existsSync(headPath)) return null;
 						const commonDirPath = join(gitDir, "commondir");
-						const commonGitDir = existsSync(commonDirPath)
+						const hasCommonDir = existsSync(commonDirPath);
+						const commonGitDir = hasCommonDir
 							? resolve(gitDir, readFileSync(commonDirPath, "utf8").trim())
 							: gitDir;
-						return { repoDir: dir, commonGitDir, headPath };
+						const isLinkedWorktree = hasCommonDir && basename(dirname(gitDir)) === "worktrees";
+						return {
+							repoDir: dir,
+							commonGitDir,
+							headPath,
+							worktreeName: isLinkedWorktree ? basename(gitDir) : null,
+						};
 					}
 				} else if (stat.isDirectory()) {
 					const headPath = join(gitPath, "HEAD");
 					if (!existsSync(headPath)) return null;
-					return { repoDir: dir, commonGitDir: gitPath, headPath };
+					return { repoDir: dir, commonGitDir: gitPath, headPath, worktreeName: null };
 				}
 			} catch {
 				return null;
@@ -129,6 +137,11 @@ export class FooterDataProvider {
 			this.cachedBranch = this.resolveGitBranchSync();
 		}
 		return this.cachedBranch;
+	}
+
+	/** Linked worktree name, or null for the main worktree and non-repositories. */
+	getGitWorktree(): string | null {
+		return this.gitPaths?.worktreeName ?? null;
 	}
 
 	/** Extension status texts set via ctx.ui.setStatus() */
@@ -384,5 +397,5 @@ export class FooterDataProvider {
 /** Read-only view for extensions - excludes setExtensionStatus, setAvailableProviderCount and dispose */
 export type ReadonlyFooterDataProvider = Pick<
 	FooterDataProvider,
-	"getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
+	"getGitBranch" | "getGitWorktree" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
 >;

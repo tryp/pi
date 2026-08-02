@@ -77,6 +77,16 @@ function createReftableWorktree(tempDir: string): WorktreeFixture {
 	return { worktreeDir, reftableDir };
 }
 
+function createSubmodule(tempDir: string): string {
+	const gitDir = join(tempDir, "repo", ".git", "modules", "child");
+	const submoduleDir = join(tempDir, "submodule");
+	mkdirSync(gitDir, { recursive: true });
+	mkdirSync(submoduleDir, { recursive: true });
+	writeFileSync(join(submoduleDir, ".git"), `gitdir: ${gitDir}\n`);
+	writeFileSync(join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+	return submoduleDir;
+}
+
 async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
 	const startedAt = Date.now();
 	while (!condition()) {
@@ -115,6 +125,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 		const provider = new FooterDataProvider(nestedDir);
 		try {
 			expect(provider.getGitBranch()).toBe("main");
+			expect(provider.getGitWorktree()).toBeNull();
 			expect(vi.mocked(spawnSync)).not.toHaveBeenCalled();
 		} finally {
 			provider.dispose();
@@ -149,6 +160,20 @@ describe("FooterDataProvider reftable branch detection", () => {
 		const provider = new FooterDataProvider(worktreeDir);
 		try {
 			expect(provider.getGitBranch()).toBe("main");
+			expect(provider.getGitWorktree()).toBe("src");
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	it("does not label submodules as linked worktrees", () => {
+		const submoduleDir = createSubmodule(tempDir);
+		process.chdir(submoduleDir);
+
+		const provider = new FooterDataProvider(submoduleDir);
+		try {
+			expect(provider.getGitBranch()).toBe("main");
+			expect(provider.getGitWorktree()).toBeNull();
 		} finally {
 			provider.dispose();
 		}
