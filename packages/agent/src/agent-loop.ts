@@ -606,9 +606,16 @@ async function prepareToolCall(
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
 	if (!tool) {
+		const availableTools = currentContext.tools
+			?.map((t) => t.name)
+			.sort()
+			.join(", ");
+		const msg = availableTools
+			? `Tool "${toolCall.name}" not found. Available tools: ${availableTools}.`
+			: `Tool "${toolCall.name}" not found.`;
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			result: createErrorToolResult(msg),
 			isError: true,
 		};
 	}
@@ -714,7 +721,7 @@ async function finalizeExecutedToolCall(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 ): Promise<FinalizedToolCallOutcome> {
-	let result = executed.result;
+	let result = normalizeToolResult(executed.result);
 	let isError = executed.isError;
 
 	if (config.afterToolCall) {
@@ -758,6 +765,26 @@ function createErrorToolResult(message: string): AgentToolResult<any> {
 		content: [{ type: "text", text: message }],
 		details: {},
 	};
+}
+
+/**
+ * Normalize a raw tool execute() return into an AgentToolResult.
+ *
+ * Extension tools occasionally return plain strings or omit `content` entirely,
+ * violating the AgentToolResult contract. Without normalization the string flows
+ * into `tool_execution_end` as-is and the TUI crashes on `result.content.filter`
+ * (Cannot read properties of undefined), and `createToolResultMessage` silently
+ * delivers empty content to the model. Normalize once here so both the event and
+ * the message carry valid content.
+ */
+function normalizeToolResult(result: unknown): AgentToolResult<any> {
+	if (typeof result === "string") {
+		return { content: [{ type: "text", text: result }], details: {} };
+	}
+	if (result && typeof result === "object" && Array.isArray((result as any).content)) {
+		return result as AgentToolResult<any>;
+	}
+	return { ...((result as object) ?? {}), content: (result as any)?.content ?? [] } as AgentToolResult<any>;
 }
 
 async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: AgentEventSink): Promise<void> {
