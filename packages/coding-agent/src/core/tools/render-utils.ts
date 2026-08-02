@@ -37,7 +37,7 @@ export function normalizeDisplayText(text: string): string {
 }
 
 export function getTextOutput(
-	result: { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> } | undefined,
+	result: { content?: Array<{ type: string; text?: string; data?: string; mimeType?: string }> } | undefined,
 	showImages: boolean,
 ): string {
 	if (!result || !Array.isArray(result.content)) return "";

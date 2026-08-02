@@ -2918,6 +2918,17 @@ export class InteractiveMode {
 		});
 	}
 
+	/** Normalize a tool result that may be a plain string into the expected shape with content. */
+	private normalizeToolResult(
+		result: unknown,
+		isError: boolean,
+	): { content: { type: string; text?: string }[]; isError: boolean } {
+		if (typeof result === "string") {
+			return { content: [{ type: "text", text: result }], isError };
+		}
+		return { ...(result as any), isError } as any;
+	}
+
 	private async handleEvent(event: AgentSessionEvent): Promise<void> {
 		if (!this.isInitialized) {
 			await this.init();
@@ -3104,7 +3115,8 @@ export class InteractiveMode {
 			case "tool_execution_update": {
 				const component = this.pendingTools.get(event.toolCallId);
 				if (component) {
-					component.updateResult({ ...event.partialResult, isError: false }, true);
+					const normalized = this.normalizeToolResult(event.partialResult, false);
+					component.updateResult(normalized, true);
 					this.ui.requestRender();
 				}
 				break;
@@ -3113,7 +3125,8 @@ export class InteractiveMode {
 			case "tool_execution_end": {
 				const component = this.pendingTools.get(event.toolCallId);
 				if (component) {
-					component.updateResult({ ...event.result, isError: event.isError });
+					const normalized = this.normalizeToolResult(event.result, event.isError);
+					component.updateResult(normalized);
 					this.pendingTools.delete(event.toolCallId);
 					this.ui.requestRender();
 				}

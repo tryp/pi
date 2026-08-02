@@ -99,6 +99,14 @@ export function serializeConversation(messages: Message[]): string {
 			const thinkingParts: string[] = [];
 			const toolCalls: string[] = [];
 
+			if (typeof msg.content === "string") {
+				if (msg.content) parts.push(`[Assistant]: ${msg.content}`);
+				continue;
+			}
+			if (!Array.isArray(msg.content)) {
+				continue;
+			}
+
 			for (const block of msg.content) {
 				if (block.type === "thinking") {
 					thinkingParts.push(block.thinking);

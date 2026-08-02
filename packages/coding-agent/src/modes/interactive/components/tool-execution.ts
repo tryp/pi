@@ -178,7 +178,7 @@ export class ToolExecutionComponent extends Container {
 	private maybeConvertImagesForKitty(): void {
 		const caps = getCapabilities();
 		if (caps.images !== "kitty") return;
-		if (!this.result) return;
+		if (!this.result?.content) return;
 
 		const imageBlocks = this.resultContent().filter((c) => c.type === "image");
 		for (let i = 0; i < imageBlocks.length; i++) {
