@@ -84,7 +84,10 @@ if [ "$PROMOTE" = "1" ]; then
     git branch -f main HEAD
     git checkout main
     echo "=== Pushing main to fork ==="
-    git push "$FORK_REMOTE" main
+    # Promotion replaces the old mainline history with the rebased branch.
+    # The subject-containment check above guarantees no commit is lost, so
+    # this is a safe force push (--force-with-lease guards against races).
+    git push "$FORK_REMOTE" main --force-with-lease
     echo ""
     echo "=== Done ==="
     echo "main is now at: $(git log --oneline main -1)"
