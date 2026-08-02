@@ -1247,6 +1247,19 @@ export interface ExtensionAPI {
 		tool: ToolDefinition<TParams, TDetails, TState>,
 	): void;
 
+	/**
+	 * Contribute prompt guidelines for a specific tool.
+	 * Extensions use this to add relative guidance about core tools (e.g., LSP
+	 * guidelines for the read tool). Contributions are merged into the tool's
+	 * existing promptGuidelines and appear in the Guidelines section of the
+	 * system prompt alongside the tool's own guidelines.
+	 *
+	 * Multiple extensions can contribute guidelines for the same tool;
+	 * duplicates are removed. Core tools remain tool-agnostic — the extension
+	 * that introduces the relationship owns the guidance.
+	 */
+	registerToolPromptGuidelines(toolName: string, guidelines: string[]): void;
+
 	// =========================================================================
 	// Command, Shortcut, Flag Registration
 	// =========================================================================
@@ -1691,6 +1704,8 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	/** Prompt guideline contributions keyed by tool name. See ExtensionAPI.registerToolPromptGuidelines(). */
+	toolPromptGuidelineContributions: Map<string, string[]>;
 }
 
 /** Result of loading extensions. */

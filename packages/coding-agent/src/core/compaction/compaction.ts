@@ -287,7 +287,6 @@ export function estimateTokens(message: AgentMessage): number {
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
-<<<<<<< HEAD
 			const assistantContent = assistant.content as
 				| string
 				| Array<TextContent | ThinkingContent | ToolCall>;
@@ -299,12 +298,6 @@ export function estimateTokens(message: AgentMessage): number {
 				return 0;
 			}
 			for (const block of assistantContent) {
-=======
-			if (!Array.isArray(assistant.content)) {
-				return 0;
-			}
-			for (const block of assistant.content) {
->>>>>>> c026afe01 (fix: prevent pi subprocess hang on non-TTY non-pipe stdin)
 				if (block.type === "text") {
 					chars += block.text.length;
 				} else if (block.type === "thinking") {
