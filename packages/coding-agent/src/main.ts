@@ -5,6 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { fstatSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
@@ -67,6 +68,20 @@ const EXTENSION_LOAD_FAILURE_HINT = 'Hint: Start without extensions using "pi -n
 async function readPipedStdin(): Promise<string | undefined> {
 	// If stdin is a TTY, we're running interactively - don't read stdin
 	if (process.stdin.isTTY) {
+		return undefined;
+	}
+
+	// Check the stdin file descriptor type to avoid hanging when stdin
+	// is not a TTY but also not a pipe (e.g., child process spawned with
+	// 'ignore' stdio or fd 0 pointing to /dev/null). Only read from stdin
+	// if it's a FIFO (pipe) or regular file (input redirection).
+	try {
+		const stat = fstatSync(0);
+		if (!stat.isFIFO() && !stat.isFile()) {
+			return undefined;
+		}
+	} catch {
+		// EBADF or other error = fd is closed, skip stdin read
 		return undefined;
 	}
 
