@@ -36,7 +36,9 @@ const replaceEditSchema = Type.Object(
 			description:
 				"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.",
 		}),
-		newText: Type.String({ description: "Replacement text for this targeted edit." }),
+		newText: Type.Optional(
+			Type.String({ description: "Replacement text for this targeted edit. Omit to delete oldText." }),
+		),
 	},
 	{},
 );
@@ -54,6 +56,7 @@ const editSchema = Type.Object(
 
 export type EditToolInput = Static<typeof editSchema>;
 type LegacyEditToolInput = EditToolInput & {
+	file_path?: unknown;
 	oldText?: unknown;
 	newText?: unknown;
 };
@@ -65,6 +68,10 @@ export interface EditToolDetails {
 	patch: string;
 	/** Line number of the first change in the new file (for editor navigation) */
 	firstChangedLine?: number;
+	/** Number of lines added, for git-style diffstat */
+	addedLines: number;
+	/** Number of lines removed, for git-style diffstat */
+	removedLines: number;
 }
 
 /**
@@ -98,6 +105,13 @@ function prepareEditArguments(input: unknown): EditToolInput {
 
 	const args = input as Record<string, unknown>;
 
+	// Some clients use file_path instead of path. Normalize it before schema validation.
+	if (typeof args.path !== "string" && typeof args.file_path === "string") {
+		const { file_path, ...rest } = args;
+		Object.assign(args, { ...rest, path: file_path });
+	}
+	delete args.file_path;
+
 	// Some models (Opus 4.6, GLM-5.1) send edits as a JSON string instead of an array
 	if (typeof args.edits === "string") {
 		try {
@@ -107,12 +121,17 @@ function prepareEditArguments(input: unknown): EditToolInput {
 	}
 
 	const legacy = args as LegacyEditToolInput;
-	if (typeof legacy.oldText !== "string" || typeof legacy.newText !== "string") {
+	if (typeof legacy.oldText !== "string") {
+		return args as EditToolInput;
+	}
+	if (legacy.newText !== undefined && typeof legacy.newText !== "string") {
 		return args as EditToolInput;
 	}
 
 	const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : [];
-	edits.push({ oldText: legacy.oldText, newText: legacy.newText });
+	const replacement: { oldText: string; newText?: string } = { oldText: legacy.oldText };
+	if (typeof legacy.newText === "string") replacement.newText = legacy.newText;
+	edits.push(replacement);
 	const { oldText: _oldText, newText: _newText, ...rest } = legacy;
 	return { ...rest, edits } as EditToolInput;
 }
@@ -121,7 +140,9 @@ function validateEditInput(input: EditToolInput): { path: string; edits: Edit[] 
 	if (!Array.isArray(input.edits) || input.edits.length === 0) {
 		throw new Error("Edit tool input is invalid. edits must contain at least one replacement.");
 	}
-	return { path: input.path, edits: input.edits };
+	// Normalize: absent newText means deletion (empty string replacement)
+	const edits: Edit[] = input.edits.map((e) => ({ oldText: e.oldText, newText: e.newText ?? "" }));
+	return { path: input.path, edits };
 }
 
 type RenderableEditArgs = {
@@ -177,16 +198,14 @@ function getRenderablePreviewInput(args: RenderableEditArgs | undefined): { path
 		return null;
 	}
 
-	if (
-		Array.isArray(args.edits) &&
-		args.edits.length > 0 &&
-		args.edits.every((edit) => typeof edit?.oldText === "string" && typeof edit?.newText === "string")
-	) {
-		return { path, edits: args.edits };
+	if (Array.isArray(args.edits) && args.edits.length > 0) {
+		// Normalize: absent newText means deletion (empty string replacement)
+		const edits: Edit[] = args.edits.map((e) => ({ oldText: e.oldText, newText: e.newText ?? "" }));
+		return { path, edits };
 	}
 
-	if (typeof args.oldText === "string" && typeof args.newText === "string") {
-		return { path, edits: [{ oldText: args.oldText, newText: args.newText }] };
+	if (typeof args.oldText === "string") {
+		return { path, edits: [{ oldText: args.oldText, newText: args.newText ?? "" }] };
 	}
 
 	return null;
@@ -301,6 +320,8 @@ export function createEditToolDefinition(
 			"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
 			"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 			"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+			"On failure: the error message tells you exactly what went wrong (text not found, ambiguous match, overlapping edits, etc.). The file was not modified.",
+			"On success: the result shows a git-style diffstat (e.g. 'src/file.ts | 5 ++---') confirming the exact scope of changes.",
 		],
 		parameters: editSchema,
 		renderShell: "self",
@@ -349,14 +370,22 @@ export function createEditToolDefinition(
 
 				const diffResult = generateDiffString(baseContent, newContent);
 				const patch = generateUnifiedPatch(path, baseContent, newContent);
+
+				// Git-style diffstat
+				const total = diffResult.addedLines + diffResult.removedLines;
+				const barWidth = Math.min(total, 50);
+				const addChars = barWidth > 0 ? Math.round((diffResult.addedLines / total) * barWidth) : 0;
+				const remChars = barWidth - addChars;
+				const diffstat = `${path} | ${total} ${'+'.repeat(addChars)}${'-'.repeat(remChars)}`;
+
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+							text: `${diffstat}\n${edits.length} block(s) replaced.`,
 						},
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine, addedLines: diffResult.addedLines, removedLines: diffResult.removedLines },
 				};
 			});
 		},
@@ -401,7 +430,7 @@ export function createEditToolDefinition(
 					changed =
 						setEditPreview(
 							callComponent,
-							{ diff: resultDiff, firstChangedLine: typedResult.details?.firstChangedLine },
+							{ diff: resultDiff, firstChangedLine: typedResult.details?.firstChangedLine, addedLines: typedResult.details?.addedLines ?? 0, removedLines: typedResult.details?.removedLines ?? 0 },
 							argsKey,
 						) || changed;
 				}

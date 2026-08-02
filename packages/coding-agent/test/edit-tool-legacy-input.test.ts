@@ -37,6 +37,18 @@ describe("edit tool prepareArguments", () => {
 		});
 	});
 
+	it("normalizes file_path and supports top-level deletion input", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!({
+			file_path: "file.txt",
+			oldText: "before",
+		});
+		expect(prepared).toEqual({
+			path: "file.txt",
+			edits: [{ oldText: "before" }],
+		});
+	});
+
 	it("appends legacy replacement to existing edits", () => {
 		const definition = createEditToolDefinition(process.cwd());
 		const prepared = definition.prepareArguments!({
