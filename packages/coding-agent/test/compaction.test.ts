@@ -292,6 +292,56 @@ describe("shouldCompact", () => {
 
 		expect(shouldCompact(95000, 100000, settings)).toBe(false);
 	});
+
+	it("maxContextTokens acts as an absolute model-independent threshold", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+			maxContextTokens: 180000,
+		};
+
+		// Compact at the fixed level regardless of context window size
+		expect(shouldCompact(181000, 200000, settings)).toBe(true);
+		expect(shouldCompact(181000, 1000000, settings)).toBe(true);
+		expect(shouldCompact(179000, 200000, settings)).toBe(false);
+		expect(shouldCompact(179000, 1000000, settings)).toBe(false);
+	});
+
+	it("maxContextTokens overrides the window-relative threshold", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+			maxContextTokens: 50000,
+		};
+
+		// Window-relative threshold (window - reserve) would allow this,
+		// but the absolute maxContextTokens threshold must fire first.
+		expect(shouldCompact(60000, 200000, settings)).toBe(true);
+	});
+
+	it("falls back to window-relative threshold when maxContextTokens is unset", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+		};
+
+		expect(shouldCompact(190001, 200000, settings)).toBe(true);
+		expect(shouldCompact(180000, 200000, settings)).toBe(false);
+	});
+
+	it("disabled wins even when maxContextTokens would fire", () => {
+		const settings: CompactionSettings = {
+			enabled: false,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+			maxContextTokens: 50000,
+		};
+
+		expect(shouldCompact(60000, 200000, settings)).toBe(false);
+	});
 });
 
 describe("findCutPoint", () => {
