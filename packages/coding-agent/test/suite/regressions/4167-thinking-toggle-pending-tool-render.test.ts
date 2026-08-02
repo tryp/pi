@@ -51,6 +51,7 @@ type RenderSessionContextThis = {
 	getRegisteredToolDefinition(toolName: string): undefined;
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void;
 	renderSessionItems: RenderSessionItems;
+	normalizeToolResult(result: unknown, isError: boolean): { content: { type: string; text?: string }[]; isError: boolean };
 };
 
 type RenderSessionEntries = (
@@ -81,6 +82,9 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		getRegisteredToolDefinition: (_toolName: string) => undefined,
 		renderSessionItems: (InteractiveMode.prototype as unknown as { renderSessionItems: RenderSessionItems })
 			.renderSessionItems,
+		normalizeToolResult: (InteractiveMode.prototype as unknown as {
+			normalizeToolResult: RenderSessionContextThis["normalizeToolResult"];
+		}).normalizeToolResult,
 		addMessageToChat(message: AgentMessage) {
 			chatContainer.addChild(new Text(message.role, 0, 0));
 		},
