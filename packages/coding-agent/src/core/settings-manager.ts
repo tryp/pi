@@ -9,6 +9,31 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 
+export interface ContextSettings {
+	/**
+	 * Cap on total AGENTS.md/CLAUDE.md content injected into the system
+	 * prompt (bytes). Files beyond the budget are tail-truncated or dropped
+	 * with a visible notice. Default: 24 KiB (aligned with pi-context's
+	 * default inline capture limit).
+	 */
+	contextFilesMaxBytes?: number;
+	/** Cap on total lines of injected context-file content (default: 300). */
+	contextFilesMaxLines?: number;
+	/**
+	 * Max bytes of a single tool result kept inline before sidecar capture
+	 * (pi-context). Default: 24 KiB.
+	 */
+	captureMaxBytes?: number;
+	/** Max lines of a single tool result kept inline (pi-context). Default: 300. */
+	captureMaxLines?: number;
+	/** Sidecar retention in days (pi-context). Default: 7. */
+	retentionDays?: number;
+	/** Sidecar max size in MiB (pi-context). Default: null (no cap). */
+	maxMb?: number;
+	/** Purge sidecar sources on shutdown (pi-context). Default: false. */
+	purgeOnShutdown?: boolean;
+}
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
@@ -94,6 +119,7 @@ export interface Settings {
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	context?: ContextSettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
@@ -787,6 +813,26 @@ export class SettingsManager {
 
 	getCompactionMaxContextTokens(): number | undefined {
 		return this.settings.compaction?.maxContextTokens;
+	}
+
+	getContextFilesMaxBytes(): number {
+		return this.settings.context?.contextFilesMaxBytes ?? 24 * 1024;
+	}
+
+	getContextFilesMaxLines(): number {
+		return this.settings.context?.contextFilesMaxLines ?? 300;
+	}
+
+	getContextSettings(): ContextSettings {
+		return {
+			contextFilesMaxBytes: this.getContextFilesMaxBytes(),
+			contextFilesMaxLines: this.getContextFilesMaxLines(),
+			captureMaxBytes: this.settings.context?.captureMaxBytes ?? 24 * 1024,
+			captureMaxLines: this.settings.context?.captureMaxLines ?? 300,
+			retentionDays: this.settings.context?.retentionDays ?? 7,
+			maxMb: this.settings.context?.maxMb ?? undefined,
+			purgeOnShutdown: this.settings.context?.purgeOnShutdown ?? false,
+		};
 	}
 
 	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number; maxContextTokens?: number } {

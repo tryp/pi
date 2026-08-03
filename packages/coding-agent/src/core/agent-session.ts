@@ -1126,6 +1126,8 @@ export class AgentSession {
 			cwd: this._cwd,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
+			contextFilesMaxBytes: this.settingsManager.getContextFilesMaxBytes(),
+			contextFilesMaxLines: this.settingsManager.getContextFilesMaxLines(),
 			customPrompt: loaderSystemPrompt,
 			appendSystemPrompt,
 			selectedTools: validToolNames,

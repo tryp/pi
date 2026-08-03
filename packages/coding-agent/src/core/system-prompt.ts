@@ -5,6 +5,9 @@
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
 import { formatSkillsForPrompt, type Skill } from "./skills.ts";
 
+/** Default cap on AGENTS.md/CLAUDE.md content injected into the system prompt. */
+export const DEFAULT_CONTEXT_FILES_MAX_BYTES = 24 * 1024;
+
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
@@ -22,6 +25,102 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
+	/**
+	 * Total byte budget for context-file content injected into the system
+	 * prompt. Files beyond the budget are tail-truncated or dropped with a
+	 * visible notice so the agent can review what was omitted.
+	 */
+	contextFilesMaxBytes?: number;
+	/** Total line budget for injected context-file content. */
+	contextFilesMaxLines?: number;
+}
+
+/**
+ * Apply a byte/line budget to context files for system-prompt injection.
+ * Returns { files, notices } where notices describe truncations/drops.
+ *
+ * Files are prioritized most-local-first (cwd over ancestors over global),
+ * so a large AGENTS.md at the repo root cannot starve the project's own
+ * instructions. Rendering order is preserved (load order).
+ */
+export function applyContextFileBudget(
+	contextFiles: Array<{ path: string; content: string }>,
+	maxBytes: number,
+	maxLines: number,
+): { files: Array<{ path: string; content: string }>; notices: string[] } {
+	const sized = contextFiles.map((file) => ({
+		...file,
+		byteLength: Buffer.byteLength(file.content, "utf8"),
+		lineCount: file.content.split("\n").length,
+	}));
+
+	const notices: string[] = [];
+	let remainingBytes = maxBytes;
+	let remainingLines = maxLines;
+
+	// Most-local first (reverse of load order: global, root..cwd).
+	const budgeted: Array<{ path: string; content: string } | null> = new Array(sized.length).fill(null);
+	for (let i = sized.length - 1; i >= 0; i--) {
+		const file = sized[i]!;
+		if (remainingBytes <= 0 || remainingLines <= 0) {
+			notices.push(`dropped ${file.path}`);
+			continue;
+		}
+		const bytesBudget = Math.min(remainingBytes, file.byteLength);
+		const linesBudget = Math.min(remainingLines, file.lineCount);
+		if (bytesBudget < file.byteLength || linesBudget < file.lineCount) {
+			// Trim to the tighter budget, cutting at a line boundary (keep head).
+			const lines = file.content.split("\n");
+			const kept: string[] = [];
+			let keptBytes = 0;
+			for (const line of lines) {
+				const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+				if (kept.length + 1 > linesBudget || keptBytes + lineBytes > bytesBudget) break;
+				kept.push(line);
+				keptBytes += lineBytes;
+			}
+			if (kept.length > 0) {
+				budgeted[i] = { path: file.path, content: kept.join("\n") };
+				remainingBytes -= keptBytes;
+				remainingLines -= kept.length + 1;
+			}
+			notices.push(
+				`truncated ${file.path} (${kept.length} of ${file.lineCount} lines, ${Math.round(keptBytes / 1024)} of ${Math.round(file.byteLength / 1024)} KiB)`,
+			);
+		} else {
+			budgeted[i] = file;
+			remainingBytes -= file.byteLength;
+			remainingLines -= file.lineCount;
+		}
+	}
+
+	const files = sized
+		.map((_, index) => budgeted[index])
+		.filter((file): file is { path: string; content: string } => file !== null);
+	return { files, notices };
+}
+
+function renderProjectContext(
+	contextFiles: Array<{ path: string; content: string }>,
+	contextFilesMaxBytes?: number,
+	contextFilesMaxLines?: number,
+): string {
+	if (contextFiles.length === 0) return "";
+
+	const maxBytes = contextFilesMaxBytes ?? DEFAULT_CONTEXT_FILES_MAX_BYTES;
+	const maxLines = contextFilesMaxLines ?? 300;
+	const { files, notices } = applyContextFileBudget(contextFiles, maxBytes, maxLines);
+
+	let prompt = "\n\n<project_context>\n\n";
+	prompt += "Project-specific instructions and guidelines:\n\n";
+	for (const { path: filePath, content } of files) {
+		prompt += `<project_instructions path="${filePath}">\n${content}\n</project_instructions>\n\n`;
+	}
+	if (notices.length > 0) {
+		prompt += `[context files truncated: ${notices.join("; ")}]\n\n`;
+	}
+	prompt += "</project_context>\n";
+	return prompt;
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -42,6 +141,11 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
+	const projectContext = renderProjectContext(
+		contextFiles,
+		options.contextFilesMaxBytes,
+		options.contextFilesMaxLines,
+	);
 
 	if (customPrompt) {
 		let prompt = customPrompt;
@@ -51,13 +155,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		}
 
 		// Append project context files
-		if (contextFiles.length > 0) {
-			prompt += "\n\n<project_context>\n\n";
-			prompt += "Project-specific instructions and guidelines:\n\n";
-			for (const { path: filePath, content } of contextFiles) {
-				prompt += `<project_instructions path="${filePath}">\n${content}\n</project_instructions>\n\n`;
-			}
-			prompt += "</project_context>\n";
+		if (projectContext) {
+			prompt += projectContext;
 		}
 
 		// Append skills section (only if read tool is available)
@@ -142,13 +241,8 @@ Pi documentation (read only when the user asks about pi itself, its SDK, extensi
 	}
 
 	// Append project context files
-	if (contextFiles.length > 0) {
-		prompt += "\n\n<project_context>\n\n";
-		prompt += "Project-specific instructions and guidelines:\n\n";
-		for (const { path: filePath, content } of contextFiles) {
-			prompt += `<project_instructions path="${filePath}">\n${content}\n</project_instructions>\n\n`;
-		}
-		prompt += "</project_context>\n";
+	if (projectContext) {
+		prompt += projectContext;
 	}
 
 	// Append skills section (only if read tool is available)
