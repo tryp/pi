@@ -95,6 +95,7 @@ import type { UiMode } from "../../core/settings-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
+import { resolveToCwd } from "../../core/tools/path-utils.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
@@ -3089,6 +3090,13 @@ export class InteractiveMode {
 				break;
 
 			case "tool_execution_start": {
+				// Track the agent's working directory: when a tool call specifies a cwd
+				// (for example a git worktree checkout), move the footer's branch/worktree
+				// indicator to follow the agent instead of staying on the session root.
+				const perCallCwd = (event.args as { cwd?: unknown } | undefined)?.cwd;
+				if (typeof perCallCwd === "string" && perCallCwd.length > 0) {
+					this.footerDataProvider.setCwd(resolveToCwd(perCallCwd, this.sessionManager.getCwd()));
+				}
 				let component = this.pendingTools.get(event.toolCallId);
 				if (!component) {
 					component = new ToolExecutionComponent(

@@ -124,6 +124,7 @@ describe("FooterDataProvider reftable branch detection", () => {
 
 		const provider = new FooterDataProvider(nestedDir);
 		try {
+			expect(provider.getCwd()).toBe(nestedDir);
 			expect(provider.getGitBranch()).toBe("main");
 			expect(provider.getGitWorktree()).toBeNull();
 			expect(vi.mocked(spawnSync)).not.toHaveBeenCalled();

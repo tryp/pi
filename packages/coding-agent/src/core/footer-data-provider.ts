@@ -139,6 +139,11 @@ export class FooterDataProvider {
 		return this.cachedBranch;
 	}
 
+	/** Working directory the provider currently resolves git state for. */
+	getCwd(): string {
+		return this.cwd;
+	}
+
 	/** Linked worktree name, or null for the main worktree and non-repositories. */
 	getGitWorktree(): string | null {
 		return this.gitPaths?.worktreeName ?? null;
@@ -397,5 +402,10 @@ export class FooterDataProvider {
 /** Read-only view for extensions - excludes setExtensionStatus, setAvailableProviderCount and dispose */
 export type ReadonlyFooterDataProvider = Pick<
 	FooterDataProvider,
-	"getGitBranch" | "getGitWorktree" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
+	| "getCwd"
+	| "getGitBranch"
+	| "getGitWorktree"
+	| "getExtensionStatuses"
+	| "getAvailableProviderCount"
+	| "onBranchChange"
 >;
