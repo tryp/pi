@@ -20,7 +20,7 @@ import {
 	stripBom,
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
-import { resolveToCwd } from "./path-utils.ts";
+import { resolvePerCallCwd, resolveToCwd } from "./path-utils.ts";
 import { renderToolPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 
@@ -50,6 +50,12 @@ const editSchema = Type.Object(
 			description:
 				"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
 		}),
+		cwd: Type.Optional(
+			Type.String({
+				description:
+					"Working directory to resolve the path against. Use when editing a file outside the session working directory (for example in a git worktree). Defaults to the session working directory.",
+			}),
+		),
 	},
 	{},
 );
@@ -328,7 +334,7 @@ export function createEditToolDefinition(
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, _ctx?) {
 			const { path, edits } = validateEditInput(input);
-			const absolutePath = resolveToCwd(path, cwd);
+			const absolutePath = resolveToCwd(path, resolvePerCallCwd(input.cwd, cwd));
 
 			return withFileMutationQueue(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the
@@ -376,7 +382,7 @@ export function createEditToolDefinition(
 				const barWidth = Math.min(total, 50);
 				const addChars = barWidth > 0 ? Math.round((diffResult.addedLines / total) * barWidth) : 0;
 				const remChars = barWidth - addChars;
-				const diffstat = `${path} | ${total} ${'+'.repeat(addChars)}${'-'.repeat(remChars)}`;
+				const diffstat = `${path} | ${total} ${"+".repeat(addChars)}${"-".repeat(remChars)}`;
 
 				return {
 					content: [
@@ -385,7 +391,13 @@ export function createEditToolDefinition(
 							text: `${diffstat}\n${edits.length} block(s) replaced.`,
 						},
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine, addedLines: diffResult.addedLines, removedLines: diffResult.removedLines },
+					details: {
+						diff: diffResult.diff,
+						patch,
+						firstChangedLine: diffResult.firstChangedLine,
+						addedLines: diffResult.addedLines,
+						removedLines: diffResult.removedLines,
+					},
 				};
 			});
 		},
@@ -430,7 +442,12 @@ export function createEditToolDefinition(
 					changed =
 						setEditPreview(
 							callComponent,
-							{ diff: resultDiff, firstChangedLine: typedResult.details?.firstChangedLine, addedLines: typedResult.details?.addedLines ?? 0, removedLines: typedResult.details?.removedLines ?? 0 },
+							{
+								diff: resultDiff,
+								firstChangedLine: typedResult.details?.firstChangedLine,
+								addedLines: typedResult.details?.addedLines ?? 0,
+								removedLines: typedResult.details?.removedLines ?? 0,
+							},
 							argsKey,
 						) || changed;
 				}

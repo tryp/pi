@@ -1,6 +1,7 @@
 import { Box, type Component, Container, getCapabilities, Image, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext } from "../../../core/extensions/types.ts";
 import { createAllToolDefinitions, type ToolName } from "../../../core/tools/index.ts";
+import { resolvePerCallCwd } from "../../../core/tools/path-utils.ts";
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
 import { convertToPng } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
@@ -113,6 +114,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private getRenderContext(lastComponent: Component | undefined): ToolRenderContext {
+		const perCallCwd = (this.args as { cwd?: unknown } | undefined)?.cwd;
 		return {
 			args: this.args,
 			toolCallId: this.toolCallId,
@@ -122,7 +124,7 @@ export class ToolExecutionComponent extends Container {
 			},
 			lastComponent,
 			state: this.rendererState,
-			cwd: this.cwd,
+			cwd: resolvePerCallCwd(typeof perCallCwd === "string" ? perCallCwd : undefined, this.cwd),
 			executionStarted: this.executionStarted,
 			argsComplete: this.argsComplete,
 			isPartial: this.isPartial,

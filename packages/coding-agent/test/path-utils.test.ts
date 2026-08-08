@@ -2,7 +2,7 @@ import { mkdtempSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { expandPath, resolveReadPath, resolveToCwd } from "../src/core/tools/path-utils.ts";
+import { expandPath, resolvePerCallCwd, resolveReadPath, resolveToCwd } from "../src/core/tools/path-utils.ts";
 
 describe("path-utils", () => {
 	describe("expandPath", () => {
@@ -26,6 +26,30 @@ describe("path-utils", () => {
 			const withNBSP = "file\u00A0name.txt";
 			const result = expandPath(withNBSP);
 			expect(result).toBe("file name.txt");
+		});
+	});
+
+	describe("resolvePerCallCwd", () => {
+		it("returns the base cwd when no per-call cwd is provided", () => {
+			expect(resolvePerCallCwd(undefined, "/base/cwd")).toBe("/base/cwd");
+		});
+
+		it("treats an empty string as no per-call cwd", () => {
+			expect(resolvePerCallCwd("", "/base/cwd")).toBe("/base/cwd");
+		});
+
+		it("returns absolute per-call cwds as-is", () => {
+			expect(resolvePerCallCwd("/abs/worktree", "/base/cwd")).toBe("/abs/worktree");
+		});
+
+		it("resolves relative per-call cwds against the base cwd", () => {
+			expect(resolvePerCallCwd("worktrees/feature", "/base/cwd")).toBe(resolve("/base/cwd", "worktrees/feature"));
+		});
+
+		it("expands ~ in per-call cwds", () => {
+			const result = resolvePerCallCwd("~/worktree", "/base/cwd");
+			expect(result).not.toContain("~");
+			expect(result.endsWith(join("worktree"))).toBe(true);
 		});
 	});
 

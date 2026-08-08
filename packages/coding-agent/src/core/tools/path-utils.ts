@@ -49,6 +49,14 @@ export function resolveToCwd(filePath: string, cwd: string): string {
 	return resolvePath(filePath, cwd, { normalizeUnicodeSpaces: true, stripAtPrefix: true });
 }
 
+/**
+ * Resolve a per-call working directory against the tool's base cwd.
+ * Returns the base cwd when no per-call cwd is provided.
+ */
+export function resolvePerCallCwd(perCallCwd: string | undefined, baseCwd: string): string {
+	return perCallCwd ? resolveToCwd(perCallCwd, baseCwd) : baseCwd;
+}
+
 export function resolveReadPath(filePath: string, cwd: string): string {
 	const resolved = resolveToCwd(filePath, cwd);
 

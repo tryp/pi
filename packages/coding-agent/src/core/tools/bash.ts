@@ -17,6 +17,7 @@ import {
 } from "../../utils/shell.ts";
 import type { ExtensionContext, ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
+import { resolvePerCallCwd } from "./path-utils.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
@@ -40,6 +41,12 @@ function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Working directory to execute the command in. Use when working outside the session working directory (for example in a git worktree). Defaults to the session working directory.",
+		}),
+	),
 });
 
 export type BashToolInput = Static<typeof bashSchema>;
@@ -324,21 +331,30 @@ export function createBashToolDefinition(
 	return {
 		name: "bash",
 		label: "bash",
-		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a bash command. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds. Optionally provide a cwd to run in a different working directory (for example a git worktree); defaults to the session working directory.`,
 		promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
 		promptGuidelines: exposeSessionEnvironment
-			? ["Inspect PI_* environment variables for current model and session details."]
+			? [
+					"Inspect PI_* environment variables for current model and session details.",
+					"Pass cwd when working in a directory other than the session root (e.g. a git worktree) so the UI shows the branch/worktree you are actually working in.",
+				]
 			: undefined,
 		parameters: bashSchema,
 		async execute(
 			_toolCallId,
-			{ command, timeout }: { command: string; timeout?: number },
+			{ command, timeout, cwd: perCallCwd }: { command: string; timeout?: number; cwd?: string },
 			signal?: AbortSignal,
 			onUpdate?,
 			ctx?,
 		) {
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
-			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook, exposeSessionEnvironment, ctx);
+			const spawnContext = resolveSpawnContext(
+				resolvedCommand,
+				resolvePerCallCwd(perCallCwd, cwd),
+				spawnHook,
+				exposeSessionEnvironment,
+				ctx,
+			);
 			const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
