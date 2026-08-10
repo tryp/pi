@@ -38,6 +38,12 @@ function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 	return timeoutMs;
 }
 
+function getErrorCode(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null || !("code" in error)) return;
+	const code = error.code;
+	return typeof code === "string" ? code : undefined;
+}
+
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
@@ -136,8 +142,26 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 					else signal.addEventListener("abort", onAbort, { once: true });
 				}
 				// Handle shell spawn errors and wait for the process to terminate without hanging
-				// on inherited stdio handles held by detached descendants.
-				const exitCode = await waitForChildProcess(child);
+				// on inherited stdio handles held by detached descendants. A cwd can
+				// disappear between the access check above and spawn(), for example when a
+				// worktree is removed concurrently; translate that race into a useful tool
+				// error instead of leaking Node's ambiguous ENOENT message.
+				let exitCode: number | null;
+				try {
+					exitCode = await waitForChildProcess(child);
+				} catch (error) {
+					if (getErrorCode(error) === "ENOENT") {
+						try {
+							await fsAccess(cwd, constants.F_OK);
+						} catch {
+							throw new Error(
+								`Working directory disappeared while starting bash: ${cwd}\nCannot execute bash commands.`,
+								{ cause: error },
+							);
+						}
+					}
+					throw error;
+				}
 				if (signal?.aborted) {
 					throw new Error("aborted");
 				}

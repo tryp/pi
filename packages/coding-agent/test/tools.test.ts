@@ -1,3 +1,4 @@
+import type * as FsPromises from "node:fs/promises";
 import { applyPatch } from "diff";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -15,6 +16,13 @@ import {
 	createWriteTool,
 } from "../src/index.ts";
 import * as shellModule from "../src/utils/shell.ts";
+
+const { accessMock } = vi.hoisted(() => ({ accessMock: vi.fn() }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = (await importOriginal()) as typeof FsPromises;
+	accessMock.mockImplementation(actual.access);
+	return { ...actual, access: accessMock };
+});
 
 const readTool = createReadTool(process.cwd());
 const writeTool = createWriteTool(process.cwd());
@@ -535,6 +543,20 @@ describe("Coding Agent Tools", () => {
 			await expect(bashToolWithBadCwd.execute("test-call-11", { command: "echo test" })).rejects.toThrow(
 				/Working directory does not exist/,
 			);
+		});
+
+		it("should report when cwd disappears during spawn", async () => {
+			const racedCwd = join(testDir, "raced-cwd");
+			mkdirSync(racedCwd, { recursive: true });
+			accessMock.mockImplementationOnce(async () => undefined);
+			rmSync(racedCwd, { recursive: true, force: true });
+
+			const ops = createLocalBashOperations();
+			await expect(
+				ops.exec("echo test", racedCwd, {
+					onData: () => {},
+				}),
+			).rejects.toThrow(`Working directory disappeared while starting bash: ${racedCwd}`);
 		});
 
 		it("should handle process spawn errors", async () => {
