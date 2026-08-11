@@ -313,8 +313,11 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _isAgentSettling = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
+	private _queuedMessageWakePending = false;
+	private _queuedMessageWakeScheduled = false;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -577,7 +580,12 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (
+			this._isAgentRunActive ||
+			this._queuedMessageWakePending ||
+			this.agent.hasQueuedMessages() ||
+			!this._resolveIdleWait
+		) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -586,13 +594,65 @@ export class AgentSession {
 		resolve();
 	}
 
+	/**
+	 * Wake an idle session when a trigger-turn message arrived after the
+	 * agent loop performed its final queue drain. The wake is deferred one
+	 * timer turn so it cannot re-enter the agent from an agent_settled handler.
+	 */
+	private _scheduleQueuedMessageWake(): void {
+		if (!this._queuedMessageWakePending || this._isAgentRunActive || this._queuedMessageWakeScheduled) {
+			return;
+		}
+
+		this._queuedMessageWakeScheduled = true;
+		setTimeout(() => {
+			this._queuedMessageWakeScheduled = false;
+			if (this._isAgentRunActive) return;
+			if (!this.agent.hasQueuedMessages()) {
+				this._queuedMessageWakePending = false;
+				this._resolveIdleWaitIfIdle();
+				return;
+			}
+
+			this._queuedMessageWakePending = false;
+			void this._runQueuedMessages().catch((error: unknown) => {
+				this._extensionRunner.emitError({
+					extensionPath: "<runtime>",
+					event: "queued_message_wakeup",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		}, 0);
+	}
+
+	private async _runQueuedMessages(): Promise<void> {
+		if (this._isAgentRunActive || !this.agent.hasQueuedMessages()) return;
+
+		this._isAgentRunActive = true;
+		try {
+			while (this.agent.hasQueuedMessages()) {
+				await this.agent.continue();
+				while (await this._handlePostAgentRun()) {
+					await this.agent.continue();
+				}
+			}
+		} finally {
+			this._systemPromptOverride = undefined;
+			this._flushPendingBashMessages();
+			await this._emitAgentSettled();
+		}
+	}
+
 	private async _emitAgentSettled(): Promise<void> {
+		this._isAgentSettling = true;
 		this._isAgentRunActive = false;
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
 		} finally {
+			this._isAgentSettling = false;
 			this._resolveIdleWaitIfIdle();
+			this._scheduleQueuedMessageWake();
 		}
 	}
 
@@ -601,6 +661,10 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "message_start" && event.message.role === "custom") {
+			this._queuedMessageWakePending = false;
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -1159,7 +1223,7 @@ export class AgentSession {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
-			return false;
+			return this.agent.hasQueuedMessages();
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
@@ -1524,11 +1588,14 @@ export class AgentSession {
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
-		} else if (this.isStreaming) {
+		} else if (this.isStreaming || this._isAgentSettling) {
 			if (options?.deliverAs === "followUp") {
 				this.agent.followUp(appMessage);
 			} else {
 				this.agent.steer(appMessage);
+			}
+			if (options?.triggerTurn) {
+				this._queuedMessageWakePending = true;
 			}
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
@@ -1633,7 +1700,7 @@ export class AgentSession {
 	}
 
 	async waitForIdle(): Promise<void> {
-		if (this.isIdle) {
+		if (this.isIdle && !this._queuedMessageWakePending && !this.agent.hasQueuedMessages()) {
 			return;
 		}
 		await this._getIdleWaitPromise();
