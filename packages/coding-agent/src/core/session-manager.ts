@@ -188,6 +188,13 @@ export interface SessionInfo {
 	allMessagesText: string;
 }
 
+/** Lightweight session information used when resolving a session ID. */
+export interface SessionPathInfo {
+	path: string;
+	id: string;
+	cwd: string;
+}
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
@@ -632,6 +639,102 @@ function readSessionHeaderForDiscovery(filePath: string): SessionHeader | null {
 		// and one corrupt file must not prevent other sessions from being found.
 		return null;
 	}
+}
+
+/**
+ * Session files created by pi end with `_<session-id>.jsonl`.
+ *
+ * This is only a discovery hint: callers must still validate the parsed header
+ * because filenames can be stale, manually renamed, or otherwise incorrect.
+ */
+export function isSessionFilenameForId(fileName: string, sessionId: string): boolean {
+	return fileName.endsWith(`_${sessionId}.jsonl`);
+}
+
+interface SessionPathMatch extends SessionPathInfo {
+	mtimeMs: number;
+}
+
+function sessionPathMatch(path: string, header: SessionHeader): SessionPathMatch {
+	let mtimeMs = 0;
+	try {
+		mtimeMs = statSync(path).mtimeMs;
+	} catch {
+		// A file can disappear between readdir and stat. Keep it as a valid match;
+		// the subsequent open will report any actual race to the caller.
+	}
+	return {
+		path,
+		id: header.id,
+		cwd: getSessionHeaderCwd(header) ?? "",
+		mtimeMs,
+	};
+}
+
+function collectSessionPathMatches(
+	dir: string,
+	sessionId: string,
+	resolvedCwd?: string,
+): { exact: SessionPathMatch[]; prefix: SessionPathMatch[] } {
+	if (!existsSync(dir)) return { exact: [], prefix: [] };
+
+	let files: Array<{ name: string; path: string }>;
+	try {
+		files = readdirSync(dir)
+			.filter((name) => name.endsWith(".jsonl"))
+			.map((name) => ({ name, path: join(dir, name) }));
+	} catch {
+		return { exact: [], prefix: [] };
+	}
+
+	const headers = new Map<string, SessionHeader | null>();
+	const readHeader = (file: { name: string; path: string }): SessionHeader | null => {
+		if (!headers.has(file.path)) {
+			headers.set(file.path, readSessionHeaderForDiscovery(file.path));
+		}
+		return headers.get(file.path) ?? null;
+	};
+	const matchesCwd = (header: SessionHeader): boolean =>
+		resolvedCwd === undefined || sessionCwdMatches(getSessionHeaderCwd(header), resolvedCwd);
+
+	// The normal filename is a fast path for exact IDs, but never trust it
+	// without validating the header. This avoids parsing every session in the
+	// directory for the common `pi --session <full-id>` case.
+	for (const file of files) {
+		if (!isSessionFilenameForId(file.name, sessionId)) continue;
+		const header = readHeader(file);
+		if (header?.id === sessionId && matchesCwd(header)) {
+			return { exact: [sessionPathMatch(file.path, header)], prefix: [] };
+		}
+	}
+
+	const exact: SessionPathMatch[] = [];
+	const prefix: SessionPathMatch[] = [];
+	for (const file of files) {
+		const header = readHeader(file);
+		if (!header || !matchesCwd(header)) continue;
+		const match = sessionPathMatch(file.path, header);
+		if (header.id === sessionId) {
+			exact.push(match);
+		} else if (header.id.startsWith(sessionId)) {
+			prefix.push(match);
+		}
+	}
+	return { exact, prefix };
+}
+
+function newestSessionPathMatch(matches: SessionPathMatch[]): SessionPathInfo | undefined {
+	return matches
+		.slice()
+		.sort((a, b) => b.mtimeMs - a.mtimeMs)
+		.at(0);
+}
+
+function selectSessionPathMatch(matches: {
+	exact: SessionPathMatch[];
+	prefix: SessionPathMatch[];
+}): SessionPathInfo | undefined {
+	return newestSessionPathMatch(matches.exact) ?? newestSessionPathMatch(matches.prefix);
 }
 
 function getSessionHeaderCwd(header: SessionHeader): string | undefined {
@@ -1651,6 +1754,53 @@ export class SessionManager {
 		}
 
 		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
+	}
+
+	/**
+	 * Find a session by exact ID or ID prefix without loading message metadata.
+	 *
+	 * Exact IDs that use pi's normal filename format are resolved from the
+	 * filename and validated against the session header. Other IDs fall back to
+	 * bounded header scans, preserving support for partial IDs and legacy files.
+	 * @param cwd Working directory (used to compute the default session directory)
+	 * @param sessionId Full or partial session ID
+	 * @param sessionDir Optional session directory
+	 */
+	static findById(cwd: string, sessionId: string, sessionDir?: string): SessionPathInfo | undefined {
+		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
+		const matches = collectSessionPathMatches(dir, sessionId, filterCwd ? resolvePath(cwd) : undefined);
+		return selectSessionPathMatch(matches);
+	}
+
+	/** Find a session by exact ID or ID prefix across all session directories. */
+	static findByIdAll(sessionId: string, sessionDir?: string): SessionPathInfo | undefined {
+		if (sessionDir !== undefined) {
+			const matches = collectSessionPathMatches(normalizePath(sessionDir), sessionId);
+			return selectSessionPathMatch(matches);
+		}
+
+		const sessionsDir = getSessionsDir();
+		if (!existsSync(sessionsDir)) return undefined;
+
+		let dirs: string[];
+		try {
+			dirs = readdirSync(sessionsDir, { withFileTypes: true })
+				.filter((entry) => entry.isDirectory())
+				.map((entry) => join(sessionsDir, entry.name));
+		} catch {
+			return undefined;
+		}
+
+		const prefixMatches: SessionPathMatch[] = [];
+		for (const dir of dirs) {
+			const matches = collectSessionPathMatches(dir, sessionId);
+			// Session IDs are expected to be unique. Return an exact match as soon
+			// as one is validated, without scanning the remaining large directories.
+			if (matches.exact.length > 0) return newestSessionPathMatch(matches.exact);
+			prefixMatches.push(...matches.prefix);
+		}
+		return newestSessionPathMatch(prefixMatches);
 	}
 
 	/**
