@@ -380,6 +380,53 @@ export async function resolveModelScope(
 	return scopedModels;
 }
 
+/** Check if a pattern contains glob magic (should not be auto-pruned) */
+function isGlobPattern(pattern: string): boolean {
+	// Strip optional :thinking suffix before checking
+	const colonIdx = pattern.lastIndexOf(":");
+	let base = pattern;
+	if (colonIdx !== -1) {
+		const suffix = pattern.substring(colonIdx + 1);
+		if (isValidThinkingLevel(suffix as ThinkingLevel)) base = pattern.substring(0, colonIdx);
+	}
+	return base.includes("*") || base.includes("?") || base.includes("[");
+}
+
+/**
+ * Return exact (non-glob) patterns that had no-match diagnostics.
+ * These are candidates for auto-pruning from enabledModels.
+ */
+export function getStaleExactPatterns(
+	patterns: string[],
+	diagnostics: ModelScopeDiagnostic[],
+): string[] {
+	const stale: string[] = [];
+	const patternSet = new Set(patterns);
+	for (const d of diagnostics) {
+		if (d.code !== "no-match") continue;
+		if (!patternSet.has(d.pattern)) continue;
+		if (isGlobPattern(d.pattern)) continue;
+		stale.push(d.pattern);
+	}
+	return [...new Set(stale)];
+}
+
+/**
+ * Prune stale exact patterns from enabledModels.
+ * Returns pruned list and removed entries. Globs are never pruned.
+ */
+export function pruneStaleEnabledModels(
+	enabledModels: string[] | undefined,
+	diagnostics: ModelScopeDiagnostic[],
+): { pruned: string[] | undefined; removed: string[] } {
+	if (!enabledModels?.length) return { pruned: enabledModels, removed: [] };
+	const stale = getStaleExactPatterns(enabledModels, diagnostics);
+	if (stale.length === 0) return { pruned: enabledModels, removed: [] };
+	const staleSet = new Set(stale);
+	const pruned = enabledModels.filter((p) => !staleSet.has(p));
+	return { pruned: pruned.length > 0 ? pruned : undefined, removed: stale };
+}
+
 export interface ResolveCliModelResult {
 	model: Model<Api> | undefined;
 	thinkingLevel?: ThinkingLevel;

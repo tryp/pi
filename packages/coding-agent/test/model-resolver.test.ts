@@ -11,7 +11,9 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import {
 	defaultModelPerProvider,
 	findInitialModel,
+	getStaleExactPatterns,
 	parseModelPattern,
+	pruneStaleEnabledModels,
 	resolveCliModel,
 	resolveModelScope,
 	resolveModelScopeWithDiagnostics,
@@ -315,6 +317,70 @@ describe("resolveModelScopeWithDiagnostics", () => {
 		expect(result.scopedModels.map((scoped) => scoped.model.id)).toEqual(["bracketed-model[1m]"]);
 		expect(result.scopedModels[0].thinkingLevel).toBe("high");
 		expect(result.diagnostics).toEqual([]);
+	});
+});
+
+describe("pruneStaleEnabledModels", () => {
+	test("prunes exact provider/id patterns with no-match", () => {
+		const enabled = ["opencode/laguna-s-2.1-free", "opencode-go/ox-alpha-free", "anthropic/claude-sonnet-4-5"];
+		const diagnostics = [
+			{ type: "warning" as const, code: "no-match" as const, message: 'No models match pattern "opencode-go/ox-alpha-free"', pattern: "opencode-go/ox-alpha-free" },
+		];
+		const { pruned, removed } = pruneStaleEnabledModels(enabled, diagnostics);
+		expect(removed).toEqual(["opencode-go/ox-alpha-free"]);
+		expect(pruned).toEqual(["opencode/laguna-s-2.1-free", "anthropic/claude-sonnet-4-5"]);
+	});
+
+	test("does not prune glob patterns", () => {
+		const enabled = ["opencode/*", "opencode/ling-*:free"];
+		const diagnostics = [
+			{ type: "warning" as const, code: "no-match" as const, message: 'No models match pattern "opencode/*"', pattern: "opencode/*" },
+			{ type: "warning" as const, code: "no-match" as const, message: 'No models match pattern "opencode/ling-*:free"', pattern: "opencode/ling-*:free" },
+		];
+		const { pruned, removed } = pruneStaleEnabledModels(enabled, diagnostics);
+		expect(removed).toEqual([]);
+		expect(pruned).toEqual(enabled);
+	});
+
+	test("does not prune bracketed ids that are not globs", () => {
+		const enabled = ["custom/bracketed-model[1m]"];
+		const diagnostics = [
+			{ type: "warning" as const, code: "no-match" as const, message: 'No models match pattern "custom/bracketed-model[1m]"', pattern: "custom/bracketed-model[1m]" },
+		];
+		// bracketed model contains '[' but is treated as glob in resolver; prune should skip it
+		const { removed } = pruneStaleEnabledModels(enabled, diagnostics);
+		expect(removed).toEqual([]);
+	});
+
+	test("handles thinking level suffix", () => {
+		const enabled = ["opencode/x-preview-f-free:high", "anthropic/claude-sonnet-4-5:low"];
+		const diagnostics = [
+			{ type: "warning" as const, code: "no-match" as const, message: 'No models match pattern "opencode/x-preview-f-free:high"', pattern: "opencode/x-preview-f-free:high" },
+		];
+		const { pruned, removed } = pruneStaleEnabledModels(enabled, diagnostics);
+		expect(removed).toEqual(["opencode/x-preview-f-free:high"]);
+		expect(pruned).toEqual(["anthropic/claude-sonnet-4-5:low"]);
+	});
+
+	test("returns undefined when all pruned", () => {
+		const enabled = ["opencode/x-preview-f-free"];
+		const diagnostics = [
+			{ type: "warning" as const, code: "no-match" as const, message: 'No models match pattern "opencode/x-preview-f-free"', pattern: "opencode/x-preview-f-free" },
+		];
+		const { pruned, removed } = pruneStaleEnabledModels(enabled, diagnostics);
+		expect(removed).toEqual(["opencode/x-preview-f-free"]);
+		expect(pruned).toBeUndefined();
+	});
+
+	test("getStaleExactPatterns isolates exact stale patterns", () => {
+		const patterns = ["a/b", "c/*", "d/e:high"];
+		const diagnostics = [
+			{ type: "warning" as const, code: "no-match" as const, message: 'No models match pattern "a/b"', pattern: "a/b" },
+			{ type: "warning" as const, code: "no-match" as const, message: 'No models match pattern "c/*"', pattern: "c/*" },
+			{ type: "warning" as const, code: "no-match" as const, message: 'No models match pattern "d/e:high"', pattern: "d/e:high" },
+			{ type: "warning" as const, code: "invalid-thinking-level" as const, message: "bad", pattern: "a/b" },
+		];
+		expect(getStaleExactPatterns(patterns, diagnostics)).toEqual(["a/b", "d/e:high"]);
 	});
 });
 

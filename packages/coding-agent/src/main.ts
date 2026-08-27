@@ -45,7 +45,12 @@ import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
-import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
+import {
+	pruneStaleEnabledModels,
+	resolveCliModel,
+	resolveModelScopeWithDiagnostics,
+	type ScopedModel,
+} from "./core/model-resolver.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
@@ -784,11 +789,37 @@ export async function main(args: string[], options?: MainOptions) {
 			})),
 		];
 
-		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
-		const scopedModels =
-			modelPatterns && modelPatterns.length > 0
-				? await resolveModelScope(modelPatterns, modelRuntime, { signal: AbortSignal.timeout(15_000) })
-				: [];
+		const rawModelPatterns = parsed.models ?? settingsManager.getEnabledModels();
+		let modelPatterns = rawModelPatterns;
+		let scopedModels: ScopedModel[] = [];
+		if (modelPatterns && modelPatterns.length > 0) {
+			const result = await resolveModelScopeWithDiagnostics(modelPatterns, modelRuntime, {
+				signal: AbortSignal.timeout(15_000),
+			});
+			// Auto-prune stale exact patterns from enabledModels (only when using settings, not CLI --models)
+			const isFromSettings = !parsed.models;
+			const shouldPrune = isFromSettings && !process.env.PI_NO_AUTO_PRUNE;
+			if (shouldPrune) {
+				const { pruned, removed } = pruneStaleEnabledModels(modelPatterns, result.diagnostics);
+				if (removed.length > 0) {
+					// Persist pruned list (backup handled by SettingsManager via file write; keep console visible)
+					settingsManager.setEnabledModels(pruned);
+					console.warn(
+						chalk.yellow(
+							`Pruned ${removed.length} stale enabledModels pattern(s) with no matching models: ${removed.join(", ")} ` +
+								`(auto-prune; set PI_NO_AUTO_PRUNE=1 to disable)`,
+						),
+					);
+					// Filter diagnostics to not double-warn pruned patterns
+					result.diagnostics = result.diagnostics.filter((d) => !removed.includes(d.pattern));
+					modelPatterns = pruned ?? [];
+				}
+			}
+			for (const d of result.diagnostics) {
+				console.warn(chalk.yellow(`Warning: ${d.message}`));
+			}
+			scopedModels = result.scopedModels;
+		}
 		const {
 			options: sessionOptions,
 			cliThinkingFromModel,
