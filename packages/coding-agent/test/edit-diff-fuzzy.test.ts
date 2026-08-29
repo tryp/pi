@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	applyEditsToNormalizedContent,
+	computeEditsDiff,
 	fuzzyFindText,
 	normalizeForFuzzyMatch,
 } from "../src/core/tools/edit-diff.ts";
@@ -158,5 +159,173 @@ describe("applyEditsToNormalizedContent", () => {
 				{ oldText: "same text", newText: "same text" },
 			], "test.ts"),
 		).toThrow(/no change|unchanged/i);
+	});
+});
+
+// ============================================================================
+// Duplicate-match disambiguation hints (match locations in the error)
+// ============================================================================
+
+describe("applyEditsToNormalizedContent duplicate locations", () => {
+	it("includes line numbers and first-line previews for ambiguous matches", () => {
+		const content = "import os\nimport sys\n\ndef a():\n    pass\n\ndef a():\n    pass\n";
+		expect(() =>
+			applyEditsToNormalizedContent(content, [
+				{ oldText: "def a():\n    pass", newText: "def a():\n    return 1" },
+			], "mod.py"),
+		).toThrow(/Found 2 occurrences of the text in mod\.py after whitespace normalization — line 4 \(.*def a\(\).*\), line 7 \(.*def a\(\).*\)\. Please provide more surrounding context/u);
+	});
+
+	it("includes locations in the multi-edit variant", () => {
+		const content = "anchor\nx = 1\nx = 1\n";
+		expect(() =>
+			applyEditsToNormalizedContent(content, [
+				{ oldText: "anchor", newText: "anchor" },
+				{ oldText: "x = 1", newText: "x = 2" },
+			], "multi.py"),
+		).toThrow(/Found 2 occurrences of edits\[1\] in multi\.py after whitespace normalization — line 2 \(.*x = 1.*\), line 3 \(.*x = 1.*\)\./u);
+	});
+
+	it("caps listed locations at three", () => {
+		const content = "loop\nloop\nloop\nloop\n";
+		expect(() =>
+			applyEditsToNormalizedContent(content, [
+				{ oldText: "loop", newText: "stop" },
+			], "cap.txt"),
+		).toThrow(/line 1 .*line 2 .*line 3 (?!.*line 4)/u);
+	});
+});
+
+// ============================================================================
+// not-found closest-line hint (content drift / stale oldText recovery)
+// ============================================================================
+
+describe("applyEditsToNormalizedContent not-found closest-line hint", () => {
+	it("points at the drifted line when the anchor exists but content differs", () => {
+		const content = "def process(items):\n    result = process_items(items)\n    return result\n";
+		// oldText's first significant line exists in the file but the body drifted
+		const err = (() => {
+			try {
+				applyEditsToNormalizedContent(content, [
+					{ oldText: "def process(items):\n    return None\n", newText: "def process(items):\n    return []\n" },
+				], "svc.py");
+			} catch (error) {
+				return (error as Error).message;
+			}
+			return "";
+		})();
+		expect(err).toMatch(/Could not find the exact text in svc\.py\./u);
+		expect(err).toMatch(/Closest matching file line \(line 1\): "def process\(items\):" — the file content may differ from oldText; re-read the file if unsure\./u);
+	});
+
+	it("omits the hint when no line is similar", () => {
+		const err = (() => {
+			try {
+				applyEditsToNormalizedContent("alpha beta\ngamma delta\n", [
+					{ oldText: "completely other words here now", newText: "x" },
+				], "f.txt");
+			} catch (error) {
+				return (error as Error).message;
+			}
+			return "";
+		})();
+		expect(err).toMatch(/Could not find the exact text in f\.txt\./u);
+		expect(err).not.toMatch(/Closest matching file line/u);
+	});
+
+	it("skips the hint for tiny oldText without significant tokens", () => {
+		const err = (() => {
+			try {
+				applyEditsToNormalizedContent("x = 1\ny = 2\n", [
+					{ oldText: "a b", newText: "c" },
+				], "tiny.txt");
+			} catch (error) {
+				return (error as Error).message;
+			}
+			return "";
+		})();
+		expect(err).not.toMatch(/Closest matching file line/u);
+	});
+});
+
+// ============================================================================
+// no-change error guidance (already-applied recovery)
+// ============================================================================
+
+describe("applyEditsToNormalizedContent no-change guidance", () => {
+	it("suggests continuing when the replacement is identical", () => {
+		expect(() =>
+			applyEditsToNormalizedContent("same text", [
+				{ oldText: "same text", newText: "same text" },
+			], "same.txt"),
+		).toThrow(/If this edit was already applied in a previous step, continue with your next change instead of retrying\./u);
+	});
+
+	it("includes the guidance in the multi-edit variant", () => {
+		expect(() =>
+			applyEditsToNormalizedContent("a\nb\n", [
+				{ oldText: "a", newText: "a" },
+				{ oldText: "b", newText: "b" },
+			], "same2.txt"),
+		).toThrow(/If an edit was already applied in a previous step, continue with your next change instead of retrying\./u);
+	});
+});
+
+// ============================================================================
+// Review-driven regression tests
+// ============================================================================
+
+describe("applyEditsToNormalizedContent duplicate locations (fuzzy strategies)", () => {
+	it("includes locations when a blank-line-reinsertion match is ambiguous", () => {
+		const content = "a\n\nb\nc\na\n\nb\nc";
+		expect(() =>
+			applyEditsToNormalizedContent(content, [
+				{ oldText: "a\nb\nc", newText: "replaced" },
+			], "fuzzy-dup.ts"),
+		).toThrow(/Found 2 occurrences of the text in fuzzy-dup\.ts after whitespace normalization — line 1 \(.*\), line 5 \(.*\)/u);
+	});
+});
+
+describe("applyEditsToNormalizedContent closest-line hint thresholds", () => {
+	it("requires distinct tokens, not repeated ones", () => {
+		const err = (() => {
+			try {
+				applyEditsToNormalizedContent("x = 1\nfoo foo foo\ny = 2\n", [
+					{ oldText: "completely unrelated content here", newText: "z" },
+				], "repeat.txt");
+			} catch (error) {
+				return (error as Error).message;
+			}
+			return "";
+		})();
+		expect(err).not.toMatch(/Closest matching file line/u);
+	});
+
+	it("still hints for exactly CLOSEST_LINE_MAX_FILE_LINES of content", () => {
+		const line = "this is a reasonably long anchor line for tokens\n";
+		const content = line.repeat(20000);
+		const err = (() => {
+			try {
+				applyEditsToNormalizedContent(content, [
+					{ oldText: "this is a reasonably long anchor line for tokens\nwith drifted continuation", newText: "x" },
+				], "big.txt");
+			} catch (error) {
+				return (error as Error).message;
+			}
+			return "";
+		})();
+		expect(err).toMatch(/Closest matching file line \(line 1\)/u);
+	});
+});
+
+describe("computeEditsDiff missing-file hints", () => {
+	it("appends the path-verification hint to the preview error", async () => {
+		const result = await computeEditsDiff("definitely-missing.txt", [{ oldText: "a", newText: "b" }], process.cwd());
+		expect("error" in result && result.error!.includes("The file does not exist; verify the path (read or ls) before editing.")).toBe(true);
+	});
+
+	it("mentions worktrees for removed worktree paths", async () => {
+		const result = await computeEditsDiff("tmp/worktrees/gone-task/src/a.ts", [{ oldText: "a", newText: "b" }], process.cwd());
+		expect("error" in result && result.error!.includes("check `pi-worktree list`")).toBe(true);
 	});
 });

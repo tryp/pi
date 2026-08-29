@@ -465,7 +465,9 @@ describe("Coding Agent Tools", () => {
 			const missingFile = join(testDir, "missing-preview.txt");
 			const result = await computeEditsDiff(missingFile, [{ oldText: "hello", newText: "world" }], testDir);
 
-			expect(result).toEqual({ error: `Could not edit file: ${missingFile}. Error code: ENOENT.` });
+			expect(result).toEqual({
+				error: `Could not edit file: ${missingFile}. Error code: ENOENT. The file does not exist; verify the path (read or ls) before editing.`,
+			});
 		});
 
 		it("should include EACCES in diff preview for unreadable files", async () => {

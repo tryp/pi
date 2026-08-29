@@ -339,25 +339,106 @@ export function stripBom(content: string): { bom: string; text: string } {
 	return content.startsWith("\uFEFF") ? { bom: "\uFEFF", text: content.slice(1) } : { bom: "", text: content };
 }
 
-function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
+function getNotFoundError(path: string, editIndex: number, totalEdits: number, closestLineHint?: string): Error {
+	const hint = closestLineHint ? `\n${closestLineHint}` : "";
 	if (totalEdits === 1) {
 		return new Error(
-			`Could not find the exact text in ${path}. Include the surrounding newline and preserve the target block's indentation. Unique tab/space indentation differences are normalized automatically.`,
+			`Could not find the exact text in ${path}. Include the surrounding newline and preserve the target block's indentation. Unique tab/space indentation differences are normalized automatically.${hint}`,
 		);
 	}
 	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. Include the surrounding newline and preserve the target block's indentation. Unique tab/space indentation differences are normalized automatically.`,
+		`Could not find edits[${editIndex}] in ${path}. Include the surrounding newline and preserve the target block's indentation. Unique tab/space indentation differences are normalized automatically.${hint}`,
 	);
 }
 
-function getDuplicateError(path: string, editIndex: number, totalEdits: number, occurrences: number): Error {
+/**
+ * Best-effort pointer to the file line most similar to the first significant
+ * line of a not-found oldText. Session analysis of not-found failures showed
+ * the dominant cause is stale or drifted oldText, so showing what the file
+ * actually contains at the closest line lets the model recover by re-reading
+ * instead of blindly retrying. Token-overlap similarity (not a diff): cheap,
+ * deterministic, and only runs on the failure path.
+ */
+const CLOSEST_LINE_MIN_TOKENS = 3;
+const CLOSEST_LINE_MIN_SCORE = 0.5;
+const CLOSEST_LINE_MAX_FILE_LINES = 20000;
+const CLOSEST_LINE_MAX_PREVIEW = 80;
+
+function tokenizeForSimilarity(text: string): Set<string> {
+	return new Set(text.match(/[A-Za-z_][A-Za-z0-9_]*|\d+/g) ?? []);
+}
+
+function findClosestLineHint(content: string, oldText: string): string | undefined {
+	const needleLine = oldText
+		.split("\n")
+		.map((line) => line.trim())
+		.find((line) => tokenizeForSimilarity(line).size >= CLOSEST_LINE_MIN_TOKENS);
+	if (!needleLine) return undefined;
+	const lines = content.split("\n");
+	// A trailing newline yields a final empty split entry; don't let it push a
+	// file with exactly CLOSEST_LINE_MAX_FILE_LINES real lines over the cap.
+	const lineCount = lines.length > 1 && lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
+	if (lineCount > CLOSEST_LINE_MAX_FILE_LINES) return undefined;
+	const needleTokens = tokenizeForSimilarity(needleLine);
+	let best: { line: number; text: string; score: number } | undefined;
+	for (let i = 0; i < lines.length; i++) {
+		const candidate = lines[i].trim();
+		if (!candidate) continue;
+		let score: number;
+		if (candidate.includes(needleLine)) {
+			score = 1;
+		} else {
+			const candidateTokens = tokenizeForSimilarity(candidate);
+			if (candidateTokens.size === 0) continue;
+			let intersection = 0;
+			for (const token of needleTokens) {
+				if (candidateTokens.has(token)) intersection++;
+			}
+			score = intersection / (needleTokens.size + candidateTokens.size - intersection);
+		}
+		if (!best || score > best.score) {
+			best = { line: i + 1, text: candidate, score };
+		}
+	}
+	if (!best || best.score < CLOSEST_LINE_MIN_SCORE) return undefined;
+	const preview =
+		best.text.length > CLOSEST_LINE_MAX_PREVIEW
+			? `${best.text.slice(0, CLOSEST_LINE_MAX_PREVIEW - 3)}...`
+			: best.text;
+	return `Closest matching file line (line ${best.line}): ${JSON.stringify(preview)} — the file content may differ from oldText; re-read the file if unsure.`;
+}
+
+/**
+ * Describe where each ambiguous match sits (line number + first-line preview)
+ * so the model can disambiguate in one retry instead of diffing blind.
+ */
+function describeMatchLocations(content: string, matches: MatchPosition[], maxLocations = 3): string[] {
+	return matches.slice(0, maxLocations).map((match) => {
+		const line = content.slice(0, match.index).split("\n").length;
+		const firstLine = content
+			.slice(match.index, match.index + match.matchLength)
+			.split("\n")[0]
+			.trim();
+		const preview = firstLine.length > 60 ? `${firstLine.slice(0, 57)}...` : firstLine;
+		return `line ${line} (${JSON.stringify(preview)})`;
+	});
+}
+
+function getDuplicateError(
+	path: string,
+	editIndex: number,
+	totalEdits: number,
+	occurrences: number,
+	locations?: string[],
+): Error {
+	const where = locations && locations.length > 0 ? ` — ${locations.join(", ")}` : "";
 	if (totalEdits === 1) {
 		return new Error(
-			`Found ${occurrences} occurrences of the text in ${path} after whitespace normalization. Please provide more surrounding context to make it unique.`,
+			`Found ${occurrences} occurrences of the text in ${path} after whitespace normalization${where}. Please provide more surrounding context to make it unique.`,
 		);
 	}
 	return new Error(
-		`Found ${occurrences} occurrences of edits[${editIndex}] in ${path} after whitespace normalization. Each oldText must be unique; provide more surrounding context.`,
+		`Found ${occurrences} occurrences of edits[${editIndex}] in ${path} after whitespace normalization${where}. Each oldText must be unique; provide more surrounding context.`,
 	);
 }
 
@@ -368,13 +449,32 @@ function getEmptyOldTextError(path: string, editIndex: number, totalEdits: numbe
 	return new Error(`edits[${editIndex}].oldText must not be empty in ${path}.`);
 }
 
+/**
+ * Shared suffix for "file missing" edit errors: tells the model what to check
+ * next instead of a bare errno. Worktree-looking paths get an extra pointer
+ * because session analysis showed missing-file failures cluster on removed
+ * task worktrees.
+ */
+const worktreePathRe = /(^|[\/\\])(agent-)?worktree(s|\-checkouts)?([\/\\]|$)/;
+
+export function describeMissingFile(code: string | undefined, path: string): string {
+	if (code !== "ENOENT") return "";
+	let hint = " The file does not exist; verify the path (read or ls) before editing.";
+	if (worktreePathRe.test(path)) {
+		hint += " This path looks like a task worktree that may have been removed; check `pi-worktree list`.";
+	}
+	return hint;
+}
+
 function getNoChangeError(path: string, totalEdits: number): Error {
 	if (totalEdits === 1) {
 		return new Error(
-			`No changes made to ${path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.`,
+			`No changes made to ${path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected. If this edit was already applied in a previous step, continue with your next change instead of retrying.`,
 		);
 	}
-	return new Error(`No changes made to ${path}. The replacements produced identical content.`);
+	return new Error(
+		`No changes made to ${path}. The replacements produced identical content. If an edit was already applied in a previous step, continue with your next change instead of retrying.`,
+	);
 }
 
 /**
@@ -411,11 +511,22 @@ export function applyEditsToNormalizedContent(
 		const edit = normalizedEdits[i];
 		const resolution = resolveFuzzyMatch(replacementBaseContent, edit.oldText);
 		if (resolution.matches.length === 0) {
-			throw getNotFoundError(path, i, normalizedEdits.length);
+			throw getNotFoundError(
+				path,
+				i,
+				normalizedEdits.length,
+				findClosestLineHint(normalizedContent, edit.oldText),
+			);
 		}
 
 		if (resolution.matches.length > 1) {
-			throw getDuplicateError(path, i, normalizedEdits.length, resolution.matches.length);
+			throw getDuplicateError(
+				path,
+				i,
+				normalizedEdits.length,
+				resolution.matches.length,
+				describeMatchLocations(replacementBaseContent, resolution.matches),
+			);
 		}
 
 		const match = resolution.matches[0];
@@ -619,7 +730,8 @@ export async function computeEditsDiff(
 			await access(absolutePath, constants.R_OK);
 		} catch (error: unknown) {
 			const errorMessage = error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
-			return { error: `Could not edit file: ${path}. ${errorMessage}.` };
+			const code = error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+			return { error: `Could not edit file: ${path}. ${errorMessage}.${describeMissingFile(code, absolutePath)}` };
 		}
 
 		// Read the file
