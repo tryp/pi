@@ -1,6 +1,6 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/types.ts";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.ts";
@@ -8,9 +8,7 @@ import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Ha
 async function createWaitingHarness(
 	options: {
 		tools?: AgentTool[];
-		extensionFactories?: Harness["session"]["extensionRunner"] extends never
-			? never
-			: Array<(pi: ExtensionAPI) => void>;
+		extensionFactories?: ExtensionFactory[];
 	} = {},
 ): Promise<{
 	harness: Harness;
@@ -323,6 +321,46 @@ describe("AgentSession queue characterization", () => {
 		expect(
 			harness.session.messages.some((message) => message.role === "custom" && message.customType === "queue-test"),
 		).toBe(true);
+	});
+
+	it.fails("drops stale custom follow-ups after the producer's job becomes terminal", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		let jobStatus: "running" | "completed" = "running";
+		let sawStaleMessage = false;
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("original turn complete"),
+			(context) => {
+				sawStaleMessage = context.messages.some(
+					(message) =>
+						message.role === "user" &&
+						getMessageText(message).includes("job-queue-race was backgrounded"),
+				);
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		await waitForToolStart;
+		await harness.session.sendCustomMessage(
+			{
+				customType: "bg-timeout",
+				content: "job-queue-race was backgrounded",
+				display: true,
+				details: { jobId: "job-queue-race" },
+			},
+			{ deliverAs: "followUp" },
+		);
+		// Model pi-tau's completion callback winning before the queued
+		// follow-up is delivered. The core queue has no job-state predicate.
+		jobStatus = "completed";
+		releaseToolExecution();
+		await promptPromise;
+
+		expect(jobStatus).toBe("completed");
+		expect(sawStaleMessage).toBe(false);
 	});
 
 	it("injects nextTurn custom messages into the next prompt", async () => {
