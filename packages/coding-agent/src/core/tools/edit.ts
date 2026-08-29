@@ -386,7 +386,7 @@ export function createEditToolDefinition(
 					const errorMessage =
 						error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
 					const code = error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
-					const hint = describeMissingFile(code, path);
+					const hint = describeMissingFile(code, absolutePath);
 					throw new Error(`Could not edit file: ${path}. ${errorMessage}.${hint}`);
 				}
 				throwIfAborted();
