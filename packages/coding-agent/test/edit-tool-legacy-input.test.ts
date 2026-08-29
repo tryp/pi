@@ -176,7 +176,9 @@ describe("edit tool missing file hint", () => {
 		const definition = createEditToolDefinition(dir);
 		await expect(
 			definition.execute!("t1", { path: "missing.txt", edits: [{ oldText: "a", newText: "b" }] }),
-		).rejects.toThrow(/Could not edit file: missing\.txt\. Error code: ENOENT\. The file does not exist; verify the path \(read or ls\) before editing\.$/u);
+		).rejects.toThrow(
+			/Could not edit file: missing\.txt\. Error code: ENOENT\. The file does not exist; verify the path \(read or ls\) before editing\.$/u,
+		);
 	});
 
 	it("suggests checking worktrees for removed worktree paths", async () => {
@@ -187,7 +189,9 @@ describe("edit tool missing file hint", () => {
 				path: "tmp/worktrees/gone-task/src/a.ts",
 				edits: [{ oldText: "a", newText: "b" }],
 			}),
-		).rejects.toThrow(/This path looks like a task worktree that may have been removed; check `pi-worktree list`\.$/u);
+		).rejects.toThrow(
+			/This path looks like a task worktree that may have been removed; check `pi-worktree list`\.$/u,
+		);
 	});
 });
 

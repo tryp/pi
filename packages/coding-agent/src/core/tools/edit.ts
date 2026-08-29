@@ -11,11 +11,11 @@ import type { ToolDefinition } from "../extensions/types.ts";
 import {
 	applyEditsToNormalizedContent,
 	computeEditsDiff,
+	describeMissingFile,
 	detectLineEnding,
 	type Edit,
 	type EditDiffError,
 	type EditDiffResult,
-	describeMissingFile,
 	generateDiffString,
 	generateUnifiedPatch,
 	normalizeToLF,
@@ -144,8 +144,7 @@ function prepareEditArguments(input: unknown): EditToolInput {
 	if (!args.path && Array.isArray(args.edits)) {
 		const candidatePaths = new Set<string>();
 		for (const entry of args.edits) {
-			const entryPath =
-				entry && typeof entry === "object" ? (entry as Record<string, unknown>).path : undefined;
+			const entryPath = entry && typeof entry === "object" ? (entry as Record<string, unknown>).path : undefined;
 			if (typeof entryPath === "string" && entryPath.length > 0) {
 				candidatePaths.add(entryPath);
 			}
@@ -383,7 +382,7 @@ export function createEditToolDefinition(
 					const errorMessage =
 						error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
 					const code = error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
-					const hint = describeMissingFile(code, path);
+					const hint = describeMissingFile(code, absolutePath);
 					throw new Error(`Could not edit file: ${path}. ${errorMessage}.${hint}`);
 				}
 				throwIfAborted();

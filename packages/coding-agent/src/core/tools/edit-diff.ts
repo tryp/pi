@@ -245,12 +245,9 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 }
 
 function countOccurrences(content: string, oldText: string): number {
-	if (!oldText) return 0;
-	let count = 0;
-	for (let index = content.indexOf(oldText); index !== -1; index = content.indexOf(oldText, index + 1)) {
-		count++;
-	}
-	return count;
+	const fuzzyContent = normalizeForFuzzyMatch(content);
+	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
+	return fuzzyContent.split(fuzzyOldText).length - 1;
 }
 
 type MatchPosition = {
@@ -367,7 +364,7 @@ function getDuplicateError(
 		);
 	}
 	return new Error(
-		`Found ${occurrences} occurrences of edits[${editIndex}] in ${path} after whitespace normalization${where}. Each oldText must be unique; provide more surrounding context.`
+		`Found ${occurrences} occurrences of edits[${editIndex}] in ${path} after whitespace normalization${where}. Each oldText must be unique; provide more surrounding context.`,
 	);
 }
 
@@ -384,7 +381,7 @@ function getEmptyOldTextError(path: string, editIndex: number, totalEdits: numbe
  * because session analysis showed missing-file failures cluster on removed
  * task worktrees.
  */
-const worktreePathRe = /(^|[\/\\])(agent-)?worktree(s|\-checkouts)?([\/\\]|$)/;
+const worktreePathRe = /(^|[/\\])(agent-)?worktree(s|-checkouts)?([/\\]|$)/;
 
 export function describeMissingFile(code: string | undefined, path: string): string {
 	if (code !== "ENOENT") return "";
@@ -440,16 +437,10 @@ export function applyEditsToNormalizedContent(
 		const edit = normalizedEdits[i];
 		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
 		if (!matchResult.found) {
-			throw getNotFoundError(
-				path,
-				i,
-				normalizedEdits.length,
-				findClosestLineHint(normalizedContent, edit.oldText),
-			);
+			throw getNotFoundError(path, i, normalizedEdits.length, findClosestLineHint(normalizedContent, edit.oldText));
 		}
 
-		const matchNeedle = matchResult.usedFuzzyMatch ? normalizeForFuzzyMatch(edit.oldText) : edit.oldText;
-		const occurrences = countOccurrences(replacementBaseContent, matchNeedle);
+		const occurrences = countOccurrences(replacementBaseContent, edit.oldText);
 		if (occurrences > 1) {
 			throw getDuplicateError(
 				path,
