@@ -114,3 +114,103 @@ describe("edit tool stringified edits", () => {
 		});
 	});
 });
+
+describe("edit tool prepareArguments path hoist", () => {
+	it("hoists an unambiguous path from an edit entry to the top level", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!({
+			edits: [{ path: "/tmp/project/a.ts", oldText: "foo", newText: "bar" }],
+		});
+		expect(prepared.path).toBe("/tmp/project/a.ts");
+		expect(prepared.edits).toEqual([{ oldText: "foo", newText: "bar" }]);
+	});
+
+	it("keeps a single shared path from multiple entries", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!({
+			edits: [
+				{ path: "/tmp/project/a.ts", oldText: "foo", newText: "bar" },
+				{ path: "/tmp/project/a.ts", oldText: "baz", newText: "qux" },
+			],
+		});
+		expect(prepared.path).toBe("/tmp/project/a.ts");
+		expect((prepared.edits as Array<Record<string, unknown>>).every((entry) => !("path" in entry))).toBe(true);
+	});
+
+	it("does not hoist when entries disagree on the path", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const input = {
+			edits: [
+				{ path: "/tmp/project/a.ts", oldText: "foo", newText: "bar" },
+				{ path: "/tmp/project/b.ts", oldText: "baz", newText: "qux" },
+			],
+		};
+		const prepared = definition.prepareArguments!(input);
+		expect(prepared.path).toBeUndefined();
+		expect(prepared.edits).toEqual(input.edits);
+	});
+
+	it("leaves a valid top-level path untouched", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!({
+			path: "/tmp/project/real.ts",
+			edits: [{ path: "/tmp/project/a.ts", oldText: "foo", newText: "bar" }],
+		});
+		expect(prepared.path).toBe("/tmp/project/real.ts");
+		expect((prepared.edits as Array<Record<string, unknown>>)[0].path).toBe("/tmp/project/a.ts");
+	});
+
+	it("parses stringified edits before attempting the hoist", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!({
+			edits: JSON.stringify([{ path: "/tmp/project/a.ts", oldText: "foo", newText: "bar" }]),
+		});
+		expect(prepared.path).toBe("/tmp/project/a.ts");
+		expect(prepared.edits).toEqual([{ oldText: "foo", newText: "bar" }]);
+	});
+});
+
+describe("edit tool missing file hint", () => {
+	it("appends a path-verification hint for ENOENT", async () => {
+		const dir = await createTempDir();
+		const definition = createEditToolDefinition(dir);
+		await expect(
+			definition.execute!("t1", { path: "missing.txt", edits: [{ oldText: "a", newText: "b" }] }),
+		).rejects.toThrow(/Could not edit file: missing\.txt\. Error code: ENOENT\. The file does not exist; verify the path \(read or ls\) before editing\.$/u);
+	});
+
+	it("suggests checking worktrees for removed worktree paths", async () => {
+		const dir = await createTempDir();
+		const definition = createEditToolDefinition(dir);
+		await expect(
+			definition.execute!("t1", {
+				path: "tmp/worktrees/gone-task/src/a.ts",
+				edits: [{ oldText: "a", newText: "b" }],
+			}),
+		).rejects.toThrow(/This path looks like a task worktree that may have been removed; check `pi-worktree list`\.$/u);
+	});
+});
+
+describe("edit tool prepareArguments hoist safety", () => {
+	it("does not mutate the caller's input objects when hoisting", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const entry = { path: "/tmp/project/a.ts", oldText: "foo", newText: "bar" };
+		const input = { edits: [entry] };
+		definition.prepareArguments!(input);
+		expect(entry).toEqual({ path: "/tmp/project/a.ts", oldText: "foo", newText: "bar" });
+		expect(input.edits).not.toBeUndefined();
+	});
+
+	it("composes with the legacy top-level oldText/newText fold", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const prepared = definition.prepareArguments!({
+			edits: [{ path: "/tmp/project/a.ts" }],
+			oldText: "foo",
+			newText: "bar",
+		});
+		expect(prepared.path).toBe("/tmp/project/a.ts");
+		// The pure path-carrier entry is dropped; the legacy fold supplies the
+		// actual replacement.
+		expect(prepared.edits).toEqual([{ oldText: "foo", newText: "bar" }]);
+	});
+});

@@ -15,6 +15,7 @@ import {
 	type Edit,
 	type EditDiffError,
 	type EditDiffResult,
+	describeMissingFile,
 	generateDiffString,
 	generateUnifiedPatch,
 	normalizeToLF,
@@ -133,6 +134,36 @@ function prepareEditArguments(input: unknown): EditToolInput {
 		} catch {}
 	} else if (isSingleEditInput(args.edits)) {
 		args.edits = [args.edits];
+	}
+
+	// Session analysis showed some models place the file path inside an edit
+	// entry instead of the top-level required "path" field. When the placement
+	// is unambiguous (exactly one distinct non-empty path value among the
+	// entries), hoist it so the call succeeds instead of failing schema
+	// validation with a raw error.
+	if (!args.path && Array.isArray(args.edits)) {
+		const candidatePaths = new Set<string>();
+		for (const entry of args.edits) {
+			const entryPath =
+				entry && typeof entry === "object" ? (entry as Record<string, unknown>).path : undefined;
+			if (typeof entryPath === "string" && entryPath.length > 0) {
+				candidatePaths.add(entryPath);
+			}
+		}
+		if (candidatePaths.size === 1) {
+			const [hoisted] = candidatePaths;
+			args.path = hoisted;
+			// Build new entry objects instead of mutating the caller's inputs in
+			// place; entries that were pure path carriers are dropped, they carry
+			// no edit intent of their own.
+			args.edits = (args.edits as unknown[]).flatMap((entry) => {
+				if (entry && typeof entry === "object") {
+					const { path: _removed, ...rest } = entry as Record<string, unknown>;
+					return Object.keys(rest).length > 0 ? [rest] : [];
+				}
+				return [entry];
+			});
+		}
 	}
 
 	const legacy = args as LegacyEditToolInput;
@@ -351,7 +382,9 @@ export function createEditToolDefinition(
 					throwIfAborted();
 					const errorMessage =
 						error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
-					throw new Error(`Could not edit file: ${path}. ${errorMessage}.`);
+					const code = error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+					const hint = describeMissingFile(code, path);
+					throw new Error(`Could not edit file: ${path}. ${errorMessage}.${hint}`);
 				}
 				throwIfAborted();
 
