@@ -1,15 +1,12 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/types.ts";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/types.ts";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.ts";
 
 async function createWaitingHarness(
-	options: {
-		tools?: AgentTool[];
-		extensionFactories?: ExtensionFactory[];
-	} = {},
+	options: { tools?: AgentTool[]; extensionFactories?: ExtensionFactory[] } = {},
 ): Promise<{
 	harness: Harness;
 	releaseToolExecution: () => void;
@@ -323,7 +320,7 @@ describe("AgentSession queue characterization", () => {
 		).toBe(true);
 	});
 
-	it.fails("drops stale custom follow-ups after the producer's job becomes terminal", async () => {
+	it("cancels stale custom follow-ups after the producer's job becomes terminal", async () => {
 		const waiting = await createWaitingHarness();
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
 		harnesses.push(harness);
@@ -336,8 +333,7 @@ describe("AgentSession queue characterization", () => {
 			(context) => {
 				sawStaleMessage = context.messages.some(
 					(message) =>
-						message.role === "user" &&
-						getMessageText(message).includes("job-queue-race was backgrounded"),
+						message.role === "user" && getMessageText(message).includes("job-queue-race was backgrounded"),
 				);
 				return fauxAssistantMessage("done");
 			},
@@ -351,16 +347,48 @@ describe("AgentSession queue characterization", () => {
 				display: true,
 				details: { jobId: "job-queue-race" },
 			},
-			{ deliverAs: "followUp" },
+			{ deliverAs: "followUp", queueKey: "job-queue-race" },
 		);
 		// Model pi-tau's completion callback winning before the queued
-		// follow-up is delivered. The core queue has no job-state predicate.
+		// follow-up is delivered. Cancel at this deterministic boundary.
 		jobStatus = "completed";
+		expect(harness.session.cancelQueuedMessage("job-queue-race")).toBe(true);
 		releaseToolExecution();
 		await promptPromise;
 
 		expect(jobStatus).toBe("completed");
 		expect(sawStaleMessage).toBe(false);
+		expect(harness.session.cancelQueuedMessage("job-queue-race")).toBe(false);
+	});
+
+	it("cancels keyed nextTurn custom messages before the next prompt", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let sawCancelledMessage = false;
+
+		await harness.session.sendCustomMessage(
+			{ customType: "next-turn-cancel", content: "do not inject", display: true, details: {} },
+			{ deliverAs: "nextTurn", queueKey: "next-turn-cancel-key" },
+		);
+		expect(harness.session.cancelQueuedMessage("next-turn-cancel-key")).toBe(true);
+
+		harness.setResponses([
+			(context) => {
+				sawCancelledMessage = context.messages.some(
+					(message) =>
+						message.role === "user" &&
+						typeof message.content !== "string" &&
+						message.content.some(
+							(part) => part.type === "text" && part.text === "do not inject",
+						),
+				);
+				return fauxAssistantMessage("done");
+			},
+		]);
+		await harness.session.prompt("start");
+
+		expect(sawCancelledMessage).toBe(false);
+		expect(harness.session.cancelQueuedMessage("next-turn-cancel-key")).toBe(false);
 	});
 
 	it("injects nextTurn custom messages into the next prompt", async () => {

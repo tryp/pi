@@ -123,15 +123,15 @@ export interface AgentOptions {
 }
 
 class PendingMessageQueue {
-	private messages: AgentMessage[] = [];
+	private messages: PendingMessage[] = [];
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
 		this.mode = mode;
 	}
 
-	enqueue(message: AgentMessage): void {
-		this.messages.push(message);
+	enqueue(message: AgentMessage, queueKey?: string): void {
+		this.messages.push({ message, queueKey });
 	}
 
 	hasItems(): boolean {
@@ -140,7 +140,7 @@ class PendingMessageQueue {
 
 	drain(): AgentMessage[] {
 		if (this.mode === "all") {
-			const drained = this.messages.slice();
+			const drained = this.messages.map((entry) => entry.message);
 			this.messages = [];
 			return drained;
 		}
@@ -150,7 +150,14 @@ class PendingMessageQueue {
 			return [];
 		}
 		this.messages = this.messages.slice(1);
-		return [first];
+		return [first.message];
+	}
+
+	cancel(queueKey: string): boolean {
+		const remaining = this.messages.filter((entry) => entry.queueKey !== queueKey);
+		if (remaining.length === this.messages.length) return false;
+		this.messages = remaining;
+		return true;
 	}
 
 	clear(): void {
@@ -162,6 +169,11 @@ type ActiveRun = {
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
+};
+
+type PendingMessage = {
+	message: AgentMessage;
+	queueKey?: string;
 };
 
 /**
@@ -280,13 +292,20 @@ export class Agent {
 	}
 
 	/** Queue a message to be injected after the current assistant turn finishes. */
-	steer(message: AgentMessage): void {
-		this.steeringQueue.enqueue(message);
+	steer(message: AgentMessage, queueKey?: string): void {
+		this.steeringQueue.enqueue(message, queueKey);
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
-	followUp(message: AgentMessage): void {
-		this.followUpQueue.enqueue(message);
+	followUp(message: AgentMessage, queueKey?: string): void {
+		this.followUpQueue.enqueue(message, queueKey);
+	}
+
+	/** Cancel queued steering/follow-up messages matching a caller-owned key. */
+	cancelQueuedMessage(queueKey: string): boolean {
+		const cancelledSteering = this.steeringQueue.cancel(queueKey);
+		const cancelledFollowUp = this.followUpQueue.cancel(queueKey);
+		return cancelledSteering || cancelledFollowUp;
 	}
 
 	/** Remove all queued steering messages. */

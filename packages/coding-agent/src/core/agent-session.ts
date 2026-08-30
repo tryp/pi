@@ -326,7 +326,7 @@ export class AgentSession {
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
 	private _followUpMessages: string[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
-	private _pendingNextTurnMessages: CustomMessage[] = [];
+	private _pendingNextTurnMessages: Array<{ message: CustomMessage; queueKey?: string }> = [];
 	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
 	private _pendingCustomMessages: CustomMessage[] = [];
 
@@ -1248,8 +1248,8 @@ export class AgentSession {
 			});
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
-			for (const msg of this._pendingNextTurnMessages) {
-				messages.push(msg);
+			for (const { message } of this._pendingNextTurnMessages) {
+				messages.push(message);
 			}
 			this._pendingNextTurnMessages = [];
 
@@ -1458,10 +1458,15 @@ export class AgentSession {
 	 * @param message Custom message with customType, content, display, details
 	 * @param options.triggerTurn If true and not streaming, triggers a new LLM turn
 	 * @param options.deliverAs Delivery mode: "steer", "followUp", or "nextTurn"
+	 * @param options.queueKey Optional caller-owned key used to cancel queued delivery
 	 */
 	async sendCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+			queueKey?: string;
+		},
 	): Promise<void> {
 		const appMessage = {
 			role: "custom" as const,
@@ -1473,12 +1478,18 @@ export class AgentSession {
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
-			this._pendingNextTurnMessages.push(appMessage);
+			this._pendingNextTurnMessages.push({ message: appMessage, queueKey: options.queueKey });
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
 			if (options?.deliverAs === "followUp") {
-				this.agent.followUp(appMessage);
+				(this.agent as Agent & { followUp(message: AgentMessage, queueKey?: string): void }).followUp(
+					appMessage,
+					options?.queueKey,
+				);
 			} else {
-				this.agent.steer(appMessage);
+				(this.agent as Agent & { steer(message: AgentMessage, queueKey?: string): void }).steer(
+					appMessage,
+					options?.queueKey,
+				);
 			}
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
@@ -1517,6 +1528,17 @@ export class AgentSession {
 		for (const appMessage of pending) {
 			this._appendCustomMessage(appMessage);
 		}
+	}
+
+	/** Cancel queued custom messages sent with a caller-owned key. */
+	cancelQueuedMessage(queueKey: string): boolean {
+		const cancelledByAgent = (
+			this.agent as Agent & { cancelQueuedMessage(queueKey: string): boolean }
+		).cancelQueuedMessage(queueKey);
+		const remaining = this._pendingNextTurnMessages.filter((entry) => entry.queueKey !== queueKey);
+		const cancelledNextTurn = remaining.length !== this._pendingNextTurnMessages.length;
+		this._pendingNextTurnMessages = remaining;
+		return cancelledByAgent || cancelledNextTurn;
 	}
 
 	/**
@@ -2552,6 +2574,9 @@ export class AgentSession {
 							error: err instanceof Error ? err.message : String(err),
 						});
 					});
+				},
+				cancelQueuedMessage: (queueKey) => {
+					this.cancelQueuedMessage(queueKey);
 				},
 				sendUserMessage: (content, options) => {
 					this.sendUserMessage(content, options).catch((err) => {
