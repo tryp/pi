@@ -73,7 +73,7 @@ describe("ExtensionRunner", () => {
 
 	const extensionActions: ExtensionActions = {
 		sendMessage: () => {},
-		cancelQueuedMessage: () => {},
+		cancelQueuedMessage: () => false,
 		sendUserMessage: () => {},
 		appendEntry: () => {},
 		setSessionName: () => {},
@@ -116,6 +116,28 @@ describe("ExtensionRunner", () => {
 			const scoped = [{ model: { id: "scoped-test" }, thinkingLevel: "high" }] as unknown as ScopedModel[];
 			runner.bindCore(extensionActions, { ...extensionContextActions, getScopedModels: () => scoped });
 			expect(runner.createContext().scopedModels).toBe(scoped);
+		});
+	});
+
+	describe("cancelQueuedMessage", () => {
+		it("propagates cancellation effectiveness from the bound action", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const cancelledKeys: string[] = [];
+			runner.bindCore(
+				{
+					...extensionActions,
+					cancelQueuedMessage: (queueKey) => {
+						cancelledKeys.push(queueKey);
+						return true;
+					},
+				},
+				extensionContextActions,
+			);
+
+			expect(result.runtime.cancelQueuedMessage("k1")).toBe(true);
+			expect(result.runtime.cancelQueuedMessage("k1")).toBe(true);
+			expect(cancelledKeys).toEqual(["k1", "k1"]);
 		});
 	});
 

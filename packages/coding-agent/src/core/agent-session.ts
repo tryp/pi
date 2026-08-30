@@ -1481,15 +1481,9 @@ export class AgentSession {
 			this._pendingNextTurnMessages.push({ message: appMessage, queueKey: options.queueKey });
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
 			if (options?.deliverAs === "followUp") {
-				(this.agent as Agent & { followUp(message: AgentMessage, queueKey?: string): void }).followUp(
-					appMessage,
-					options?.queueKey,
-				);
+				this.agent.followUp(appMessage, options?.queueKey);
 			} else {
-				(this.agent as Agent & { steer(message: AgentMessage, queueKey?: string): void }).steer(
-					appMessage,
-					options?.queueKey,
-				);
+				this.agent.steer(appMessage, options?.queueKey);
 			}
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
@@ -1532,9 +1526,7 @@ export class AgentSession {
 
 	/** Cancel queued custom messages sent with a caller-owned key. */
 	cancelQueuedMessage(queueKey: string): boolean {
-		const cancelledByAgent = (
-			this.agent as Agent & { cancelQueuedMessage(queueKey: string): boolean }
-		).cancelQueuedMessage(queueKey);
+		const cancelledByAgent = this.agent.cancelQueuedMessage(queueKey);
 		const remaining = this._pendingNextTurnMessages.filter((entry) => entry.queueKey !== queueKey);
 		const cancelledNextTurn = remaining.length !== this._pendingNextTurnMessages.length;
 		this._pendingNextTurnMessages = remaining;
@@ -2575,9 +2567,7 @@ export class AgentSession {
 						});
 					});
 				},
-				cancelQueuedMessage: (queueKey) => {
-					this.cancelQueuedMessage(queueKey);
-				},
+				cancelQueuedMessage: (queueKey) => this.cancelQueuedMessage(queueKey),
 				sendUserMessage: (content, options) => {
 					this.sendUserMessage(content, options).catch((err) => {
 						runner.emitError({
