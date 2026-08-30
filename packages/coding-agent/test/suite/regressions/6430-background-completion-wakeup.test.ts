@@ -127,7 +127,7 @@ describe("background completion wakeup", () => {
 						queued = true;
 						void pi.sendMessage(
 							{ customType: "completion", content: "stale completion", display: true, details: {} },
-							{ deliverAs: "followUp", triggerTurn: true },
+							{ deliverAs: "followUp", triggerTurn: true, queueKey: "stale-completion" },
 						);
 					});
 				},
@@ -135,6 +135,7 @@ describe("background completion wakeup", () => {
 		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("must not run")]);
+		(harness.session.agent as unknown as { cancelQueuedMessage?: unknown }).cancelQueuedMessage = undefined;
 
 		await harness.session.prompt("start");
 		harness.session.dispose();
@@ -143,6 +144,20 @@ describe("background completion wakeup", () => {
 
 		expect(getAssistantTexts(harness)).toEqual(["first"]);
 		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	it("cancels nextTurn messages without an older agent cancellation method", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		(harness.session.agent as unknown as { cancelQueuedMessage?: unknown }).cancelQueuedMessage = undefined;
+
+		await harness.session.sendCustomMessage(
+			{ customType: "next-turn-cancel", content: "do not inject", display: true, details: {} },
+			{ deliverAs: "nextTurn", queueKey: "next-turn-cancel-key" },
+		);
+
+		expect(harness.session.cancelQueuedMessage("next-turn-cancel-key")).toBe(true);
+		expect(harness.session.cancelQueuedMessage("next-turn-cancel-key")).toBe(false);
 	});
 
 	it("cancels a deferred wake when aborted before its timer fires", async () => {

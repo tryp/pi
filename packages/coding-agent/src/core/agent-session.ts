@@ -647,7 +647,7 @@ export class AgentSession {
 		}
 		if (hadDeferredWake) {
 			for (const queueKey of this._autonomousWakeQueueKeys) {
-				this.agent.cancelQueuedMessage(queueKey);
+				this.agent.cancelQueuedMessage?.(queueKey);
 			}
 			this._autonomousWakeQueueKeys.clear();
 			this._autonomousWakeQueueMessages.clear();
@@ -1725,7 +1725,7 @@ export class AgentSession {
 
 	/** Cancel queued custom messages sent with a caller-owned key. */
 	cancelQueuedMessage(queueKey: string): boolean {
-		const cancelledByAgent = this.agent.cancelQueuedMessage(queueKey);
+		const cancelledByAgent = this.agent.cancelQueuedMessage?.(queueKey) ?? false;
 		const remaining = this._pendingNextTurnMessages.filter((entry) => entry.queueKey !== queueKey);
 		const cancelledNextTurn = remaining.length !== this._pendingNextTurnMessages.length;
 		this._pendingNextTurnMessages = remaining;
