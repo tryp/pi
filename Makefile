@@ -73,6 +73,7 @@ install-runtime-dependencies:
 
 deploy: build-telemetry build-agent build-extra build-coding-agent install-runtime-dependencies  ## Build and sync all local runtime packages, stamp, verify, and smoke-test
 	rsync -a --delete packages/coding-agent/dist/ $(RUNTIME_DIR)/dist/
+	cp packages/coding-agent/package.json $(RUNTIME_DIR)/package.json
 	mkdir -p $(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry
 	rsync -a --delete packages/telemetry/dist/ \
 		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry/dist/
