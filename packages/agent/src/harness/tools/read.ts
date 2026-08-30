@@ -42,6 +42,10 @@ export interface ReadToolOptions {
 	imageProcessor?: ReadImageProcessor;
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new Error("Operation aborted");
+}
+
 export function createReadTool<TContext extends ExecutionToolContext = ExecutionToolContext>(
 	options?: ReadToolOptions,
 ): AgentHarnessTool<TContext, typeof readSchema, ReadToolDetails | undefined> {
@@ -52,13 +56,16 @@ export function createReadTool<TContext extends ExecutionToolContext = Execution
 		parameters: readSchema,
 		async execute(_toolCallId, { path, offset, limit }, signal, _onUpdate, { env }) {
 			const absolutePath = await resolveReadToolPath(env, path, signal);
+			throwIfAborted(signal);
 			const bytes = getOrThrow(await env.readBinaryFile(absolutePath, signal));
+			throwIfAborted(signal);
 			const mimeType = detectSupportedImageMimeType(bytes);
 			if (mimeType) {
 				if (options?.imageProcessor) {
 					const processed = await options.imageProcessor(bytes, mimeType, {
 						autoResizeImages: options.autoResizeImages ?? true,
 					});
+					throwIfAborted(signal);
 					if (!processed.ok) {
 						return {
 							content: [{ type: "text", text: `Read image file [${mimeType}]\n${processed.message}` }],

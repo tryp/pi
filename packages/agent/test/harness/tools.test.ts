@@ -46,6 +46,22 @@ class SlowReadExecutionEnv extends NodeExecutionEnv {
 	}
 }
 
+class LateReadExecutionEnv extends NodeExecutionEnv {
+	readonly firstReadStarted = deferred();
+	readonly releaseFirstRead = deferred();
+	private firstRead = true;
+
+	override async readBinaryFile(path: string, abortSignal?: AbortSignal): Promise<Result<Uint8Array, FileError>> {
+		if (this.firstRead) {
+			this.firstRead = false;
+			this.firstReadStarted.resolve();
+			await this.releaseFirstRead.promise;
+			return ok(new TextEncoder().encode("late result"));
+		}
+		return super.readBinaryFile(path, abortSignal);
+	}
+}
+
 class BlockingWriteExecutionEnv extends NodeExecutionEnv {
 	readonly firstWriteStarted = deferred();
 	readonly finishFirstWrite = deferred();
@@ -203,6 +219,47 @@ describe("AgentHarness tools", () => {
 			await expect(
 				createReadTool().execute("read-3", { path: "short.txt", offset: 100 }, undefined, undefined, context),
 			).rejects.toThrow("Offset 100 is beyond end of file (3 lines total)");
+		});
+
+		it("does not return a successful result when the read settles after abort", async () => {
+			const env = new LateReadExecutionEnv({ cwd: createTempDir() });
+			getOrThrow(await env.writeFile("late.txt", "original result"));
+			const controller = new AbortController();
+			const firstRead = createReadTool().execute("read-late", { path: "late.txt" }, controller.signal, undefined, {
+				env,
+			});
+
+			await env.firstReadStarted.promise;
+			controller.abort();
+			env.releaseFirstRead.resolve();
+			await expect(firstRead).rejects.toThrow("Operation aborted");
+
+			const followUp = await createReadTool().execute("read-follow-up", { path: "late.txt" }, undefined, undefined, {
+				env,
+			});
+			expect(textOutput(followUp)).toBe("original result");
+		});
+
+		it("does not return processed image content when the processor settles after abort", async () => {
+			const context = createContext();
+			const bmp = createTinyBmp();
+			getOrThrow(await context.env.writeFile("late.bmp", bmp));
+			const processorStarted = deferred();
+			const releaseProcessor = deferred();
+			const controller = new AbortController();
+			const tool = createReadTool({
+				imageProcessor: async () => {
+					processorStarted.resolve();
+					await releaseProcessor.promise;
+					return { ok: true, data: "converted", mimeType: "image/png", hints: [] };
+				},
+			});
+			const read = tool.execute("read-late-image", { path: "late.bmp" }, controller.signal, undefined, context);
+
+			await processorStarted.promise;
+			controller.abort();
+			releaseProcessor.resolve();
+			await expect(read).rejects.toThrow("Operation aborted");
 		});
 
 		it("detects supported images by content", async () => {
