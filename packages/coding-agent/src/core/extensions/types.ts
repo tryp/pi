@@ -1318,8 +1318,12 @@ export interface ExtensionAPI {
 		},
 	): void;
 
-	/** Cancel queued custom messages previously sent with the given queue key. */
-	cancelQueuedMessage(queueKey: string): void;
+	/**
+	 * Cancel queued custom messages previously sent with the given queue key.
+	 * Returns true when at least one queued message was removed; false when
+	 * nothing matched (e.g. the message was already delivered).
+	 */
+	cancelQueuedMessage(queueKey: string): boolean;
 
 	/**
 	 * Send a user message to the agent. Always triggers a turn.
@@ -1572,7 +1576,7 @@ export type SendMessageHandler = <T = unknown>(
 	},
 ) => void;
 
-export type CancelQueuedMessageHandler = (queueKey: string) => void;
+export type CancelQueuedMessageHandler = (queueKey: string) => boolean;
 
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],

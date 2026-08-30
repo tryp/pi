@@ -322,9 +322,9 @@ function createExtensionAPI(
 			runtime.sendMessage(message, options);
 		},
 
-		cancelQueuedMessage(queueKey: string): void {
+		cancelQueuedMessage(queueKey: string): boolean {
 			runtime.assertActive();
-			runtime.cancelQueuedMessage(queueKey);
+			return runtime.cancelQueuedMessage(queueKey);
 		},
 
 		sendUserMessage(content, options): void {
