@@ -7,6 +7,7 @@
 #   make deploy            # build agent + coding-agent, sync, stamp, verify
 #   make deploy-full       # additionally rebuild+sync pi-ai and pi-tui
 #   make verify            # deployed tree matches this build
+#   make smoke-test        # fresh-process startup test with configured extensions
 #   make deployed-commit   # show what is deployed
 #
 # Traps encoded here (do not "simplify" them away):
@@ -28,8 +29,10 @@
 
 RUNTIME_DIR ?= $(HOME)/.pi/local/pi-coding-agent
 CORE_PKGS := telemetry agent coding-agent
+PI ?= pi
+SMOKE_TIMEOUT ?= 90
 
-.PHONY: deploy deploy-full verify deployed-commit build-telemetry build-agent build-coding-agent install-runtime-dependencies
+.PHONY: deploy deploy-full verify smoke-test deployed-commit build-telemetry build-agent build-coding-agent install-runtime-dependencies build-extra
 
 build-telemetry:
 	cd packages/telemetry && npm run build || true
@@ -65,9 +68,11 @@ deploy: build-telemetry build-agent build-coding-agent install-runtime-dependenc
 		"$(CURDIR)" "$$(git rev-parse --abbrev-ref HEAD)" "$$(git rev-parse HEAD)" "$$(date '+%Y-%m-%d %H:%M:%S %z')" "$(CORE_PKGS)" \
 		> $(RUNTIME_DIR)/.deployed-commit
 	@$(MAKE) --no-print-directory verify
+	@$(MAKE) --no-print-directory smoke-test
 
 deploy-full: deploy build-extra  ## Additionally rebuild and sync pi-ai and pi-tui
 	@$(MAKE) --no-print-directory verify
+	@$(MAKE) --no-print-directory smoke-test
 
 build-extra:
 	cd packages/ai && npm run build
@@ -108,6 +113,20 @@ verify:  ## Verify deployed dist matches this build (versions + content + exec b
 		echo "WARN: pi-$$pkg version drift (source $$src vs deployed $$dep); sync with 'make deploy-full' if this checkout changed pi-$$pkg"; \
 	done
 	@echo "OK: $(RUNTIME_DIR) matches $$(git rev-parse --short HEAD) ($(CORE_PKGS))"
+
+smoke-test:  ## Start a fresh pi process with the configured extensions
+	@set -eu; \
+	root="$(CURDIR)/tmp/predeploy-core-smoke-$$$$"; out="$$root/pi.jsonl"; \
+	mkdir -p "$$root/sessions"; \
+	if ! timeout "$(SMOKE_TIMEOUT)" "$(PI)" --session-dir "$$root/sessions" --no-session --mode json \
+		-p 'List your available tools, report that startup succeeded, and stop.' >"$$out" 2>&1; then \
+		echo "FAIL: pi startup smoke failed; inspect $$out" >&2; tail -80 "$$out" >&2; exit 1; \
+	fi; \
+	if grep -Eq 'Failed to load extension|registerToolPromptGuidelines is not a function|"errorMessage"|uncaught|Not logged in' "$$out"; then \
+		echo "FAIL: pi startup smoke reported an extension or turn error; inspect $$out" >&2; exit 1; \
+	fi; \
+	grep -Eq '"type"[[:space:]]*:[[:space:]]*"agent_end"' "$$out" || { echo "FAIL: pi startup smoke did not reach agent_end; inspect $$out" >&2; exit 1; }; \
+	echo "OK: fresh pi startup smoke passed; output: $$out"
 
 deployed-commit:  ## Show what is deployed
 	@cat $(RUNTIME_DIR)/.deployed-commit 2>/dev/null || echo "no .deployed-commit marker in $(RUNTIME_DIR)"
