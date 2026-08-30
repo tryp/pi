@@ -498,6 +498,21 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
+	it("should cancel only keyed queued messages", () => {
+		const agent = new Agent({ streamFn: unusedStreamFunction });
+		const dropped = { role: "user" as const, content: "drop", timestamp: Date.now() };
+		const retained = { role: "user" as const, content: "retain", timestamp: Date.now() };
+
+		agent.followUp(dropped, "drop-key");
+		agent.followUp(retained, "retain-key");
+
+		expect(agent.cancelQueuedMessage("drop-key")).toBe(true);
+		expect(agent.cancelQueuedMessage("drop-key")).toBe(false);
+		expect(agent.hasQueuedMessages()).toBe(true);
+		expect(agent.cancelQueuedMessage("retain-key")).toBe(true);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
 	it("should handle abort controller", () => {
 		const agent = new Agent({ streamFn: unusedStreamFunction });
 
