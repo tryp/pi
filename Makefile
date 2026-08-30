@@ -15,10 +15,11 @@
 #    dist. The npm build script chains chmod/copy-assets with &&, so those
 #    post-steps are silently skipped on any type error. We run them
 #    unconditionally.
-# 2. coding-agent dist MUST be deployed together with pi-agent-core dist.
-#    The runtime pins its own node_modules: a dist-only deploy leaves new
-#    agent APIs unresolved — extra call args are silently dropped (a queueKey
-#    vanishes) and new methods raise TypeError at runtime.
+# 2. coding-agent dist MUST be deployed together with pi-agent-core and
+#    pi-telemetry dist. The runtime pins its own node_modules: a dist-only
+#    deploy leaves new agent APIs or runtime imports unresolved — extra call
+#    args are silently dropped (a queueKey vanishes), new methods raise
+#    TypeError, or startup fails on a missing package.
 # 3. pi-ai and pi-tui only need syncing when this checkout changes those
 #    packages; their builds may require network (generate-models). Use
 #    `make deploy-full` for that case and confirm the build actually ran.
@@ -26,9 +27,13 @@
 #    tree, before recording a deploy event.
 
 RUNTIME_DIR ?= $(HOME)/.pi/local/pi-coding-agent
-CORE_PKGS := agent coding-agent
+CORE_PKGS := telemetry agent coding-agent
 
-.PHONY: deploy deploy-full verify deployed-commit build-agent build-coding-agent
+.PHONY: deploy deploy-full verify deployed-commit build-telemetry build-agent build-coding-agent install-runtime-dependencies
+
+build-telemetry:
+	cd packages/telemetry && npm run build || true
+	test -f packages/telemetry/dist/index.js || { echo "FAIL: packages/telemetry dist not emitted" >&2; exit 1; }
 
 build-agent:
 	cd packages/agent && npm run build || true
@@ -40,8 +45,17 @@ build-coding-agent:
 	chmod +x packages/coding-agent/dist/cli.js packages/coding-agent/dist/rpc-entry.js
 	cd packages/coding-agent && npm run copy-assets
 
-deploy: build-agent build-coding-agent  ## Build core packages, sync runtime, stamp, verify
+install-runtime-dependencies:
+	npm install --prefix $(RUNTIME_DIR) --no-save --ignore-scripts grok-mermaid@0.2.2
+	test -f $(RUNTIME_DIR)/node_modules/grok-mermaid/package.json || { echo "FAIL: grok-mermaid runtime dependency missing" >&2; exit 1; }
+
+deploy: build-telemetry build-agent build-coding-agent install-runtime-dependencies  ## Build core packages, sync runtime, stamp, verify
 	rsync -a --delete packages/coding-agent/dist/ $(RUNTIME_DIR)/dist/
+	mkdir -p $(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry
+	rsync -a --delete packages/telemetry/dist/ \
+		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry/dist/
+	cp packages/telemetry/package.json \
+		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry/package.json
 	rsync -a --delete packages/agent/dist/ \
 		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-agent-core/dist/
 	cp packages/agent/package.json \
@@ -72,9 +86,16 @@ verify:  ## Verify deployed dist matches this build (versions + content + exec b
 	@test -x $(RUNTIME_DIR)/dist/cli.js || { echo "FAIL: $(RUNTIME_DIR)/dist/cli.js missing or not executable" >&2; exit 1; }
 	@test "$$(sed -n 's/^commit: //p' $(RUNTIME_DIR)/.deployed-commit 2>/dev/null)" = "$$(git rev-parse HEAD)" || { \
 		echo "FAIL: deployed commit != checkout HEAD (run make deploy)" >&2; exit 1; }
+	@src=$$(node -p "require('./packages/telemetry/package.json').version"); \
+	dep=$$(node -p "require('$(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry/package.json').version"); \
+	[ "$$src" = "$$dep" ] || { echo "FAIL: pi-telemetry version drift: source $$src vs deployed $$dep" >&2; exit 1; }
 	@src=$$(node -p "require('./packages/agent/package.json').version"); \
 	dep=$$(node -p "require('$(RUNTIME_DIR)/node_modules/@earendil-works/pi-agent-core/package.json').version"); \
-	[ "$$src" = "$$dep" ] || { echo "FAIL: pi-agent-core version drift: source $$src vs deployed $$dep — dist-only deploy leaves new agent APIs unresolved" >&2; exit 1; }
+	[ "$$src" = "$$dep" ] || { echo "FAIL: pi-agent-core version drift: source $$src vs deployed $$dep" >&2; exit 1; }
+	@test -f $(RUNTIME_DIR)/node_modules/grok-mermaid/package.json || { echo "FAIL: grok-mermaid runtime dependency missing (run make deploy)" >&2; exit 1; }
+	@cmp -s packages/telemetry/dist/index.js \
+		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry/dist/index.js || { \
+		echo "FAIL: pi-telemetry dist drift (run make deploy)" >&2; exit 1; }
 	@cmp -s packages/agent/dist/agent.js \
 		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-agent-core/dist/agent.js || { \
 		echo "FAIL: pi-agent-core dist drift (run make deploy)" >&2; exit 1; }
