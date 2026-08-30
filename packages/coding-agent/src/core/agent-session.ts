@@ -291,6 +291,17 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
+/** Queue APIs added after the oldest agent-core peer used by coding-agent. */
+interface AgentQueueCompatibility {
+	steer(message: AgentMessage, queueKey?: string): void;
+	followUp(message: AgentMessage, queueKey?: string): void;
+	cancelQueuedMessage?: (queueKey: string) => boolean;
+}
+
+function getAgentQueueCompatibility(agent: Agent): AgentQueueCompatibility {
+	return agent as unknown as AgentQueueCompatibility;
+}
+
 function estimateMessagesTokens(messages: AgentMessage[]): number {
 	let tokens = 0;
 	for (const message of messages) {
@@ -646,8 +657,9 @@ export class AgentSession {
 			this._queuedMessageWakeActive = false;
 		}
 		if (hadDeferredWake) {
+			const queueAgent = getAgentQueueCompatibility(this.agent);
 			for (const queueKey of this._autonomousWakeQueueKeys) {
-				this.agent.cancelQueuedMessage?.(queueKey);
+				queueAgent.cancelQueuedMessage?.(queueKey);
 			}
 			this._autonomousWakeQueueKeys.clear();
 			this._autonomousWakeQueueMessages.clear();
@@ -1660,10 +1672,11 @@ export class AgentSession {
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push({ message: appMessage, queueKey: options.queueKey });
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
+			const queueAgent = getAgentQueueCompatibility(this.agent);
 			if (options?.deliverAs === "followUp") {
-				this.agent.followUp(appMessage, options?.queueKey);
+				queueAgent.followUp(appMessage, options?.queueKey);
 			} else {
-				this.agent.steer(appMessage, options?.queueKey);
+				queueAgent.steer(appMessage, options?.queueKey);
 			}
 		} else if (this._isAgentSettling && options?.triggerTurn) {
 			if (
@@ -1676,10 +1689,11 @@ export class AgentSession {
 			const queueKey =
 				options.queueKey ??
 				`agent-session-autonomous-wake-${this._queuedMessageWakeGeneration}-${this._nextAutonomousWakeQueueKey++}`;
+			const queueAgent = getAgentQueueCompatibility(this.agent);
 			if (options?.deliverAs === "followUp") {
-				this.agent.followUp(appMessage, queueKey);
+				queueAgent.followUp(appMessage, queueKey);
 			} else {
-				this.agent.steer(appMessage, queueKey);
+				queueAgent.steer(appMessage, queueKey);
 			}
 			this._autonomousWakeQueueKeys.add(queueKey);
 			this._autonomousWakeQueueMessages.set(appMessage, queueKey);
@@ -1725,7 +1739,7 @@ export class AgentSession {
 
 	/** Cancel queued custom messages sent with a caller-owned key. */
 	cancelQueuedMessage(queueKey: string): boolean {
-		const cancelledByAgent = this.agent.cancelQueuedMessage?.(queueKey) ?? false;
+		const cancelledByAgent = getAgentQueueCompatibility(this.agent).cancelQueuedMessage?.(queueKey) ?? false;
 		const remaining = this._pendingNextTurnMessages.filter((entry) => entry.queueKey !== queueKey);
 		const cancelledNextTurn = remaining.length !== this._pendingNextTurnMessages.length;
 		this._pendingNextTurnMessages = remaining;
