@@ -19,6 +19,7 @@ import {
 import { getExperimentalToolSampling } from "../experimental.ts";
 import type { ExtensionContext, ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
+import { resolvePerCallCwd } from "./path-utils.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
@@ -39,9 +40,21 @@ function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 	return timeoutMs;
 }
 
+function getErrorCode(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null || !("code" in error)) return;
+	const code = error.code;
+	return typeof code === "string" ? code : undefined;
+}
+
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Working directory to execute the command in. Use when working outside the session working directory (for example in a git worktree). Defaults to the session working directory.",
+		}),
+	),
 });
 
 export const bashToolSystemPromptContribution = {
@@ -131,8 +144,26 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					else signal.addEventListener("abort", onAbort, { once: true });
 				}
 				// Handle shell spawn errors and wait for the process to terminate without hanging
-				// on inherited stdio handles held by detached descendants.
-				const exitCode = await waitForChildProcess(child);
+				// on inherited stdio handles held by detached descendants. A cwd can
+				// disappear between the access check above and spawn(), for example when a
+				// worktree is removed concurrently; translate that race into a useful tool
+				// error instead of leaking Node's ambiguous ENOENT message.
+				let exitCode: number | null;
+				try {
+					exitCode = await waitForChildProcess(child);
+				} catch (error) {
+					if (getErrorCode(error) === "ENOENT") {
+						try {
+							await fsAccess(cwd, constants.F_OK);
+						} catch {
+							throw new Error(
+								`Working directory disappeared while starting bash: ${cwd}\nCannot execute bash commands.`,
+								{ cause: error },
+							);
+						}
+					}
+					throw error;
+				}
 				if (signal?.aborted) {
 					throw new Error("aborted");
 				}
@@ -347,20 +378,26 @@ export function createShellToolDefinition(
 	return {
 		name: config.name,
 		label: config.label,
-		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds. Optionally provide a cwd to run in a different working directory (for example a git worktree); defaults to the session working directory.`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
 		constrainedSampling: getExperimentalToolSampling(),
 		async execute(
 			_toolCallId,
-			{ command, timeout }: { command: string; timeout?: number },
+			{ command, timeout, cwd: perCallCwd }: { command: string; timeout?: number; cwd?: string },
 			signal?: AbortSignal,
 			onUpdate?,
 			ctx?,
 		) {
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
-			const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook, exposeSessionEnvironment, ctx);
+			const spawnContext = resolveSpawnContext(
+				resolvedCommand,
+				resolvePerCallCwd(perCallCwd, cwd),
+				spawnHook,
+				exposeSessionEnvironment,
+				ctx,
+			);
 			const output = new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;

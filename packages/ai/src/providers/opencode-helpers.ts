@@ -73,12 +73,7 @@ export const ZEN_ANTHROPIC_MODEL_IDS = new Set([
 	"qwen3.6-plus-free",
 ]);
 
-export const ZEN_GOOGLE_MODEL_IDS = new Set([
-	"gemini-3.5-flash",
-	"gemini-3.1-pro",
-	"gemini-3-pro",
-	"gemini-3-flash",
-]);
+export const ZEN_GOOGLE_MODEL_IDS = new Set(["gemini-3.5-flash", "gemini-3.1-pro", "gemini-3-pro", "gemini-3-flash"]);
 
 export const GO_ANTHROPIC_MODEL_IDS = new Set([
 	"minimax-m3",

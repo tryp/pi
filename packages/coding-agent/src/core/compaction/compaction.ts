@@ -7,7 +7,16 @@
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { contentText, type RetryCallbacks, type RetryPolicy, retryAssistantCall, uuidv7 } from "@earendil-works/pi-ai";
-import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import type {
+	AssistantMessage,
+	Context,
+	Model,
+	SimpleStreamOptions,
+	TextContent,
+	ThinkingContent,
+	ToolCall,
+	Usage,
+} from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { convertToLlm } from "../messages.ts";
 import {
@@ -127,12 +136,14 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	maxContextTokens?: number;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	maxContextTokens: undefined,
 };
 
 // ============================================================================
@@ -234,6 +245,12 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
+	// If maxContextTokens is set, use it as an absolute threshold (model-independent).
+	// This allows triggering compaction at a fixed token level regardless of the
+	// model's context window (e.g., compact at 180k whether model has 200k or 1M context).
+	if (settings.maxContextTokens != null) {
+		return contextTokens > settings.maxContextTokens;
+	}
 	return contextTokens > contextWindow - settings.reserveTokens;
 }
 
@@ -246,6 +263,10 @@ const ESTIMATED_IMAGE_CHARS = 4800;
 function estimateTextAndImageContentChars(content: string | Array<{ type: string; text?: string }>): number {
 	if (typeof content === "string") {
 		return content.length;
+	}
+
+	if (!Array.isArray(content)) {
+		return 0;
 	}
 
 	let chars = 0;
@@ -275,7 +296,15 @@ export function estimateTokens(message: AgentMessage): number {
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
-			for (const block of assistant.content) {
+			const assistantContent = assistant.content as string | Array<TextContent | ThinkingContent | ToolCall>;
+			if (typeof assistantContent === "string") {
+				chars = assistantContent.length;
+				return Math.ceil(chars / 4);
+			}
+			if (!Array.isArray(assistantContent)) {
+				return 0;
+			}
+			for (const block of assistantContent) {
 				if (block.type === "text") {
 					chars += block.text.length;
 				} else if (block.type === "thinking") {

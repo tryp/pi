@@ -8,13 +8,19 @@ import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/inte
 import { getExperimentalToolSampling } from "../experimental.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
-import { resolveToCwd } from "./path-utils.ts";
+import { resolvePerCallCwd, resolveToCwd } from "./path-utils.ts";
 import { normalizeDisplayText, renderToolPath, replaceTabs, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 
 const writeSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to write (relative or absolute)" }),
 	content: Type.String({ description: "Content to write to the file" }),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Working directory to resolve the path against. Use when writing a file outside the session working directory (for example in a git worktree). Defaults to the session working directory.",
+		}),
+	),
 });
 
 export const writeToolSystemPromptContribution = {
@@ -200,12 +206,12 @@ export function createWriteToolDefinition(
 		constrainedSampling: getExperimentalToolSampling(),
 		async execute(
 			_toolCallId,
-			{ path, content }: { path: string; content: string },
+			{ path, content, cwd: perCallCwd }: { path: string; content: string; cwd?: string },
 			signal?: AbortSignal,
 			_onUpdate?,
 			_ctx?,
 		) {
-			const absolutePath = resolveToCwd(path, cwd);
+			const absolutePath = resolveToCwd(path, resolvePerCallCwd(perCallCwd, cwd));
 			const dir = dirname(absolutePath);
 			return withFileMutationQueue(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the

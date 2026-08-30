@@ -87,9 +87,11 @@ function createSession(options: {
 	return session as unknown as AgentSession;
 }
 
-function createFooterData(providerCount: number): ReadonlyFooterDataProvider {
+function createFooterData(providerCount: number, worktree: string | null = null): ReadonlyFooterDataProvider {
 	const provider = {
+		getCwd: () => "/tmp/project",
 		getGitBranch: () => "main",
+		getGitWorktree: () => worktree,
 		getExtensionStatuses: () => new Map<string, string>(),
 		getAvailableProviderCount: () => providerCount,
 		onBranchChange: (callback: () => void) => {
@@ -115,6 +117,20 @@ describe("formatCwdForFooter", () => {
 describe("FooterComponent width handling", () => {
 	beforeAll(() => {
 		initTheme(undefined, false);
+	});
+
+	it("identifies linked worktrees in the git status line", () => {
+		const session = createSession({ sessionName: "" });
+		const footer = new FooterComponent(session, createFooterData(1, "feature"));
+
+		expect(stripAnsi(footer.render(120)[0])).toContain("/tmp/project (main @ feature)");
+	});
+
+	it("shows the worktree alone when it matches the branch name", () => {
+		const session = createSession({ sessionName: "" });
+		const footer = new FooterComponent(session, createFooterData(1, "main"));
+
+		expect(stripAnsi(footer.render(120)[0])).toContain("/tmp/project (main)");
 	});
 
 	it("keeps all lines within width for wide session names", () => {

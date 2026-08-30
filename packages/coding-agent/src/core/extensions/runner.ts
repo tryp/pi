@@ -522,6 +522,18 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
+	/** Get all prompt guideline contributions from all extensions, merged per tool name. */
+	getToolPromptGuidelineContributions(): Map<string, string[]> {
+		const contributions = new Map<string, string[]>();
+		for (const ext of this.extensions) {
+			for (const [toolName, guidelines] of ext.toolPromptGuidelineContributions) {
+				const existing = contributions.get(toolName) ?? [];
+				contributions.set(toolName, [...existing, ...guidelines]);
+			}
+		}
+		return contributions;
+	}
+
 	getFlags(): Map<string, ExtensionFlag> {
 		const allFlags = new Map<string, ExtensionFlag>();
 		for (const ext of this.extensions) {
@@ -786,6 +798,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				runner.shutdownHandler();
 			},
+			reload: () => {
+				runner.assertActive();
+				return runner.reloadHandler();
+			},
 			getContextUsage: () => {
 				runner.assertActive();
 				return runner.getContextUsageFn();
@@ -832,10 +848,6 @@ export class ExtensionRunner {
 		context.switchSession = (sessionPath, options) => {
 			this.assertActive();
 			return this.switchSessionHandler(sessionPath, options);
-		};
-		context.reload = () => {
-			this.assertActive();
-			return this.reloadHandler();
 		};
 		return context;
 	}

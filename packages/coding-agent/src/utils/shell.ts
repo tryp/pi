@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.ts";
@@ -192,22 +192,98 @@ export function sanitizeBinaryOutput(str: string): string {
 /**
  * Detached child processes must be tracked so they can be killed on parent
  * shutdown signals (SIGHUP/SIGTERM).
+ *
+ * PIDs are persisted to a companion file so orphaned processes survive
+ * pi process crashes and can be cleaned up on session restore.
  */
-const trackedDetachedChildPids = new Set<number>();
+const trackedDetachedChildPids = new Map<number, string | undefined>();
+
+/** Return Linux's process start token so persisted PIDs cannot target a reused PID. */
+function getProcessStartToken(pid: number): string | undefined {
+	if (process.platform !== "linux") return undefined;
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+		const commandEnd = stat.lastIndexOf(") ");
+		if (commandEnd === -1) return undefined;
+		return stat
+			.slice(commandEnd + 2)
+			.trim()
+			.split(/\s+/u)[19];
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Companion file path for persisting tracked PIDs across pi process restarts.
+ * Set by setDetachedPidFilePath() in session-manager.ts.
+ * Format: one PID and its Linux process-start token per line.
+ */
+let persistedPidFilePath: string | undefined;
+
+/**
+ * Register the companion file path for PID persistence.
+ * On call, loads existing PIDs whose process identity still matches.
+ */
+export function setDetachedPidFilePath(filePath: string): void {
+	if (persistedPidFilePath === filePath) return;
+	persistedPidFilePath = filePath;
+	trackedDetachedChildPids.clear();
+	loadPersistedPids();
+}
+
+/** Load only PID records whose process identity can be verified. */
+function loadPersistedPids(): void {
+	if (!persistedPidFilePath) return;
+	try {
+		const data = readFileSync(persistedPidFilePath, "utf-8").trim();
+		if (data) {
+			for (const line of data.split("\n")) {
+				const [pidText, startToken] = line.trim().split(/\s+/u, 2);
+				const pid = Number(pidText);
+				if (Number.isSafeInteger(pid) && pid > 1 && /^\d+$/u.test(startToken ?? "")) {
+					const currentToken = getProcessStartToken(pid);
+					if (currentToken === startToken) trackedDetachedChildPids.set(pid, startToken);
+				}
+			}
+		}
+	} catch {
+		// File doesn't exist yet — nothing to load
+	}
+}
+
+/** Write the current tracking set to the companion file. */
+function persistTrackedPids(): void {
+	if (!persistedPidFilePath) return;
+	try {
+		const records = Array.from(trackedDetachedChildPids, ([pid, startToken]) =>
+			startToken ? `${pid} ${startToken}` : undefined,
+		).filter((record): record is string => record !== undefined);
+		writeFileSync(persistedPidFilePath, records.length > 0 ? `${records.join("\n")}\n` : "", "utf-8");
+	} catch {
+		// Best-effort persistence
+	}
+}
 
 export function trackDetachedChildPid(pid: number): void {
-	trackedDetachedChildPids.add(pid);
+	if (!Number.isSafeInteger(pid) || pid <= 1) return;
+	trackedDetachedChildPids.set(pid, getProcessStartToken(pid));
+	persistTrackedPids();
 }
 
 export function untrackDetachedChildPid(pid: number): void {
 	trackedDetachedChildPids.delete(pid);
+	persistTrackedPids();
 }
 
 export function killTrackedDetachedChildren(): void {
-	for (const pid of trackedDetachedChildPids) {
+	for (const [pid, startToken] of trackedDetachedChildPids) {
+		if (pid <= 1) continue;
+		if (process.platform === "linux" && (!startToken || getProcessStartToken(pid) !== startToken)) continue;
 		killProcessTree(pid);
 	}
 	trackedDetachedChildPids.clear();
+	persistTrackedPids();
 }
 
 /**

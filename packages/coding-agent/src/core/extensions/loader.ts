@@ -296,6 +296,12 @@ function createExtensionAPI(
 			runtime.refreshTools();
 		},
 
+		registerToolPromptGuidelines(toolName: string, guidelines: string[]): void {
+			runtime.assertActive();
+			const existing = extension.toolPromptGuidelineContributions.get(toolName) ?? [];
+			extension.toolPromptGuidelineContributions.set(toolName, [...existing, ...guidelines]);
+		},
+
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
 			assertActive();
 			extension.commands.set(name, {
@@ -545,6 +551,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
+		toolPromptGuidelineContributions: new Map(),
 	};
 }
 

@@ -1,6 +1,7 @@
 import { Box, type Component, Container, getCapabilities, Image, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext } from "../../../core/extensions/types.ts";
 import { createAllToolDefinitions, type ToolName } from "../../../core/tools/index.ts";
+import { resolvePerCallCwd } from "../../../core/tools/path-utils.ts";
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
 import { convertToPng } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
@@ -116,6 +117,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private getRenderContext(lastComponent: Component | undefined): ToolRenderContext {
+		const perCallCwd = (this.args as { cwd?: unknown } | undefined)?.cwd;
 		return {
 			args: this.args,
 			toolCallId: this.toolCallId,
@@ -125,7 +127,7 @@ export class ToolExecutionComponent extends Container {
 			},
 			lastComponent,
 			state: this.rendererState,
-			cwd: this.cwd,
+			cwd: resolvePerCallCwd(typeof perCallCwd === "string" ? perCallCwd : undefined, this.cwd),
 			executionStarted: this.executionStarted,
 			argsComplete: this.argsComplete,
 			isPartial: this.isPartial,
@@ -189,9 +191,9 @@ export class ToolExecutionComponent extends Container {
 	private maybeConvertImagesForKitty(): void {
 		const caps = getCapabilities();
 		if (caps.images !== "kitty") return;
-		if (!this.result) return;
+		if (!this.result?.content) return;
 
-		const imageBlocks = this.result.content.filter((c) => c.type === "image");
+		const imageBlocks = this.resultContent().filter((c) => c.type === "image");
 		for (let i = 0; i < imageBlocks.length; i++) {
 			const img = imageBlocks[i];
 			if (!img.data || !img.mimeType) continue;
@@ -339,7 +341,7 @@ export class ToolExecutionComponent extends Container {
 		this.imageSpacers = [];
 
 		if (this.result) {
-			const imageBlocks = this.result.content.filter((c) => c.type === "image");
+			const imageBlocks = this.resultContent().filter((c) => c.type === "image");
 			const caps = getCapabilities();
 			for (let i = 0; i < imageBlocks.length; i++) {
 				const img = imageBlocks[i];
@@ -371,6 +373,10 @@ export class ToolExecutionComponent extends Container {
 
 	private getTextOutput(): string {
 		return getRenderedTextOutput(this.result, this.showImages);
+	}
+
+	private resultContent(): Array<{ type: string; text?: string; data?: string; mimeType?: string }> {
+		return Array.isArray(this.result?.content) ? this.result.content : [];
 	}
 
 	private formatToolExecution(): string {

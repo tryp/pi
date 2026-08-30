@@ -17,7 +17,9 @@ export function opencodeProvider(): Provider<
 		models: Object.values(OPENCODE_MODELS),
 		fetchModels: (ctx) =>
 			fetchOpencodeModels("opencode", ctx.signal) as unknown as Promise<
-				readonly import("../types.ts").Model<"anthropic-messages" | "google-generative-ai" | "openai-completions" | "openai-responses">[]
+				readonly import("../types.ts").Model<
+					"anthropic-messages" | "google-generative-ai" | "openai-completions" | "openai-responses"
+				>[]
 			>,
 		api: {
 			"anthropic-messages": anthropicMessagesApi(),

@@ -1,20 +1,17 @@
-import { describe, expect, it, vi, afterEach, beforeEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { RefreshModelsContext } from "../src/models.ts";
+import { InMemoryModelsStore } from "../src/models-store.ts";
+import { opencodeProvider } from "../src/providers/opencode.ts";
+import { opencodeGoProvider } from "../src/providers/opencode-go.ts";
 import {
 	buildFallbackEntriesFromModelsDev,
 	buildModelsFromEntries,
-	fetchOpencodeModels,
-	fetchOfficialEntries,
-	fetchModelsDev,
-	ZEN_MODELS_ENDPOINT,
-	GO_MODELS_ENDPOINT,
-	MODELS_DEV_ENDPOINT,
 	DEFAULT_CONTEXT_WINDOW,
 	DEFAULT_MAX_TOKENS,
+	fetchOfficialEntries,
+	fetchOpencodeModels,
+	ZEN_MODELS_ENDPOINT,
 } from "../src/providers/opencode-helpers.ts";
-import { opencodeProvider } from "../src/providers/opencode.ts";
-import { opencodeGoProvider } from "../src/providers/opencode-go.ts";
-import { InMemoryModelsStore } from "../src/models-store.ts";
-import type { RefreshModelsContext } from "../src/models.ts";
 
 afterEach(() => vi.restoreAllMocks());
 beforeEach(() => vi.restoreAllMocks());
@@ -160,10 +157,16 @@ describe("opencode helpers", () => {
 		};
 		vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
 			if (String(url).includes("opencode.ai/zen/v1/models")) {
-				return new Response(JSON.stringify(officialData), { status: 200, headers: { "content-type": "application/json" } });
+				return new Response(JSON.stringify(officialData), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 			if (String(url).includes("models.dev")) {
-				return new Response(JSON.stringify(devData), { status: 200, headers: { "content-type": "application/json" } });
+				return new Response(JSON.stringify(devData), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 			throw new Error(`unexpected url ${url}`);
 		});
@@ -181,7 +184,12 @@ describe("opencode helpers", () => {
 		const devData = {
 			opencode: {
 				models: {
-					"gpt-5": { id: "gpt-5", tool_call: true, provider: { npm: "@ai-sdk/openai" }, limit: { context: 128000, output: 8192 } },
+					"gpt-5": {
+						id: "gpt-5",
+						tool_call: true,
+						provider: { npm: "@ai-sdk/openai" },
+						limit: { context: 128000, output: 8192 },
+					},
 				},
 			},
 		};
@@ -190,7 +198,10 @@ describe("opencode helpers", () => {
 				return new Response("down", { status: 500 });
 			}
 			if (String(url).includes("models.dev")) {
-				return new Response(JSON.stringify(devData), { status: 200, headers: { "content-type": "application/json" } });
+				return new Response(JSON.stringify(devData), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 			throw new Error("unexpected");
 		});
@@ -218,12 +229,18 @@ describe("opencode helpers", () => {
 
 		vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
 			if (String(url).includes("opencode.ai/zen/v1/models")) {
-				return new Response(JSON.stringify(officialData), { status: 200, headers: { "content-type": "application/json" } });
+				return new Response(JSON.stringify(officialData), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 			if (String(url).includes("models.dev")) {
-				return new Response(JSON.stringify(devData), { status: 200, headers: { "content-type": "application/json" } });
+				return new Response(JSON.stringify(devData), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
-			throw new Error("unexpected " + url);
+			throw new Error(`unexpected ${url}`);
 		});
 
 		const provider = opencodeProvider();
@@ -267,12 +284,18 @@ describe("opencode helpers", () => {
 
 		vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
 			if (String(url).includes("opencode.ai/zen/go/v1/models")) {
-				return new Response(JSON.stringify(officialData), { status: 200, headers: { "content-type": "application/json" } });
+				return new Response(JSON.stringify(officialData), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 			if (String(url).includes("models.dev")) {
-				return new Response(JSON.stringify(devData), { status: 200, headers: { "content-type": "application/json" } });
+				return new Response(JSON.stringify(devData), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
-			throw new Error("unexpected " + url);
+			throw new Error(`unexpected ${url}`);
 		});
 
 		const provider = opencodeGoProvider();

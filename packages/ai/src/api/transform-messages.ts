@@ -16,7 +16,14 @@ function replaceImagesWithPlaceholder(content: (TextContent | ImageContent)[], p
 	const result: TextContent[] = [];
 	let previousWasPlaceholder = false;
 
-	for (const block of content) {
+	// Normalize non-array content (e.g. undefined/null/string from host tool results)
+	const blocks = Array.isArray(content)
+		? content
+		: typeof content === "string"
+			? [{ type: "text" as const, text: content }]
+			: [{ type: "text" as const, text: String(content ?? "") }];
+
+	for (const block of blocks) {
 		if (block.type === "image") {
 			if (!previousWasPlaceholder) {
 				result.push({ type: "text", text: placeholder });

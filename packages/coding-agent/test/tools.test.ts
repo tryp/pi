@@ -1,3 +1,4 @@
+import type * as FsPromises from "node:fs/promises";
 import { applyPatch } from "diff";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
@@ -15,6 +16,13 @@ import {
 	createWriteTool,
 } from "../src/index.ts";
 import * as shellModule from "../src/utils/shell.ts";
+
+const { accessMock } = vi.hoisted(() => ({ accessMock: vi.fn() }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = (await importOriginal()) as typeof FsPromises;
+	accessMock.mockImplementation(actual.access);
+	return { ...actual, access: accessMock };
+});
 
 const readTool = createReadTool(process.cwd());
 const writeTool = createWriteTool(process.cwd());
@@ -270,7 +278,7 @@ describe("Coding Agent Tools", () => {
 				edits: [{ oldText: "world", newText: "testing" }],
 			});
 
-			expect(getTextOutput(result)).toContain("Successfully replaced");
+			expect(getTextOutput(result)).toContain("block(s) replaced");
 			expect(result.details).toBeDefined();
 			expect(result.details.diff).toBeDefined();
 			expect(typeof result.details.diff).toBe("string");
@@ -332,7 +340,7 @@ describe("Coding Agent Tools", () => {
 				],
 			});
 
-			expect(getTextOutput(result)).toContain("Successfully replaced 2 block(s)");
+			expect(getTextOutput(result)).toContain("2 block(s) replaced");
 			expect(readFileSync(testFile, "utf-8")).toBe("ALPHA\nbeta\nGAMMA\ndelta\n");
 			expect(result.details?.diff).toContain("ALPHA");
 			expect(result.details?.diff).toContain("GAMMA");
@@ -457,7 +465,9 @@ describe("Coding Agent Tools", () => {
 			const missingFile = join(testDir, "missing-preview.txt");
 			const result = await computeEditsDiff(missingFile, [{ oldText: "hello", newText: "world" }], testDir);
 
-			expect(result).toEqual({ error: `Could not edit file: ${missingFile}. Error code: ENOENT.` });
+			expect(result).toEqual({
+				error: `Could not edit file: ${missingFile}. Error code: ENOENT. The file does not exist; verify the path (read or ls) before editing.`,
+			});
 		});
 
 		it("should include EACCES in diff preview for unreadable files", async () => {
@@ -534,6 +544,20 @@ describe("Coding Agent Tools", () => {
 			await expect(bashToolWithBadCwd.execute("test-call-11", { command: "echo test" })).rejects.toThrow(
 				/Working directory does not exist/,
 			);
+		});
+
+		it("should report when cwd disappears during spawn", async () => {
+			const racedCwd = join(testDir, "raced-cwd");
+			mkdirSync(racedCwd, { recursive: true });
+			accessMock.mockImplementationOnce(async () => undefined);
+			rmSync(racedCwd, { recursive: true, force: true });
+
+			const ops = createLocalBashOperations();
+			await expect(
+				ops.exec("echo test", racedCwd, {
+					onData: () => {},
+				}),
+			).rejects.toThrow(`Working directory disappeared while starting bash: ${racedCwd}`);
 		});
 
 		it("should handle process spawn errors", async () => {
@@ -913,9 +937,45 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "line one\nline two\n", newText: "replaced\n" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("replaced\nline three\n");
+	});
+
+	it("should match space-indented oldText against tab-indented file content", async () => {
+		const testFile = join(testDir, "tab-indentation.txt");
+		writeFileSync(testFile, "function run() {\n\treturn true;\n}\n\tuntouched();\n");
+
+		await editTool.execute("test-fuzzy-indent-spaces", {
+			path: testFile,
+			edits: [{ oldText: "function run() {\n    return true;\n}", newText: "function run() {\n\treturn false;\n}" }],
+		});
+
+		expect(readFileSync(testFile, "utf-8")).toBe("function run() {\n\treturn false;\n}\n\tuntouched();\n");
+	});
+
+	it("should match tab-indented oldText against space-indented file content", async () => {
+		const testFile = join(testDir, "space-indentation.txt");
+		writeFileSync(testFile, "function run() {\n    return true;\n}\n    untouched();\n");
+
+		await editTool.execute("test-fuzzy-indent-tabs", {
+			path: testFile,
+			edits: [{ oldText: "function run() {\n\treturn true;\n}", newText: "function run() {\n\treturn false;\n}" }],
+		});
+
+		expect(readFileSync(testFile, "utf-8")).toBe("function run() {\n\treturn false;\n}\n    untouched();\n");
+	});
+
+	it("should reject duplicate matches after indentation normalization", async () => {
+		const testFile = join(testDir, "indentation-dups.txt");
+		writeFileSync(testFile, "\treturn true;\n    return true;\n");
+
+		await expect(
+			editTool.execute("test-fuzzy-indent-dups", {
+				path: testFile,
+				edits: [{ oldText: "    return true;  ", newText: "    return false;" }],
+			}),
+		).rejects.toThrow(/after whitespace normalization/);
 	});
 
 	it("should match fullwidth punctuation in Chinese text", async () => {
@@ -927,7 +987,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "你好,世界\n你好(世界)\n", newText: "你好，pi\n你好(pi)\n" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("你好，pi\n你好(pi)\n");
 	});
@@ -941,7 +1001,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "ABC123\ncafé\n", newText: "XYZ789\ncoffee\n" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("XYZ789\ncoffee\n");
 	});
@@ -957,7 +1017,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "console.log('hello');", newText: "console.log('world');" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toContain("world");
 	});
@@ -973,7 +1033,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: 'const msg = "Hello World";', newText: 'const msg = "Goodbye";' }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toContain("Goodbye");
 	});
@@ -989,7 +1049,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "range: 1-5\nbreak-here", newText: "range: 10-50\nbreak--here" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toContain("10-50");
 	});
@@ -1005,7 +1065,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "hello world", newText: "hello universe" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toContain("universe");
 	});
@@ -1020,7 +1080,7 @@ describe("edit tool fuzzy matching", () => {
 			edits: [{ oldText: "const x = 'exact';", newText: "const x = 'changed';" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("const x = 'changed';\nconst y = 'other';\n");
 	});
@@ -1139,7 +1199,7 @@ describe("edit tool CRLF handling", () => {
 			edits: [{ oldText: "line two\n", newText: "replaced line\n" }],
 		});
 
-		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(getTextOutput(result)).toContain("block(s) replaced");
 	});
 
 	it("should preserve CRLF line endings after edit", async () => {

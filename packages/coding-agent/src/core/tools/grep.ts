@@ -9,7 +9,7 @@ import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts"
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
-import { resolveToCwd } from "./path-utils.ts";
+import { resolvePerCallCwd, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import {
@@ -33,6 +33,12 @@ const grepSchema = Type.Object({
 		Type.Number({ description: "Number of lines to show before and after each match (default: 0)" }),
 	),
 	limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" })),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Working directory to search in. Use when searching outside the session working directory (for example in a git worktree). Defaults to the session working directory.",
+		}),
+	),
 });
 
 export const grepToolSystemPromptContribution = {
@@ -146,6 +152,7 @@ export function createGrepToolDefinition(
 				literal,
 				context,
 				limit,
+				cwd: perCallCwd,
 			}: {
 				pattern: string;
 				path?: string;
@@ -154,6 +161,7 @@ export function createGrepToolDefinition(
 				literal?: boolean;
 				context?: number;
 				limit?: number;
+				cwd?: string;
 			},
 			signal?: AbortSignal,
 			_onUpdate?,
@@ -180,7 +188,7 @@ export function createGrepToolDefinition(
 							return;
 						}
 
-						const searchPath = resolveToCwd(searchDir || ".", cwd);
+						const searchPath = resolveToCwd(searchDir || ".", resolvePerCallCwd(perCallCwd, cwd));
 						const ops = customOps ?? defaultGrepOperations;
 						let isDirectory: boolean;
 						try {

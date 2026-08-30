@@ -379,6 +379,12 @@ export class AgentSession {
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
+
+	/**
+	 * Track job IDs that have been reported as completed or killed in `jobs list` output.
+	 * Used to filter stale entries so completed/killed jobs are only shown once.
+	 */
+	private _reportedCompletedOrKilledJobs: Set<string> = new Set();
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
 	private _excludedToolNames?: Set<string>;
@@ -658,8 +664,23 @@ export class AgentSession {
 		}
 		if (hadDeferredWake) {
 			const queueAgent = getAgentQueueCompatibility(this.agent);
-			for (const queueKey of this._autonomousWakeQueueKeys) {
-				queueAgent.cancelQueuedMessage?.(queueKey);
+			if (queueAgent.cancelQueuedMessage) {
+				for (const queueKey of this._autonomousWakeQueueKeys) {
+					queueAgent.cancelQueuedMessage(queueKey);
+				}
+			} else {
+				// Older agent-core versions cannot cancel by queue key. Clear the
+				// shared queues to remove autonomous messages, then restore the
+				// user-visible steering/follow-up messages we still track here.
+				const steering = [...this._steeringMessages];
+				const followUp = [...this._followUpMessages];
+				this.agent.clearAllQueues();
+				for (const text of steering) {
+					queueAgent.steer({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+				}
+				for (const text of followUp) {
+					queueAgent.followUp({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+				}
 			}
 			this._autonomousWakeQueueKeys.clear();
 			this._autonomousWakeQueueMessages.clear();
@@ -831,6 +852,10 @@ export class AgentSession {
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
+				// Filter stale completed/killed jobs from `jobs list` output
+				if (event.message.role === "toolResult") {
+					this._filterStaleJobListEntries(event.message);
+				}
 				// Regular LLM message - persist as SessionMessageEntry
 				this.sessionManager.appendMessage(event.message);
 			}
@@ -909,6 +934,63 @@ export class AgentSession {
 			delete targetRecord[key];
 		}
 		Object.assign(targetRecord, replacement);
+	}
+
+	/**
+	 * Filter stale completed/killed job entries from `jobs list` tool output.
+	 * Once a job has been reported as completed or killed, subsequent `jobs list`
+	 * calls should hide it to reduce noise. A compact summary line is added instead.
+	 */
+	private _filterStaleJobListEntries(message: { toolName?: string; content: (TextContent | ImageContent)[] }): void {
+		if (message.toolName !== "jobs") return;
+		if (!Array.isArray(message.content)) return;
+
+		// Build the full text from content blocks
+		const textParts: string[] = [];
+		for (const block of message.content) {
+			if (block.type === "text") {
+				textParts.push(block.text);
+			}
+		}
+		if (textParts.length === 0) return;
+
+		const lines = textParts.join("").split("\n");
+		const filteredLines: string[] = [];
+		let hiddenCount = 0;
+
+		// Match job status lines: "  job-XXX-YYY: ... - ✅ completed" or "  - ❌/🛑/⏹ killed"
+		const jobLineRe = /^\s*(job-\d+-\d+):.*[-]\s+(✅\s*completed|❌\s+killed|🛑\s+killed|⏹\s+killed)/;
+
+		for (const line of lines) {
+			const match = line.match(jobLineRe);
+			if (match) {
+				const jobId = match[1];
+				if (this._reportedCompletedOrKilledJobs.has(jobId)) {
+					// Already reported — suppress this line
+					hiddenCount++;
+					continue;
+				}
+				// First time seeing this completed/killed job — record it
+				this._reportedCompletedOrKilledJobs.add(jobId);
+			}
+			filteredLines.push(line);
+		}
+
+		if (hiddenCount === 0) return;
+
+		// Add a compact summary line if we hid something
+		// Insert it after the header, before the first job entry
+		// For now just add at the beginning of output
+		const summary = `  (${hiddenCount} previously reported completed/killed job${hiddenCount > 1 ? "s" : ""} hidden)\n`;
+
+		// Rebuild the content
+		const newText = summary + filteredLines.join("\n");
+		for (const block of message.content) {
+			if (block.type === "text") {
+				block.text = newText;
+				break;
+			}
+		}
 	}
 
 	/** Emit extension events based on agent events */
@@ -1242,6 +1324,8 @@ export class AgentSession {
 			cwd: this._cwd,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
+			contextFilesMaxBytes: this.settingsManager.getContextFilesMaxBytes(),
+			contextFilesMaxLines: this.settingsManager.getContextFilesMaxLines(),
 			customPrompt: loaderSystemPrompt,
 			appendSystemPrompt,
 			selectedTools: validToolNames,
@@ -1764,7 +1848,7 @@ export class AgentSession {
 
 		if (typeof content === "string") {
 			text = content;
-		} else {
+		} else if (Array.isArray(content)) {
 			const textParts: string[] = [];
 			images = [];
 			for (const part of content) {
@@ -1776,6 +1860,10 @@ export class AgentSession {
 			}
 			text = textParts.join("\n");
 			if (images.length === 0) images = undefined;
+		} else {
+			// Defensive: non-iterable content from extension callers
+			text = String(content);
+			images = undefined;
 		}
 
 		await this.prompt(text, {
@@ -1796,6 +1884,7 @@ export class AgentSession {
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
+		this._pendingNextTurnMessages = [];
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
@@ -2616,9 +2705,15 @@ export class AgentSession {
 				return true;
 			}
 
-			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-			// Continue once so queued messages are delivered.
-			return this.agent.hasQueuedMessages();
+			// After threshold compaction, only continue if the agent can resume.
+			// If the last message is assistant and there are no queued steer/followup
+			// messages, continue() would throw. Let the turn end normally instead.
+			const msgs = this.agent.state.messages;
+			const last = msgs[msgs.length - 1];
+			if (last?.role !== "assistant" || this.agent.hasQueuedMessages()) {
+				return true;
+			}
+			return false;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			if (started) {
@@ -2929,10 +3024,16 @@ export class AgentSession {
 				})
 				.filter((entry): entry is readonly [string, string] => entry !== undefined),
 		);
+		// Merge extension-contributed prompt guidelines into tool definitions.
+		// Extensions use registerToolPromptGuidelines to add relative guidance
+		// about core tools (e.g., LSP guidelines for the read tool).
+		const extensionContributions = this._extensionRunner.getToolPromptGuidelineContributions();
 		this._toolPromptGuidelines = new Map(
 			Array.from(definitionRegistry.values())
 				.map(({ definition }) => {
-					const guidelines = this._normalizePromptGuidelines(definition.promptGuidelines);
+					const own = this._normalizePromptGuidelines(definition.promptGuidelines);
+					const contributed = extensionContributions.get(definition.name) ?? [];
+					const guidelines = this._normalizePromptGuidelines([...own, ...contributed]);
 					return guidelines.length > 0 ? ([definition.name, guidelines] as const) : undefined;
 				})
 				.filter((entry): entry is readonly [string, string[]] => entry !== undefined),
@@ -3710,16 +3811,19 @@ export class AgentSession {
 				if (m.role !== "assistant") return false;
 				const msg = m as AssistantMessage;
 				// Skip aborted messages with no content
+				if (!Array.isArray(msg.content)) return false;
 				if (msg.stopReason === "aborted" && msg.content.length === 0) return false;
 				return true;
 			});
 
 		if (!lastAssistant) return undefined;
+		const content = (lastAssistant as AssistantMessage).content;
+		if (!Array.isArray(content)) return undefined;
 
 		let text = "";
-		for (const content of (lastAssistant as AssistantMessage).content) {
-			if (content.type === "text") {
-				text += content.text;
+		for (const block of content) {
+			if (block.type === "text") {
+				text += block.text;
 			}
 		}
 

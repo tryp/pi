@@ -1,9 +1,14 @@
 import { constants as bufferConstants } from "buffer";
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { basename, join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { findMostRecentSession, loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.ts";
+import {
+	findMostRecentSession,
+	isSessionFilenameForId,
+	loadEntriesFromFile,
+	SessionManager,
+} from "../../src/core/session-manager.ts";
 
 const HEADER_SCAN_LIMIT_BYTES = 1024 * 1024;
 
@@ -264,6 +269,47 @@ describe("findMostRecentSession", () => {
 
 		expect(findMostRecentSession(tempDir, projectA)).toBe(fileA);
 		expect(findMostRecentSession(tempDir, projectB)).toBe(fileB);
+	});
+});
+
+describe("SessionManager.findById", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `session-test-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("uses a correctly named file only when its header ID also matches", () => {
+		const candidate = join(tempDir, "2025-01-01T00-00-00-000Z_target.jsonl");
+		writeFileSync(
+			candidate,
+			`${JSON.stringify({ type: "session", id: "not-target", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+
+		const legacy = join(tempDir, "legacy-name.jsonl");
+		writeFileSync(
+			legacy,
+			`${JSON.stringify({ type: "session", id: "target", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+
+		expect(isSessionFilenameForId(basename(candidate), "target")).toBe(true);
+		expect(isSessionFilenameForId(basename(candidate), "not-target")).toBe(false);
+		expect(SessionManager.findById(tempDir, "target", tempDir)?.path).toBe(legacy);
+	});
+
+	it("finds a matching filename from its bounded header without reading the body", () => {
+		const file = join(tempDir, "2025-01-01T00-00-00-000Z_target.jsonl");
+		writeFileSync(
+			file,
+			`${JSON.stringify({ type: "session", id: "target", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n${"not-json ".repeat(HEADER_SCAN_LIMIT_BYTES)}\n`,
+		);
+
+		expect(SessionManager.findById(tempDir, "target", tempDir)?.path).toBe(file);
 	});
 });
 

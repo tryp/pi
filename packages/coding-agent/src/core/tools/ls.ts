@@ -6,7 +6,7 @@ import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
-import { pathExists, resolveToCwd } from "./path-utils.ts";
+import { pathExists, resolvePerCallCwd, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, renderToolPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
@@ -14,6 +14,12 @@ import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } fr
 const lsSchema = Type.Object({
 	path: Type.Optional(Type.String({ description: "Directory to list (default: current directory)" })),
 	limit: Type.Optional(Type.Number({ description: "Maximum number of entries to return (default: 500)" })),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Working directory to list. Use when listing outside the session working directory (for example in a git worktree). Defaults to the session working directory.",
+		}),
+	),
 });
 
 export const lsToolSystemPromptContribution = {
@@ -110,7 +116,7 @@ export function createLsToolDefinition(
 		parameters: lsSchema,
 		async execute(
 			_toolCallId,
-			{ path, limit }: { path?: string; limit?: number },
+			{ path, limit, cwd: perCallCwd }: { path?: string; limit?: number; cwd?: string },
 			signal?: AbortSignal,
 			_onUpdate?,
 			_ctx?,
@@ -126,7 +132,7 @@ export function createLsToolDefinition(
 
 				(async () => {
 					try {
-						const dirPath = resolveToCwd(path || ".", cwd);
+						const dirPath = resolveToCwd(path || ".", resolvePerCallCwd(perCallCwd, cwd));
 						const effectiveLimit = limit ?? DEFAULT_LIMIT;
 
 						// Check if path exists.

@@ -5,6 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { fstatSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
@@ -83,6 +84,20 @@ const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP
 async function readPipedStdin(): Promise<string | undefined> {
 	// If stdin is a TTY, we're running interactively - don't read stdin
 	if (process.stdin.isTTY) {
+		return undefined;
+	}
+
+	// Check the stdin file descriptor type to avoid hanging when stdin
+	// is not a TTY but also not a pipe (e.g., child process spawned with
+	// 'ignore' stdio or fd 0 pointing to /dev/null). Only read from stdin
+	// if it's a FIFO (pipe) or regular file (input redirection).
+	try {
+		const stat = fstatSync(0);
+		if (!stat.isFIFO() && !stat.isFile()) {
+			return undefined;
+		}
+	} catch {
+		// EBADF or other error = fd is closed, skip stdin read
 		return undefined;
 	}
 
@@ -248,9 +263,8 @@ async function findLocalSessionByExactId(
 	cwd: string,
 	sessionDir?: string,
 ): Promise<{ type: "local"; path: string } | undefined> {
-	const localSessions = await SessionManager.list(cwd, sessionDir);
-	const localMatch = localSessions.find((s) => s.id === sessionId);
-	return localMatch ? { type: "local", path: localMatch.path } : undefined;
+	const localMatch = SessionManager.findById(cwd, sessionId, sessionDir);
+	return localMatch?.id === sessionId ? { type: "local", path: localMatch.path } : undefined;
 }
 
 async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
@@ -259,20 +273,15 @@ async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: 
 		return { type: "path", path: resolvePath(sessionArg, cwd) };
 	}
 
-	// Try to match as session ID in current project first
-	const localSessions = await SessionManager.list(cwd, sessionDir);
-	const localMatch =
-		localSessions.find((s) => s.id === sessionArg) ?? localSessions.find((s) => s.id.startsWith(sessionArg));
-
+	// Try to match as session ID in current project first. ID lookup only reads
+	// bounded session headers; full metadata loading is reserved for --resume.
+	const localMatch = SessionManager.findById(cwd, sessionArg, sessionDir);
 	if (localMatch) {
 		return { type: "local", path: localMatch.path };
 	}
 
-	// Try global search across all projects
-	const allSessions = await SessionManager.listAll(sessionDir);
-	const globalMatch =
-		allSessions.find((s) => s.id === sessionArg) ?? allSessions.find((s) => s.id.startsWith(sessionArg));
-
+	// Try global search across all projects.
+	const globalMatch = SessionManager.findByIdAll(sessionArg, sessionDir);
 	if (globalMatch) {
 		return { type: "global", path: globalMatch.path, cwd: globalMatch.cwd };
 	}

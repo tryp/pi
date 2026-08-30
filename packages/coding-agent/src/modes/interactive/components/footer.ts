@@ -111,12 +111,19 @@ export class FooterComponent implements Component {
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
 
 		// Replace home directory with ~
-		let pwd = formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
+		let pwd = formatCwdForFooter(this.footerData.getCwd(), process.env.HOME || process.env.USERPROFILE);
 
-		// Add git branch if available
+		// Add git branch, and identify linked worktrees when applicable.
+		// The provider's cwd follows the agent's latest per-call tool cwd, so the
+		// branch/worktree reflects where the agent is actually working, not the
+		// session root.
 		const branch = this.footerData.getGitBranch();
 		if (branch) {
-			pwd = `${pwd} (${branch})`;
+			const worktree = this.footerData.getGitWorktree();
+			// pi-worktree checkouts use the task name for both the worktree and its
+			// branch; show the worktree alone in that case to avoid "x @ x".
+			const gitContext = worktree && worktree !== branch ? `${branch} @ ${worktree}` : branch;
+			pwd = `${pwd} (${gitContext})`;
 		}
 
 		// Add session name if set

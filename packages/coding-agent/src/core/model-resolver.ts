@@ -396,10 +396,7 @@ function isGlobPattern(pattern: string): boolean {
  * Return exact (non-glob) patterns that had no-match diagnostics.
  * These are candidates for auto-pruning from enabledModels.
  */
-export function getStaleExactPatterns(
-	patterns: string[],
-	diagnostics: ModelScopeDiagnostic[],
-): string[] {
+export function getStaleExactPatterns(patterns: string[], diagnostics: ModelScopeDiagnostic[]): string[] {
 	const stale: string[] = [];
 	const patternSet = new Set(patterns);
 	for (const d of diagnostics) {

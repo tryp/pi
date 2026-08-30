@@ -378,9 +378,7 @@ describe("AgentSession queue characterization", () => {
 					(message) =>
 						message.role === "user" &&
 						typeof message.content !== "string" &&
-						message.content.some(
-							(part) => part.type === "text" && part.text === "do not inject",
-						),
+						message.content.some((part) => part.type === "text" && part.text === "do not inject"),
 				);
 				return fauxAssistantMessage("done");
 			},

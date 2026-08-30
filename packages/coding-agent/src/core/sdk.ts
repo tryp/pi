@@ -5,6 +5,7 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
+import { estimateTokens } from "./compaction/compaction.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm } from "./messages.ts";
@@ -170,6 +171,74 @@ function getDefaultAgentDir(): string {
  * });
  * ```
  */
+/**
+ * Hard input-side context budget enforced just before each provider request.
+ *
+ * Compaction normally keeps context under budget, but extension-injected
+ * messages (custom_message, before_agent_start messages) or estimation drift
+ * can push a single request over the limit before compaction notices. This
+ * trims whole turns from the oldest end until the estimated system prompt +
+ * messages fit the budget. Guarantees:
+ * - the final message is never dropped;
+ * - a toolCall is never stranded without its toolResult;
+ * - the trimmed list never starts with an assistant toolCall (providers
+ *   reject requests whose first message is not a user message);
+ * - a non-positive budget (tiny context window) disables trimming.
+ */
+export function enforceRequestContextBudget(
+	messages: AgentMessage[],
+	systemPrompt: string,
+	model: { contextWindow?: number } | undefined,
+	maxContextTokens: number | undefined,
+	reserveTokens: number,
+): AgentMessage[] {
+	let budget: number | undefined;
+	if (maxContextTokens != null) {
+		budget = maxContextTokens;
+	} else if (model?.contextWindow && model.contextWindow > 0) {
+		budget = model.contextWindow - reserveTokens;
+	}
+	if (budget == null || budget <= 0 || messages.length === 0) return messages;
+
+	let total = estimateTokens({ role: "user", content: systemPrompt } as AgentMessage);
+	for (const message of messages) {
+		total += estimateTokens(message);
+	}
+	if (total <= budget) return messages;
+
+	// Trim whole turns from the oldest end. A turn ends at a user message
+	// boundary, so the trimmed list always starts with a user message and
+	// toolCall/toolResult pairs are dropped together.
+	let dropCount = 0;
+	while (dropCount < messages.length - 1 && total > budget) {
+		const frontier = messages[dropCount];
+		if (frontier?.role === "user") {
+			total -= estimateTokens(frontier);
+			dropCount++;
+			continue;
+		}
+		// Frontier is an assistant toolCall or a toolResult: advance past the
+		// whole turn up to the next user message (never past the final one).
+		let next = dropCount;
+		while (next < messages.length && messages[next]!.role !== "user") {
+			if (next >= messages.length - 1) break;
+			total -= estimateTokens(messages[next]!);
+			next++;
+		}
+		if (next === dropCount) break;
+		dropCount = next;
+	}
+	// Safety pass: even when the budget is already met, never leave a
+	// leading assistant toolCall (provider 400) or orphaned toolResult as
+	// the first remaining message.
+	if (dropCount > 0) {
+		while (dropCount < messages.length - 1 && messages[dropCount]!.role !== "user") {
+			dropCount++;
+		}
+	}
+	return dropCount > 0 ? messages.slice(dropCount) : messages;
+}
+
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
@@ -361,8 +430,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionId: sessionManager.getSessionId(),
 		transformContext: async (messages) => {
 			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
+			const transformed = runner ? await runner.emitContext(messages) : messages;
+			return enforceRequestContextBudget(
+				transformed,
+				agent.state.systemPrompt ?? "",
+				agent.state.model,
+				settingsManager.getCompactionMaxContextTokens(),
+				settingsManager.getCompactionReserveTokens(),
+			);
 		},
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),

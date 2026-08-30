@@ -126,4 +126,85 @@ describe("buildSystemPrompt", () => {
 			expect(prompt.match(/- Use dynamic_tool for summaries\./g)).toHaveLength(1);
 		});
 	});
+
+	describe("context file budget", () => {
+		const bigFile = (n: number): string =>
+			Array.from({ length: n }, (_, i) => `line ${i} ${"x".repeat(20)}`).join("\n");
+
+		test("injects small context files verbatim by default", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [{ path: "/a.md", content: "short instructions" }],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain('<project_instructions path="/a.md">\nshort instructions');
+			expect(prompt).not.toContain("context files truncated");
+		});
+
+		test("truncates context files beyond the byte budget and reports it", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [{ path: "/big.md", content: bigFile(200) }],
+				skills: [],
+				cwd: process.cwd(),
+				contextFilesMaxBytes: 512,
+				contextFilesMaxLines: 10_000,
+			});
+
+			expect(prompt).toContain("truncated /big.md");
+			expect(prompt).toContain("[context files truncated:");
+		});
+
+		test("protects the most-local file and truncates lower-priority ones", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [
+					{ path: "/global.md", content: "g".repeat(400) },
+					{ path: "/project.md", content: "p".repeat(400) },
+				],
+				skills: [],
+				cwd: process.cwd(),
+				contextFilesMaxBytes: 500,
+				contextFilesMaxLines: 10_000,
+			});
+
+			// Most-local file (last in load order) is kept whole.
+			expect(prompt).toContain('<project_instructions path="/project.md">');
+			// Lower-priority file is truncated and reported.
+			expect(prompt).toContain("truncated /global.md");
+			expect(prompt).toContain("[context files truncated:");
+		});
+
+		test("drops files once the budget is fully exhausted", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [
+					{ path: "/global.md", content: "g".repeat(400) },
+					{ path: "/mid.md", content: "m".repeat(400) },
+					{ path: "/project.md", content: "p".repeat(400) },
+				],
+				skills: [],
+				cwd: process.cwd(),
+				contextFilesMaxBytes: 800,
+				contextFilesMaxLines: 10_000,
+			});
+
+			// project.md (400) + mid.md (400) fill the 800-byte budget; global.md drops.
+			expect(prompt).toContain('<project_instructions path="/project.md">');
+			expect(prompt).toContain('<project_instructions path="/mid.md">');
+			expect(prompt).not.toContain('<project_instructions path="/global.md">');
+			expect(prompt).toContain("dropped /global.md");
+		});
+
+		test("respects the line budget", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [{ path: "/many.md", content: bigFile(500) }],
+				skills: [],
+				cwd: process.cwd(),
+				contextFilesMaxBytes: 1_000_000,
+				contextFilesMaxLines: 50,
+			});
+
+			expect(prompt).toContain("truncated /many.md");
+			expect(prompt).toContain("50 of 500 lines");
+		});
+	});
 });

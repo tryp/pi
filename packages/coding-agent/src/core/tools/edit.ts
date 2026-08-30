@@ -11,6 +11,7 @@ import type { ToolDefinition } from "../extensions/types.ts";
 import {
 	applyEditsToNormalizedContent,
 	computeEditsDiff,
+	describeMissingFile,
 	detectLineEnding,
 	type Edit,
 	type EditDiffError,
@@ -21,7 +22,7 @@ import {
 	restoreLineEndings,
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
-import { resolveToCwd } from "./path-utils.ts";
+import { resolvePerCallCwd, resolveToCwd } from "./path-utils.ts";
 import { renderToolPath, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 
@@ -37,7 +38,9 @@ const replaceEditSchema = Type.Object(
 			description:
 				"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.",
 		}),
-		newText: Type.String({ description: "Replacement text for this targeted edit." }),
+		newText: Type.Optional(
+			Type.String({ description: "Replacement text for this targeted edit. Omit to delete oldText." }),
+		),
 	},
 	{},
 );
@@ -49,6 +52,12 @@ const editSchema = Type.Object(
 			description:
 				"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
 		}),
+		cwd: Type.Optional(
+			Type.String({
+				description:
+					"Working directory to resolve the path against. Use when editing a file outside the session working directory (for example in a git worktree). Defaults to the session working directory.",
+			}),
+		),
 	},
 	{},
 );
@@ -65,6 +74,7 @@ export const editToolSystemPromptContribution = {
 
 export type EditToolInput = Static<typeof editSchema>;
 type LegacyEditToolInput = EditToolInput & {
+	file_path?: unknown;
 	oldText?: unknown;
 	newText?: unknown;
 };
@@ -87,6 +97,10 @@ export interface EditToolDetails {
 	patch: string;
 	/** Line number of the first change in the new file (for editor navigation) */
 	firstChangedLine?: number;
+	/** Number of lines added, for git-style diffstat */
+	addedLines: number;
+	/** Number of lines removed, for git-style diffstat */
+	removedLines: number;
 }
 
 /**
@@ -120,6 +134,13 @@ function prepareEditArguments(input: unknown): EditToolInput {
 
 	const args = input as Record<string, unknown>;
 
+	// Some clients use file_path instead of path. Normalize it before schema validation.
+	if (typeof args.path !== "string" && typeof args.file_path === "string") {
+		const { file_path, ...rest } = args;
+		Object.assign(args, { ...rest, path: file_path });
+	}
+	delete args.file_path;
+
 	// Some models (Opus 4.6, GLM-5.1) send edits as a JSON string instead of an array.
 	// Others send a single edit object instead of a one-element edits array.
 	if (typeof args.edits === "string") {
@@ -135,13 +156,47 @@ function prepareEditArguments(input: unknown): EditToolInput {
 		args.edits = [args.edits];
 	}
 
+	// Session analysis showed some models place the file path inside an edit
+	// entry instead of the top-level required "path" field. When the placement
+	// is unambiguous (exactly one distinct non-empty path value among the
+	// entries), hoist it so the call succeeds instead of failing schema
+	// validation with a raw error.
+	if (!args.path && Array.isArray(args.edits)) {
+		const candidatePaths = new Set<string>();
+		for (const entry of args.edits) {
+			const entryPath = entry && typeof entry === "object" ? (entry as Record<string, unknown>).path : undefined;
+			if (typeof entryPath === "string" && entryPath.length > 0) {
+				candidatePaths.add(entryPath);
+			}
+		}
+		if (candidatePaths.size === 1) {
+			const [hoisted] = candidatePaths;
+			args.path = hoisted;
+			// Build new entry objects instead of mutating the caller's inputs in
+			// place; entries that were pure path carriers are dropped, they carry
+			// no edit intent of their own.
+			args.edits = (args.edits as unknown[]).flatMap((entry) => {
+				if (entry && typeof entry === "object") {
+					const { path: _removed, ...rest } = entry as Record<string, unknown>;
+					return Object.keys(rest).length > 0 ? [rest] : [];
+				}
+				return [entry];
+			});
+		}
+	}
+
 	const legacy = args as LegacyEditToolInput;
-	if (typeof legacy.oldText !== "string" || typeof legacy.newText !== "string") {
+	if (typeof legacy.oldText !== "string") {
+		return args as EditToolInput;
+	}
+	if (legacy.newText !== undefined && typeof legacy.newText !== "string") {
 		return args as EditToolInput;
 	}
 
 	const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : [];
-	edits.push({ oldText: legacy.oldText, newText: legacy.newText });
+	const replacement: { oldText: string; newText?: string } = { oldText: legacy.oldText };
+	if (typeof legacy.newText === "string") replacement.newText = legacy.newText;
+	edits.push(replacement);
 	const { oldText: _oldText, newText: _newText, ...rest } = legacy;
 	return { ...rest, edits } as EditToolInput;
 }
@@ -150,7 +205,9 @@ function validateEditInput(input: EditToolInput): { path: string; edits: Edit[] 
 	if (!Array.isArray(input.edits) || input.edits.length === 0) {
 		throw new Error("Edit tool input is invalid. edits must contain at least one replacement.");
 	}
-	return { path: input.path, edits: input.edits };
+	// Normalize: absent newText means deletion (empty string replacement)
+	const edits: Edit[] = input.edits.map((e) => ({ oldText: e.oldText, newText: e.newText ?? "" }));
+	return { path: input.path, edits };
 }
 
 type RenderableEditArgs = {
@@ -206,16 +263,14 @@ function getRenderablePreviewInput(args: RenderableEditArgs | undefined): { path
 		return null;
 	}
 
-	if (
-		Array.isArray(args.edits) &&
-		args.edits.length > 0 &&
-		args.edits.every((edit) => typeof edit?.oldText === "string" && typeof edit?.newText === "string")
-	) {
-		return { path, edits: args.edits };
+	if (Array.isArray(args.edits) && args.edits.length > 0) {
+		// Normalize: absent newText means deletion (empty string replacement)
+		const edits: Edit[] = args.edits.map((e) => ({ oldText: e.oldText, newText: e.newText ?? "" }));
+		return { path, edits };
 	}
 
-	if (typeof args.oldText === "string" && typeof args.newText === "string") {
-		return { path, edits: [{ oldText: args.oldText, newText: args.newText }] };
+	if (typeof args.oldText === "string") {
+		return { path, edits: [{ oldText: args.oldText, newText: args.newText ?? "" }] };
 	}
 
 	return null;
@@ -331,7 +386,7 @@ export function createEditToolDefinition(
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, _ctx?) {
 			const { path, edits } = validateEditInput(input);
-			const absolutePath = resolveToCwd(path, cwd);
+			const absolutePath = resolveToCwd(path, resolvePerCallCwd(input.cwd, cwd));
 
 			return withFileMutationQueue(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the
@@ -351,7 +406,9 @@ export function createEditToolDefinition(
 					throwIfAborted();
 					const errorMessage =
 						error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
-					throw new Error(`Could not edit file: ${path}. ${errorMessage}.`);
+					const code = error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+					const hint = describeMissingFile(code, absolutePath);
+					throw new Error(`Could not edit file: ${path}. ${errorMessage}.${hint}`);
 				}
 				throwIfAborted();
 
@@ -373,14 +430,28 @@ export function createEditToolDefinition(
 
 				const diffResult = generateDiffString(baseContent, newContent);
 				const patch = generateUnifiedPatch(path, baseContent, newContent);
+
+				// Git-style diffstat
+				const total = diffResult.addedLines + diffResult.removedLines;
+				const barWidth = Math.min(total, 50);
+				const addChars = barWidth > 0 ? Math.round((diffResult.addedLines / total) * barWidth) : 0;
+				const remChars = barWidth - addChars;
+				const diffstat = `${path} | ${total} ${"+".repeat(addChars)}${"-".repeat(remChars)}`;
+
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+							text: `${diffstat}\n${edits.length} block(s) replaced.`,
 						},
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					details: {
+						diff: diffResult.diff,
+						patch,
+						firstChangedLine: diffResult.firstChangedLine,
+						addedLines: diffResult.addedLines,
+						removedLines: diffResult.removedLines,
+					},
 				};
 			});
 		},
@@ -425,7 +496,12 @@ export function createEditToolDefinition(
 					changed =
 						setEditPreview(
 							callComponent,
-							{ diff: resultDiff, firstChangedLine: typedResult.details?.firstChangedLine },
+							{
+								diff: resultDiff,
+								firstChangedLine: typedResult.details?.firstChangedLine,
+								addedLines: typedResult.details?.addedLines ?? 0,
+								removedLines: typedResult.details?.removedLines ?? 0,
+							},
 							argsKey,
 						) || changed;
 				}
