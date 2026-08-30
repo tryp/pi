@@ -2216,11 +2216,16 @@ describe("openai-codex streaming", () => {
 							{
 								type: "error",
 								status: 400,
-								error: {
-									code: "previous_response_not_found",
-									message: "Previous response with id 'resp_1' not found.",
-									param: "previous_response_id",
-								},
+								error:
+									recoveryTransport === "websocket"
+										? {
+												code: "previous_response_not_found",
+												message: "Previous response with id 'resp_1' not found.",
+												param: "previous_response_id",
+											}
+										: {
+												message: "No tool call found for function call output with call_id call_missing.",
+											},
 							},
 						]);
 						return;

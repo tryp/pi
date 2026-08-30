@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed OpenAI Codex cached WebSocket continuations to retry when function-call outputs report a missing tool call.
 - Fixed OpenAI-compatible Chat Completions ignoring an explicitly requested `toolChoice` when no tools are defined.
 - Fixed thinking signature serialization to run once after the signature is complete ([#8671](https://github.com/earendil-works/pi/pull/8671)).
 

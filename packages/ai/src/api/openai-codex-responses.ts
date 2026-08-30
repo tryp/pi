@@ -333,8 +333,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					} catch (error) {
 						const aborted = options?.signal?.aborted;
 						const connectionLimitBeforeStart = !websocketStarted && isWebSocketConnectionLimitReachedError(error);
-						const previousResponseNotFound = isPreviousResponseNotFoundError(error);
-						if (!aborted && previousResponseNotFound && !retriedMissingWebSocketContinuation) {
+						const missingWebSocketContinuation = isMissingWebSocketContinuationError(error);
+						if (!aborted && missingWebSocketContinuation && !retriedMissingWebSocketContinuation) {
 							retriedMissingWebSocketContinuation = true;
 							continue;
 						}
@@ -697,8 +697,12 @@ function isWebSocketConnectionLimitReachedError(error: unknown): boolean {
 	return error instanceof CodexApiError && error.code === WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE;
 }
 
-function isPreviousResponseNotFoundError(error: unknown): boolean {
-	return error instanceof CodexApiError && error.code === PREVIOUS_RESPONSE_NOT_FOUND_CODE;
+function isMissingWebSocketContinuationError(error: unknown): boolean {
+	return (
+		error instanceof CodexApiError &&
+		(error.code === PREVIOUS_RESPONSE_NOT_FOUND_CODE ||
+			error.message.includes("No tool call found for function call output"))
+	);
 }
 
 function extractCodexEventError(event: Record<string, unknown>): { code?: string; message?: string } {
