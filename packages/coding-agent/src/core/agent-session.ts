@@ -318,8 +318,21 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _isAgentSettling = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
+	private _queuedMessageWakePending = false;
+	private _queuedMessageWakeScheduled = false;
+	private _queuedMessageWakeActive = false;
+	private _queuedMessageWakeTimer: ReturnType<typeof setTimeout> | undefined;
+	private _queuedMessageWakeGeneration = 0;
+	private _agentSettlingWakeGeneration: number | undefined;
+	private _queuedMessageWakePromise: Promise<void> | undefined;
+	private _autonomousWakeQueueKeys = new Set<string>();
+	private _autonomousWakeQueueMessages = new Map<AgentMessage, string>();
+	private _nextAutonomousWakeQueueKey = 0;
+	private _userPromptPending = false;
+	private _disposed = false;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -597,7 +610,13 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (
+			this._isAgentRunActive ||
+			this._isAgentSettling ||
+			this._queuedMessageWakePending ||
+			this.agent.hasQueuedMessages() ||
+			!this._resolveIdleWait
+		) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -606,13 +625,139 @@ export class AgentSession {
 		resolve();
 	}
 
-	private async _emitAgentSettled(): Promise<void> {
+	/** Cancel a deferred autonomous wake and the messages that caused it. */
+	private _cancelQueuedMessageWake(options?: { preserveActiveWake?: boolean }): void {
+		const hadDeferredWake =
+			this._queuedMessageWakePending ||
+			this._queuedMessageWakeScheduled ||
+			this._queuedMessageWakeActive ||
+			this._queuedMessageWakeTimer !== undefined;
+		const preserveActiveWake = options?.preserveActiveWake === true && this._queuedMessageWakeActive;
+		if (!preserveActiveWake) {
+			this._queuedMessageWakeGeneration++;
+		}
+		if (this._queuedMessageWakeTimer !== undefined) {
+			clearTimeout(this._queuedMessageWakeTimer);
+			this._queuedMessageWakeTimer = undefined;
+		}
+		this._queuedMessageWakeScheduled = false;
+		this._queuedMessageWakePending = false;
+		if (!preserveActiveWake) {
+			this._queuedMessageWakeActive = false;
+		}
+		if (hadDeferredWake) {
+			for (const queueKey of this._autonomousWakeQueueKeys) {
+				this.agent.cancelQueuedMessage(queueKey);
+			}
+			this._autonomousWakeQueueKeys.clear();
+			this._autonomousWakeQueueMessages.clear();
+		}
+		this._resolveIdleWaitIfIdle();
+	}
+
+	/**
+	 * Wake an idle session when a trigger-turn message arrived after the agent
+	 * loop performed its final queue drain. Defer the wake so it cannot re-enter
+	 * the agent from an agent_settled handler.
+	 */
+	private _scheduleQueuedMessageWake(): void {
+		if (
+			this._disposed ||
+			this._isAgentRunActive ||
+			!this._queuedMessageWakePending ||
+			this._queuedMessageWakeScheduled ||
+			this._isAgentSettling ||
+			this._userPromptPending
+		) {
+			return;
+		}
+
+		this._queuedMessageWakeScheduled = true;
+		const generation = this._queuedMessageWakeGeneration;
+		this._queuedMessageWakeTimer = setTimeout(() => {
+			this._queuedMessageWakeTimer = undefined;
+			this._queuedMessageWakeScheduled = false;
+			if (
+				this._disposed ||
+				generation !== this._queuedMessageWakeGeneration ||
+				this._isAgentRunActive ||
+				this._isAgentSettling
+			)
+				return;
+			if (!this.agent.hasQueuedMessages()) {
+				this._queuedMessageWakePending = false;
+				this._resolveIdleWaitIfIdle();
+				return;
+			}
+
+			this._queuedMessageWakePending = false;
+			const wakePromise = this._runQueuedMessages(generation);
+			this._queuedMessageWakePromise = wakePromise;
+			void wakePromise.then(
+				() => {
+					if (this._queuedMessageWakePromise === wakePromise) this._queuedMessageWakePromise = undefined;
+				},
+				(error: unknown) => {
+					this._extensionRunner.emitError({
+						extensionPath: "<runtime>",
+						event: "queued_message_wakeup",
+						error: error instanceof Error ? error.message : String(error),
+					});
+					if (this._queuedMessageWakePromise === wakePromise) this._queuedMessageWakePromise = undefined;
+				},
+			);
+		}, 0);
+	}
+
+	private async _runQueuedMessages(generation: number): Promise<void> {
+		if (
+			this._disposed ||
+			this._isAgentRunActive ||
+			generation !== this._queuedMessageWakeGeneration ||
+			!this.agent.hasQueuedMessages()
+		) {
+			return;
+		}
+
+		this._queuedMessageWakeActive = true;
+		this._isAgentRunActive = true;
+		try {
+			while (!this._disposed && generation === this._queuedMessageWakeGeneration && this.agent.hasQueuedMessages()) {
+				await this.agent.continue();
+				if (this._disposed || generation !== this._queuedMessageWakeGeneration) break;
+				while (await this._handlePostAgentRun()) {
+					if (this._disposed || generation !== this._queuedMessageWakeGeneration) break;
+					await this.agent.continue();
+					if (this._disposed || generation !== this._queuedMessageWakeGeneration) break;
+				}
+			}
+		} finally {
+			this._queuedMessageWakeActive = false;
+			this._systemPromptOverride = undefined;
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			await this._emitAgentSettled(generation);
+		}
+	}
+
+	private async _emitAgentSettled(wakeGeneration?: number): Promise<void> {
+		const settlementGeneration = wakeGeneration ?? this._queuedMessageWakeGeneration;
+		const runner = this._extensionRunner;
+		this._isAgentSettling = true;
+		this._agentSettlingWakeGeneration = settlementGeneration;
 		this._isAgentRunActive = false;
 		try {
-			await this._extensionRunner.emit({ type: "agent_settled" });
-			this._emit({ type: "agent_settled" });
+			await runner.emit({ type: "agent_settled" });
+			if (runner === this._extensionRunner) this._emit({ type: "agent_settled" });
 		} finally {
+			this._isAgentSettling = false;
+			this._agentSettlingWakeGeneration = undefined;
 			this._resolveIdleWaitIfIdle();
+			// An abort during an async settlement handler invalidates the settlement's
+			// generation. Reschedule any ordinary queues after the handler returns even
+			// when that generation no longer matches; autonomous messages were removed
+			// by _cancelQueuedMessageWake before this point.
+			this._scheduleQueuedMessageWake();
 		}
 	}
 
@@ -621,6 +766,15 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "message_start" && event.message.role === "custom") {
+			this._queuedMessageWakePending = false;
+			const queueKey = this._autonomousWakeQueueMessages.get(event.message);
+			if (queueKey !== undefined) {
+				this._autonomousWakeQueueMessages.delete(event.message);
+				this._autonomousWakeQueueKeys.delete(queueKey);
+			}
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -859,6 +1013,13 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._disposed = true;
+		this._cancelQueuedMessageWake();
+		// Disposal never resumes queued work. Clear both the agent queues and their
+		// UI bookkeeping so waitForIdle cannot be held open by stale user messages.
+		this.clearQueue();
+		this._pendingNextTurnMessages = [];
+		this._pendingCustomMessages = [];
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -1101,7 +1262,7 @@ export class AgentSession {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
-			return false;
+			return this.agent.hasQueuedMessages();
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
@@ -1159,6 +1320,13 @@ export class AgentSession {
 				);
 			}
 
+			// A user prompt takes precedence over an autonomous completion wake. Mark it
+			// before any asynchronous input processing can let the wake run.
+			this._userPromptPending = true;
+			// Keep an active wake continuation valid so it can deliver this prompt if it
+			// gets queued while the current continuation is still running.
+			this._cancelQueuedMessageWake({ preserveActiveWake: true });
+
 			// Emit input event for extension interception (before skill/template expansion)
 			let currentText = text;
 			let currentImages = options?.images;
@@ -1170,6 +1338,8 @@ export class AgentSession {
 					this.isStreaming ? options?.streamingBehavior : undefined,
 				);
 				if (inputResult.action === "handled") {
+					this._userPromptPending = false;
+					this._scheduleQueuedMessageWake();
 					preflightResult?.(true);
 					return;
 				}
@@ -1284,16 +1454,25 @@ export class AgentSession {
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 			}
 		} catch (error) {
+			this._userPromptPending = false;
+			this._scheduleQueuedMessageWake();
 			preflightResult?.(false);
 			throw error;
 		}
 
 		if (!messages) {
+			this._userPromptPending = false;
+			this._scheduleQueuedMessageWake();
 			return;
 		}
 
 		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		try {
+			await this._runAgentPrompt(messages);
+		} finally {
+			this._userPromptPending = false;
+			this._scheduleQueuedMessageWake();
+		}
 	}
 
 	/**
@@ -1468,6 +1647,7 @@ export class AgentSession {
 			queueKey?: string;
 		},
 	): Promise<void> {
+		if (this._disposed) return;
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -1485,6 +1665,25 @@ export class AgentSession {
 			} else {
 				this.agent.steer(appMessage, options?.queueKey);
 			}
+		} else if (this._isAgentSettling && options?.triggerTurn) {
+			if (
+				this._disposed ||
+				this._agentSettlingWakeGeneration === undefined ||
+				this._agentSettlingWakeGeneration !== this._queuedMessageWakeGeneration
+			) {
+				return;
+			}
+			const queueKey =
+				options.queueKey ??
+				`agent-session-autonomous-wake-${this._queuedMessageWakeGeneration}-${this._nextAutonomousWakeQueueKey++}`;
+			if (options?.deliverAs === "followUp") {
+				this.agent.followUp(appMessage, queueKey);
+			} else {
+				this.agent.steer(appMessage, queueKey);
+			}
+			this._autonomousWakeQueueKeys.add(queueKey);
+			this._autonomousWakeQueueMessages.set(appMessage, queueKey);
+			this._queuedMessageWakePending = true;
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
 		} else if (this.isStreaming) {
@@ -1611,13 +1810,32 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		const wakeWasPending =
+			this._queuedMessageWakePending ||
+			this._queuedMessageWakeScheduled ||
+			this._queuedMessageWakeActive ||
+			this._queuedMessageWakeTimer !== undefined;
+		const wakePromise = this._queuedMessageWakePromise;
+		const wakeWasActive = this._queuedMessageWakeActive;
+		const settlementWasActive = this._isAgentSettling;
+		this._cancelQueuedMessageWake();
+		if (settlementWasActive) this._queuedMessageWakePending = true;
 		this.abortRetry();
 		this.agent.abort();
+
+		// An active wake owns the continuation that is currently running. Wait for
+		// its settlement before restarting ordinary user queues; otherwise the old
+		// wake can race the replacement continuation after its generation is stale.
+		if (wakeWasActive && wakePromise) await wakePromise.catch(() => undefined);
+		if ((wakeWasPending || settlementWasActive) && this.agent.hasQueuedMessages()) {
+			this._queuedMessageWakePending = true;
+			this._scheduleQueuedMessageWake();
+		}
 		await this.waitForIdle();
 	}
 
 	async waitForIdle(): Promise<void> {
-		if (this.isIdle) {
+		if (this.isIdle && !this._isAgentSettling && !this._queuedMessageWakePending && !this.agent.hasQueuedMessages()) {
 			return;
 		}
 		await this._getIdleWaitPromise();
@@ -2803,6 +3021,13 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		const wakePromise = this._queuedMessageWakePromise;
+		const wakeWasActive = this._queuedMessageWakeActive;
+		this._cancelQueuedMessageWake();
+		if (wakeWasActive) this.agent.abort();
+		// A settlement handler may itself request reload. Waiting for the wake promise
+		// there would deadlock that handler; the captured runner prevents stale events.
+		if (wakePromise && !this._isAgentSettling) await wakePromise;
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
@@ -2826,6 +3051,13 @@ export class AgentSession {
 			await options?.beforeSessionStart?.();
 			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 			await this.extendResourcesFromExtensions("reload");
+		}
+
+		// The cancelled wake only owns autonomous messages. Preserve ordinary user
+		// queue entries and restart their delivery after the replacement runner is ready.
+		if (this.agent.hasQueuedMessages()) {
+			this._queuedMessageWakePending = true;
+			this._scheduleQueuedMessageWake();
 		}
 	}
 
