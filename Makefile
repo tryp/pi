@@ -4,11 +4,17 @@
 # node_modules, not this checkout. Never edit files there directly; build and
 # deploy from here with `make deploy`.
 #
-#   make deploy            # build agent + coding-agent, sync, stamp, verify
-#   make deploy-full       # additionally rebuild+sync pi-ai and pi-tui
+#   make deploy            # build all local packages, stage, verify, and smoke-test
+#   make deploy-full       # compatibility alias for the complete deployment
 #   make verify            # deployed tree matches this build
 #   make smoke-test        # fresh-process startup test with configured extensions
+#   make test-deploy-runtime # preflight failure must not alter live runtime
 #   make deployed-commit   # show what is deployed
+#
+# Deployment is staged: every package build, dependency install, and verification
+# runs before scripts/deploy-runtime.sh replaces RUNTIME_DIR. This keeps a failed
+# preflight from leaving a mixed live runtime. Do not replace the staged deploy
+# with direct rsync/cp operations in this file.
 #
 # Traps encoded here (do not "simplify" them away):
 #
@@ -24,15 +30,15 @@
 # 3. The coding-agent bundle build is a required step. Missing sparse-checkout
 #    build scripts or bundle failures must stop deployment rather than leave a
 #    partially refreshed runtime.
-# 4. Verify the DEPLOYED tree (markers, versions, content), never the source
-#    tree, before recording a deploy event.
+# 4. Verify the staged tree before the live runtime is replaced, then verify
+#    again through the public deployed interface.
 
 RUNTIME_DIR ?= $(HOME)/.pi/local/pi-coding-agent
 CORE_PKGS := telemetry agent coding-agent ai client protocol tui
 PI ?= pi
 SMOKE_TIMEOUT ?= 90
 
-.PHONY: deploy deploy-full verify smoke-test deployed-commit build-telemetry build-agent build-ai build-client build-protocol build-tui build-coding-agent install-runtime-dependencies build-extra
+.PHONY: deploy deploy-full verify smoke-test test-deploy-runtime deployed-commit build-telemetry build-agent build-ai build-client build-protocol build-tui build-coding-agent build-extra
 
 build-telemetry:
 	cd packages/telemetry && npm run build || true
@@ -62,36 +68,14 @@ build-coding-agent:
 	test -f scripts/build-coding-agent-bundle.mjs || { echo "FAIL: coding-agent bundle script missing; hydrate it with 'git sparse-checkout add scripts'" >&2; exit 1; }
 	cd packages/coding-agent && npm run build:unbundled || true
 	test -f packages/coding-agent/dist/cli.js || { echo "FAIL: packages/coding-agent dist not emitted" >&2; exit 1; }
+	test -f packages/coding-agent/dist/index.js || { echo "FAIL: packages/coding-agent index dist not emitted" >&2; exit 1; }
 	chmod +x packages/coding-agent/dist/cli.js packages/coding-agent/dist/rpc-entry.js
 	cd packages/coding-agent && npm run copy-assets
 	node scripts/build-coding-agent-bundle.mjs
 	test -x packages/coding-agent/dist/bundle/cli.js || { echo "FAIL: coding-agent bundle not emitted" >&2; exit 1; }
 
-install-runtime-dependencies:
-	npm install --prefix $(RUNTIME_DIR) --no-save --ignore-scripts grok-mermaid@0.2.2
-	test -f $(RUNTIME_DIR)/node_modules/grok-mermaid/package.json || { echo "FAIL: grok-mermaid runtime dependency missing" >&2; exit 1; }
-
-deploy: build-telemetry build-agent build-extra build-coding-agent install-runtime-dependencies  ## Build and sync all local runtime packages, stamp, verify, and smoke-test
-	rsync -a --delete packages/coding-agent/dist/ $(RUNTIME_DIR)/dist/
-	cp packages/coding-agent/package.json $(RUNTIME_DIR)/package.json
-	mkdir -p $(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry
-	rsync -a --delete packages/telemetry/dist/ \
-		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry/dist/
-	cp packages/telemetry/package.json \
-		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry/package.json
-	rsync -a --delete packages/agent/dist/ \
-		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-agent-core/dist/
-	cp packages/agent/package.json \
-		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-agent-core/package.json
-	@for pkg in ai client protocol tui; do \
-		mkdir -p $(RUNTIME_DIR)/node_modules/@earendil-works/pi-$$pkg; \
-		rsync -a --delete packages/$$pkg/dist/ $(RUNTIME_DIR)/node_modules/@earendil-works/pi-$$pkg/dist/; \
-		cp packages/$$pkg/package.json $(RUNTIME_DIR)/node_modules/@earendil-works/pi-$$pkg/package.json; \
-	done
-	chmod +x $(RUNTIME_DIR)/dist/cli.js $(RUNTIME_DIR)/dist/rpc-entry.js
-	@printf 'deployed from: %s\nbranch: %s\ncommit: %s\ndeployed at: %s\npackages: %s\n\nThis is a deployed artifact. Do not edit files here.\nBuild and deploy from the source checkout (`make deploy`).\n' \
-		"$(CURDIR)" "$$(git rev-parse --abbrev-ref HEAD)" "$$(git rev-parse HEAD)" "$$(date '+%Y-%m-%d %H:%M:%S %z')" "$(CORE_PKGS)" \
-		> $(RUNTIME_DIR)/.deployed-commit
+deploy: build-telemetry build-agent build-extra build-coding-agent  ## Build all local runtime packages, stage dependencies, verify, install, and smoke-test
+	./scripts/deploy-runtime.sh --source-dir "$(CURDIR)" --runtime-dir "$(RUNTIME_DIR)"
 	@$(MAKE) --no-print-directory verify
 	@$(MAKE) --no-print-directory smoke-test
 
@@ -129,6 +113,9 @@ verify:  ## Verify deployed dist matches this build (versions + content + exec b
 		cmp -s "packages/$$pkg/dist/index.js" "$(RUNTIME_DIR)/node_modules/@earendil-works/pi-$$pkg/dist/index.js" || { echo "FAIL: pi-$$pkg dist drift" >&2; exit 1; }; \
 	done
 	@echo "OK: $(RUNTIME_DIR) matches $$(git rev-parse --short HEAD) ($(CORE_PKGS))"
+
+test-deploy-runtime:  ## Confirm a failed preflight leaves the live runtime untouched
+	./scripts/test-deploy-runtime.sh
 
 smoke-test:  ## Start a fresh pi process with the configured extensions
 	@set -eu; \
