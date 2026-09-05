@@ -26,22 +26,46 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
-function resolveTimeoutMs(timeout: number | undefined): number | undefined {
-	if (timeout === undefined) return undefined;
-	if (!Number.isFinite(timeout) || timeout <= 0) {
-		throw new Error("Invalid timeout: must be a finite number of seconds");
-	}
+/**
+ * Default max runtime for foreground bash commands (4 minutes).
+ * A supervising agent blocked on a foreground tool cannot check outstanding
+ * background jobs or subagent completions, so no foreground command may run
+ * indefinitely. Override with PI_BASH_DEFAULT_TIMEOUT_MS (milliseconds).
+ * An explicit `timeout` parameter always wins (including longer runs).
+ */
+export const DEFAULT_BASH_TIMEOUT_MS = 240_000;
 
-	const timeoutMs = timeout * 1000;
-	if (timeoutMs > MAX_TIMEOUT_MS) {
-		throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+export function resolveDefaultBashTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+	const raw = env.PI_BASH_DEFAULT_TIMEOUT_MS;
+	if (raw !== undefined) {
+		const normalized = raw.trim();
+		if (/^\d+$/.test(normalized)) {
+			const parsed = Number(normalized);
+			if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+		}
 	}
-	return timeoutMs;
+	return DEFAULT_BASH_TIMEOUT_MS;
+}
+
+function resolveTimeoutMs(timeout: number | undefined, env: NodeJS.ProcessEnv = process.env): number {
+	if (timeout !== undefined) {
+		if (!Number.isFinite(timeout) || timeout <= 0) {
+			throw new Error("Invalid timeout: must be a finite number of seconds");
+		}
+		const timeoutMs = timeout * 1000;
+		if (timeoutMs > MAX_TIMEOUT_MS) {
+			throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+		}
+		return timeoutMs;
+	}
+	return resolveDefaultBashTimeoutMs(env);
 }
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	timeout: Type.Optional(
+		Type.Number({ description: "Timeout in seconds (optional, defaults to 240s; explicit value overrides)" }),
+	),
 });
 
 export const bashToolSystemPromptContribution = {
@@ -115,13 +139,13 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			};
 
 			try {
-				// Set timeout if provided.
-				if (timeoutMs !== undefined) {
-					timeoutHandle = setTimeout(() => {
-						timedOut = true;
-						if (child.pid) killProcessTree(child.pid);
-					}, timeoutMs);
-				}
+				// Always armed: resolveTimeoutMs falls back to the 4-minute
+				// default so no foreground command runs indefinitely and
+				// blocks outstanding-job/subagent checks.
+				timeoutHandle = setTimeout(() => {
+					timedOut = true;
+					if (child.pid) killProcessTree(child.pid);
+				}, timeoutMs);
 				// Stream stdout and stderr.
 				child.stdout?.on("data", onData);
 				child.stderr?.on("data", onData);
