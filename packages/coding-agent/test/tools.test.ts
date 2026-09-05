@@ -492,7 +492,7 @@ describe("Coding Agent Tools", () => {
 
 		it("should include full output path for truncated timeout and abort errors", async () => {
 			for (const testCase of [
-				{ error: "timeout:5", expected: "Command timed out after 5 seconds" },
+				{ error: "timeout:5000", expected: "Command timed out after 5 seconds" },
 				{ error: "aborted", expected: "Command aborted" },
 			]) {
 				const operations: BashOperations = {

@@ -24,6 +24,13 @@ export interface BashExecutorOptions {
 	onChunk?: (chunk: string) => void;
 	/** AbortSignal for cancellation */
 	signal?: AbortSignal;
+	/**
+	 * Timeout in seconds, forwarded to the operations backend.
+	 * The local backend applies its 4-minute default when omitted; an
+	 * explicit value (including longer runs) always wins. Custom remote
+	 * backends may ignore it.
+	 */
+	timeout?: number;
 }
 
 export interface BashResult {
@@ -108,6 +115,7 @@ export async function executeBashWithOperations(
 		const result = await operations.exec(command, cwd, {
 			onData,
 			signal: options?.signal,
+			timeout: options?.timeout,
 		});
 
 		const fullOutput = outputChunks.join("");

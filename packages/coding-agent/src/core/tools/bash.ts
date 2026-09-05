@@ -41,7 +41,9 @@ export function resolveDefaultBashTimeoutMs(env: NodeJS.ProcessEnv = process.env
 		const normalized = raw.trim();
 		if (/^\d+$/.test(normalized)) {
 			const parsed = Number(normalized);
-			if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+			// Clamp: beyond MAX_TIMEOUT_MS setTimeout overflows (Node clamps
+			// to ~1ms), which would instantly time out every command.
+			if (Number.isSafeInteger(parsed) && parsed > 0) return Math.min(parsed, MAX_TIMEOUT_MS);
 		}
 	}
 	return DEFAULT_BASH_TIMEOUT_MS;
@@ -64,7 +66,10 @@ function resolveTimeoutMs(timeout: number | undefined, env: NodeJS.ProcessEnv = 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
 	timeout: Type.Optional(
-		Type.Number({ description: "Timeout in seconds (optional, defaults to 240s; explicit value overrides)" }),
+		Type.Number({
+			description:
+				"Timeout in seconds (optional; default 240s unless PI_BASH_DEFAULT_TIMEOUT_MS (ms) is set; explicit value always overrides, including longer runs)",
+		}),
 	),
 });
 
@@ -108,7 +113,7 @@ export interface BashOperations {
 export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
-			const timeoutMs = resolveTimeoutMs(timeout);
+			const timeoutMs = resolveTimeoutMs(timeout, env);
 			if (signal?.aborted) {
 				throw new Error("aborted");
 			}
@@ -161,7 +166,10 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					throw new Error("aborted");
 				}
 				if (timedOut) {
-					throw new Error(`timeout:${timeout}`);
+					// Carry the resolved milliseconds, not the raw `timeout`
+					// param: on the default path `timeout` is undefined and the
+					// old interpolation printed "after undefined seconds".
+					throw new Error(`timeout:${timeoutMs}`);
 				}
 				return { exitCode };
 			} finally {
@@ -262,7 +270,12 @@ function formatDuration(ms: number): string {
 function formatShellCall(args: { command?: string; timeout?: number } | undefined, prompt: string): string {
 	const command = str(args?.command);
 	const timeout = args?.timeout as number | undefined;
-	const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
+	// Show the pending kill even on the default path so a 4-minute cutoff is
+	// never a surprise in the transcript. Resolve the env default so an
+	// operator-set PI_BASH_DEFAULT_TIMEOUT_MS renders its real value, not
+	// the hardcoded 240s.
+	const effectiveTimeout = timeout ?? resolveDefaultBashTimeoutMs() / 1000;
+	const timeoutSuffix = theme.fg("muted", ` (timeout ${effectiveTimeout}s)`);
 	const commandDisplay = command === null ? invalidArgText(theme) : command ? command : theme.fg("toolOutput", "...");
 	return theme.fg("toolTitle", theme.bold(`${prompt} ${commandDisplay}`)) + timeoutSuffix;
 }
@@ -486,8 +499,10 @@ export function createShellToolDefinition(
 						throw new Error(appendStatus(text, "Command aborted"));
 					}
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
-						const timeoutSecs = err.message.split(":")[1];
-						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+						// Internal format is timeout:<resolved milliseconds>.
+						const timeoutMs = Number(err.message.split(":")[1]);
+						const display = Number.isFinite(timeoutMs) ? `${timeoutMs / 1000} seconds` : "the timeout";
+						throw new Error(appendStatus(text, `Command timed out after ${display}`));
 					}
 					throw err;
 				}
