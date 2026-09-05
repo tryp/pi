@@ -1249,3 +1249,57 @@ describe("InteractiveMode.showLoadedResources", () => {
 		expect(output).not.toContain("[Skills]");
 	});
 });
+
+describe("InteractiveMode model selection persistence", () => {
+	// Restores the pre-Aug-2026 last-used stickiness: interactive model
+	// selections persist as the default so the next session starts with the
+	// model used last, instead of being session-scoped only.
+	function createModelFakeThis() {
+		const model = { provider: "opencode-go", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" };
+		const setModel = vi.fn(async () => undefined);
+		const cycleModel = vi.fn(async () => ({
+			model,
+			thinkingLevel: "off",
+			isScoped: true,
+		}));
+		const fakeThis: any = {
+			session: {
+				scopedModels: [{ model }],
+				modelRuntime: { getAvailableSnapshot: vi.fn(() => [model]) },
+				setModel,
+				cycleModel,
+			},
+			settingsManager: {
+				getWarnings: vi.fn(() => ({ anthropicExtraUsage: false })),
+			},
+			footer: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showModelSelector: vi.fn(),
+			anthropicSubscriptionWarningShown: false,
+			checkDaxnutsEasterEgg: vi.fn(),
+			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(async () => undefined),
+			findExactModelMatch: (InteractiveMode as any).prototype.findExactModelMatch,
+		};
+		return { fakeThis, model, setModel, cycleModel };
+	}
+
+	test("/model <name> persists the selection as the default model", async () => {
+		const { fakeThis, model, setModel } = createModelFakeThis();
+
+		await (InteractiveMode as any).prototype.handleModelCommand.call(fakeThis, "deepseek-v4-flash");
+
+		expect(setModel).toHaveBeenCalledWith(model, { persist: true });
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("Default model: opencode-go/deepseek-v4-flash");
+	});
+
+	test("model cycling persists the selection as the default model", async () => {
+		const { fakeThis, cycleModel } = createModelFakeThis();
+
+		await (InteractiveMode as any).prototype.cycleModel.call(fakeThis, "forward");
+
+		expect(cycleModel).toHaveBeenCalledWith("forward", { persist: true });
+		expect(fakeThis.showStatus).toHaveBeenCalledWith(expect.stringContaining("DeepSeek V4 Flash"));
+	});
+});
