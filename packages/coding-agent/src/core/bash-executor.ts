@@ -44,6 +44,10 @@ export interface BashResult {
 	truncated: boolean;
 	/** Path to temp file containing full output (if output exceeded truncation threshold) */
 	fullOutputPath?: string;
+	/** True when the default budget detached the running command to the background (it keeps running) */
+	backgrounded?: boolean;
+	/** Shell (process-group leader) pid of a backgrounded command */
+	pid?: number;
 }
 
 // ============================================================================
@@ -134,6 +138,8 @@ export async function executeBashWithOperations(
 			cancelled,
 			truncated: truncationResult.truncated,
 			fullOutputPath: tempFilePath,
+			backgrounded: result.backgrounded,
+			pid: result.pid,
 		};
 	} catch (err) {
 		// Check if it was an abort
