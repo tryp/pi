@@ -1326,7 +1326,7 @@ export class AgentSession {
 				}
 			}
 
-			if (this._compactionAbortController !== undefined) {
+			if (this.isCompacting) {
 				throw new Error(
 					"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
 				);
@@ -1380,6 +1380,11 @@ export class AgentSession {
 				} else {
 					await this._queueSteer(expandedText, currentImages);
 				}
+				// This prompt has been admitted to the agent queue; it is no longer
+				// pending admission. Clearing the flag lets a later autonomous wake
+				// schedule after the active run settles.
+				this._userPromptPending = false;
+				this._scheduleQueuedMessageWake();
 				preflightResult?.(true);
 				return;
 			}
@@ -2638,11 +2643,11 @@ export class AgentSession {
 				return true;
 			}
 
-			// Threshold compaction occurs while the agent is still carrying out its
-			// task, so continue even when no explicit queue entry exists. Successful
-			// overflow compaction, however, follows a completed response and must not
-			// call continue() unless a queued message is waiting.
-			return reason === "threshold" || this.agent.hasQueuedMessages();
+			// Threshold compaction can run after a tool result while the agent still
+			// needs another turn. A completed assistant response, however, cannot be
+			// passed to agent.continue(); only queued work may continue in that case.
+			const lastMessage = this.agent.state.messages.at(-1);
+			return lastMessage?.role !== "assistant" || this.agent.hasQueuedMessages();
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			if (started) {

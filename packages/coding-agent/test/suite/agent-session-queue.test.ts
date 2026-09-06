@@ -117,6 +117,44 @@ describe("AgentSession queue characterization", () => {
 		expect(getAssistantTexts(harness)).toContain("saw steer");
 	});
 
+	it("wakes an autonomous message after a queued prompt settles", async () => {
+		let autonomousSent = false;
+		const waiting = await createWaitingHarness({
+			extensionFactories: [
+				(pi: ExtensionAPI) => {
+					pi.on("agent_settled", async () => {
+						if (autonomousSent) return;
+						autonomousSent = true;
+						pi.sendMessage(
+							{
+								customType: "autonomous-test",
+								content: [{ type: "text", text: "autonomous wake" }],
+								display: false,
+								details: {},
+							},
+							{ triggerTurn: true, deliverAs: "followUp" },
+						);
+					});
+				},
+			],
+		});
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("queued response"),
+			fauxAssistantMessage("autonomous response"),
+		]);
+
+		await waitForToolStart;
+		await harness.session.prompt("queued prompt", { streamingBehavior: "followUp" });
+		releaseToolExecution();
+		await promptPromise;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		expect(getAssistantTexts(harness)).toContain("autonomous response");
+	});
+
 	it("delivers follow-up messages only after the current run finishes", async () => {
 		const waiting = await createWaitingHarness();
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;

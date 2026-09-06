@@ -549,7 +549,7 @@ describe("AgentSession compaction characterization", () => {
 		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
 	});
 
-	it("resumes after threshold compaction with no queued messages", async () => {
+	it("does not continue after threshold compaction of a completed response", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },
 			extensionFactories: [
@@ -571,7 +571,7 @@ describe("AgentSession compaction characterization", () => {
 		await harness.session.prompt("second");
 
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
-		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
 	});
 
 	it("does not continue after successful overflow compaction without queued messages", async () => {
