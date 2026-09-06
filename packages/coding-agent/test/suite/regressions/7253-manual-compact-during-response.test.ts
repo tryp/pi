@@ -63,6 +63,7 @@ describe("issue #7253: manual compaction during an active response", () => {
 		const promptPromise = harness.session.prompt("Run the tool, then continue responding.");
 		await secondResponseStarted;
 
+		expect(harness.session.isStreaming).toBe(true);
 		const compactPromise = harness.session.compact();
 		const compactExpectation = expect(compactPromise).resolves.toMatchObject({ summary: "manual summary" });
 		releaseSecondResponse();

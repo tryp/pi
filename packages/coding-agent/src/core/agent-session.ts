@@ -2169,15 +2169,19 @@ export class AgentSession {
 	 */
 	async compact(customInstructions?: string, _capturedIsStreaming?: boolean): Promise<CompactionResult> {
 		const _isStreaming = _capturedIsStreaming !== undefined ? _capturedIsStreaming : this.isStreaming;
-		if (_isStreaming) {
-			this._disconnectFromAgent();
-			await this.abort();
-		}
+		// Claim the compaction slot before aborting an active run. The run's
+		// post-agent cleanup can call _checkCompaction() while abort() waits for
+		// idle; without the early claim it can start a competing threshold
+		// compaction and make this manual request fail as "Already compacted".
 		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
 
 		try {
+			if (_isStreaming) {
+				this._disconnectFromAgent();
+				await this.abort();
+			}
+			this._emit({ type: "compaction_start", reason: "manual" });
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
@@ -2358,6 +2362,10 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+		// A manual compaction claims the slot before aborting its active run. Its
+		// post-agent cleanup must not start a competing automatic compaction.
+		if (this.isCompacting) return false;
+
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
