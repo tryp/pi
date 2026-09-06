@@ -2168,6 +2168,9 @@ export class AgentSession {
 	 *   When omitted, uses this.isStreaming (safe for /compact command).
 	 */
 	async compact(customInstructions?: string, _capturedIsStreaming?: boolean): Promise<CompactionResult> {
+		if (this.isCompacting) {
+			throw new Error("Compaction already in progress");
+		}
 		const _isStreaming = _capturedIsStreaming !== undefined ? _capturedIsStreaming : this.isStreaming;
 		// Claim the compaction slot before aborting an active run. The run's
 		// post-agent cleanup can call _checkCompaction() while abort() waits for
@@ -2178,7 +2181,8 @@ export class AgentSession {
 
 		try {
 			if (_isStreaming) {
-				this._disconnectFromAgent();
+				// Keep the event subscription connected: abort() emits the terminal
+				// events needed to settle AgentSession bookkeeping.
 				await this.abort();
 			}
 			this._emit({ type: "compaction_start", reason: "manual" });
@@ -2482,6 +2486,8 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+		if (this.isCompacting) return false;
+		this._autoCompactionAbortController = new AbortController();
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 		let fromExtension = false;
@@ -2501,7 +2507,6 @@ export class AgentSession {
 			}
 
 			this._emit({ type: "compaction_start", reason });
-			this._autoCompactionAbortController = new AbortController();
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;

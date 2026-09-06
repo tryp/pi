@@ -58,6 +58,7 @@ describe("issue #7253: manual compaction during an active response", () => {
 				await secondResponseReleased;
 				return fauxAssistantMessage("second response");
 			},
+			fauxAssistantMessage("follow-up response"),
 		]);
 
 		const promptPromise = harness.session.prompt("Run the tool, then continue responding.");
@@ -68,6 +69,7 @@ describe("issue #7253: manual compaction during an active response", () => {
 		const compactExpectation = expect(compactPromise).resolves.toMatchObject({ summary: "manual summary" });
 		releaseSecondResponse();
 		await Promise.all([promptPromise, compactExpectation]);
+		await harness.session.prompt("follow up after compaction");
 
 		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["manual"]);
 		expect(harness.eventsOfType("compaction_end").map((event) => event.reason)).toEqual(["manual"]);
