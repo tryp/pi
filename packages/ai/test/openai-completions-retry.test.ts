@@ -136,4 +136,15 @@ describe("openai-completions provider retries", () => {
 		expect(result.errorMessage).toContain("rate limited");
 		expect(mockState.requestOptions).toEqual([expect.objectContaining({ maxRetries: 0 })]);
 	});
+
+	it("classifies a statusless abort before output with request context", async () => {
+		mockState.requestErrors = [new Error("This operation was aborted")];
+
+		const result = await consume();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(
+			/^Provider aborted request before any output \(request ~\d+ KB, 1 messages\): This operation was aborted$/,
+		);
+	});
 });

@@ -332,6 +332,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 		// `reasoning_details` are replay metadata, not user-visible stream deltas.
 		// Keep them in memory during streaming and serialize once when the block is finalized.
 		let streamedReasoningDetails: OpenAIReasoningDetail[] | undefined;
+		let params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming | undefined;
 		const applyStreamedReasoningDetails = (block: ThinkingContent): void => {
 			if (streamedReasoningDetails !== undefined) {
 				block.thinkingSignature = JSON.stringify(streamedReasoningDetails);
@@ -348,7 +349,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
 			const client = createClient(model, context, apiKey, options?.headers, options?.fetch, cacheSessionId, compat);
-			let params = buildParams(model, context, options, compat, cacheRetention, grammarToolInputProperties);
+			params = buildParams(model, context, options, compat, cacheRetention, grammarToolInputProperties);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
@@ -359,7 +360,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				maxRetries: 0,
 			};
 			const { data: openaiStream, response } = await retryProviderRequest(
-				() => client.chat.completions.create(params, requestOptions).withResponse(),
+				() => client.chat.completions.create(params!, requestOptions).withResponse(),
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
@@ -701,7 +702,15 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			const formattedError = formatProviderError(normalizeProviderError(error));
+			const hasHttpStatus = (error as any)?.status != null || (error as any)?.statusCode != null;
+			if (output.usage.totalTokens === 0 && !hasHttpStatus && !options?.signal?.aborted) {
+				const requestSizeKb = params === undefined ? 0 : Math.round(JSON.stringify(params).length / 1024);
+				output.errorMessage =
+					`Provider aborted request before any output (request ~${requestSizeKb} KB, ${context.messages.length} messages): ${formattedError}`;
+			} else {
+				output.errorMessage = formattedError;
+			}
 			// Some providers via OpenRouter give additional information in this field.
 			// normalizeProviderError already stringifies the parsed body (error.error)
 			// into errorMessage, so only append the raw metadata when it is not already
