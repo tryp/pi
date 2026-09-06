@@ -236,6 +236,19 @@ function buildModelForEntry(
 	if ((variant === "opencode" || variant === "opencode-go") && modelId === "kimi-k2.6") {
 		compat = { ...(compat ?? {}), thinkingFormat: "deepseek", supportsReasoningEffort: false };
 	}
+	if (api === "openai-completions" && modelId.includes("deepseek-v4")) {
+		// Mirror scripts/generate-models.ts deepseek-v4 compat post-processing: the
+		// upstream DeepSeek API rejects replayed assistant messages that lack
+		// `reasoning_content` when thinking mode is on. opencode keeps native
+		// reasoning effort (only the replay flag is forced); opencode-go gets the
+		// full deepseek compat (replay flag + deepseek thinking format).
+		compat = {
+			...(compat ?? {}),
+			...(variant === "opencode-go"
+				? { requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek" }
+				: { requiresReasoningContentOnAssistantMessages: true }),
+		};
+	}
 	if (variant === "opencode-go") {
 		if (modelId === "minimax-m2.7") {
 			api = "openai-completions";

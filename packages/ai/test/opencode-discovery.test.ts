@@ -111,6 +111,31 @@ describe("opencode helpers", () => {
 		expect((qwen.compat as any).thinkingFormat).toBe("qwen");
 	});
 
+	it("applies deepseek-v4 compat so replayed assistant messages keep reasoning_content", () => {
+		const entries = [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }];
+
+		// opencode keeps native reasoning effort; only the replay flag is forced
+		const zen = buildModelsFromEntries("opencode", "https://opencode.ai/zen", entries, undefined);
+		for (const m of zen) {
+			expect((m.compat as any).requiresReasoningContentOnAssistantMessages).toBe(true);
+			expect((m.compat as any).thinkingFormat).toBeUndefined();
+			expect(m.api).toBe("openai-completions");
+		}
+
+		// opencode-go gets the full deepseek compat (flag + deepseek thinking format)
+		const go = buildModelsFromEntries("opencode-go", "https://opencode.ai/zen/go", entries, undefined);
+		for (const m of go) {
+			expect((m.compat as any).requiresReasoningContentOnAssistantMessages).toBe(true);
+			expect((m.compat as any).thinkingFormat).toBe("deepseek");
+			expect((m.compat as any).maxTokensField).toBe("max_tokens");
+			expect(m.api).toBe("openai-completions");
+		}
+
+		// non-deepseek opencode-go models are untouched
+		const other = buildModelsFromEntries("opencode-go", "https://opencode.ai/zen/go", [{ id: "glm-5.2" }], undefined);
+		expect((other[0]?.compat as any)?.requiresReasoningContentOnAssistantMessages).toBeUndefined();
+	});
+
 	it("deduplicates and trims entries", () => {
 		const entries = [{ id: "a " }, { id: "a" }, { id: " b" }, { id: "" }, { id: undefined as any }];
 		const models = buildModelsFromEntries("opencode", "https://opencode.ai/zen", entries as any, undefined);
