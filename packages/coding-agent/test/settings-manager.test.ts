@@ -570,6 +570,24 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("compaction settings", () => {
+		it("returns undefined maxContextTokens by default", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getCompactionMaxContextTokens()).toBeUndefined();
+			expect(manager.getCompactionSettings().maxContextTokens).toBeUndefined();
+		});
+
+		it("returns configured maxContextTokens", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ compaction: { maxContextTokens: 180000 } }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getCompactionMaxContextTokens()).toBe(180000);
+			expect(manager.getCompactionSettings().maxContextTokens).toBe(180000);
+		});
+	});
+
 	describe("getSessionDir", () => {
 		it("should return undefined when not set", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));

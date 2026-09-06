@@ -2616,13 +2616,11 @@ export class AgentSession {
 				return true;
 			}
 
-			// After successful threshold compaction, always continue the agent so its
-			// current task isn't interrupted mid-turn. The overflow path (willRetry=true)
-			// already returns true above — threshold should behave the same way.
-			// A simple this.agent.hasQueuedMessages() check here would stop the agent
-			// loop when no follow-up/steer messages are queued, dropping the session
-			// to the TUI prompt during active work.
-			return true;
+			// Threshold compaction occurs while the agent is still carrying out its
+			// task, so continue even when no explicit queue entry exists. Successful
+			// overflow compaction, however, follows a completed response and must not
+			// call continue() unless a queued message is waiting.
+			return reason === "threshold" || this.agent.hasQueuedMessages();
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			if (started) {

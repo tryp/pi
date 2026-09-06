@@ -292,6 +292,30 @@ describe("shouldCompact", () => {
 
 		expect(shouldCompact(95000, 100000, settings)).toBe(false);
 	});
+
+	it("uses maxContextTokens as an absolute model-independent threshold", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+			maxContextTokens: 180000,
+		};
+
+		expect(shouldCompact(181000, 200000, settings)).toBe(true);
+		expect(shouldCompact(181000, 1000000, settings)).toBe(true);
+		expect(shouldCompact(179000, 200000, settings)).toBe(false);
+	});
+
+	it("lets disabled compaction override maxContextTokens", () => {
+		const settings: CompactionSettings = {
+			enabled: false,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+			maxContextTokens: 50000,
+		};
+
+		expect(shouldCompact(60000, 200000, settings)).toBe(false);
+	});
 });
 
 describe("findCutPoint", () => {
