@@ -310,6 +310,16 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
+export const CONTEXT_GUARD_ERROR_MESSAGE =
+	"Context guard: estimated context exceeds maxContextTokens — compacting before retry";
+
+export class ContextGuardError extends Error {
+	constructor() {
+		super(CONTEXT_GUARD_ERROR_MESSAGE);
+		this.name = "ContextGuardError";
+	}
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1144,6 +1154,14 @@ export class AgentSession {
 			this._compactionAbortController !== undefined ||
 			this._branchSummaryAbortController !== undefined
 		);
+	}
+
+	guardContextForRequest(messages: AgentMessage[]): void {
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled || settings.maxContextTokens == null || this.isCompacting) return;
+		if (estimateMessagesTokens(messages) > settings.maxContextTokens) {
+			throw new ContextGuardError();
+		}
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -2475,7 +2493,10 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
+			// A pre-send context guard deliberately fails the request so compaction can
+			// replace the oversized context before continuing the interrupted turn.
+			const willRetry = assistantMessage.errorMessage === CONTEXT_GUARD_ERROR_MESSAGE;
+			return await this._runAutoCompaction("threshold", willRetry);
 		}
 		return false;
 	}

@@ -1,11 +1,11 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent, type AgentEvent, type AgentTool } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentEvent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AgentSession } from "../src/core/agent-session.ts";
+import { AgentSession, ContextGuardError } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -72,6 +72,8 @@ describe("AgentSession retry", () => {
 		failCount?: number;
 		maxRetries?: number;
 		delayAssistantMessageEndMs?: number;
+		maxContextTokens?: number;
+		compactionEnabled?: boolean;
 	}) {
 		const failCount = options?.failCount ?? 1;
 		const maxRetries = options?.maxRetries ?? 3;
@@ -109,6 +111,14 @@ describe("AgentSession retry", () => {
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries, baseDelayMs: 1 } });
+		if (options?.maxContextTokens !== undefined || options?.compactionEnabled !== undefined) {
+			settingsManager.applyOverrides({
+				compaction: {
+					...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
+					...(options.compactionEnabled !== undefined ? { enabled: options.compactionEnabled } : {}),
+				},
+			});
+		}
 
 		session = new AgentSession({
 			agent,
@@ -230,6 +240,75 @@ describe("AgentSession retry", () => {
 
 		expect(callCount).toBe(2);
 		expect(events).toEqual(["start:1", "end:success=true"]);
+	});
+
+	it("guards requests over the configured absolute context limit", async () => {
+		const created = await createSession({ maxContextTokens: 1 });
+		const messages: AgentMessage[] = [
+			{ role: "user", content: [{ type: "text", text: "This exceeds one token." }], timestamp: 0 },
+		];
+
+		expect(() => created.session.guardContextForRequest(messages)).toThrow(ContextGuardError);
+		expect(() => created.session.guardContextForRequest(messages)).toThrow(
+			"Context guard: estimated context exceeds maxContextTokens — compacting before retry",
+		);
+	});
+
+	it("allows requests under the configured absolute context limit", async () => {
+		const created = await createSession({ maxContextTokens: 1000 });
+
+		expect(() =>
+			created.session.guardContextForRequest([
+				{ role: "user", content: [{ type: "text", text: "small" }], timestamp: 0 },
+			]),
+		).not.toThrow();
+	});
+
+	it("skips the guard while compaction is active", async () => {
+		const created = await createSession({ maxContextTokens: 1 });
+		(created.session as unknown as { _autoCompactionAbortController?: AbortController })._autoCompactionAbortController =
+			new AbortController();
+
+		expect(() =>
+			created.session.guardContextForRequest([
+				{ role: "user", content: [{ type: "text", text: "This exceeds one token." }], timestamp: 0 },
+			]),
+		).not.toThrow();
+	});
+
+	it("skips the guard when compaction is disabled", async () => {
+		const created = await createSession({ maxContextTokens: 1, compactionEnabled: false });
+
+		expect(() =>
+			created.session.guardContextForRequest([
+				{ role: "user", content: [{ type: "text", text: "This exceeds one token." }], timestamp: 0 },
+			]),
+		).not.toThrow();
+	});
+
+	it("skips the guard when no maximum context is configured", async () => {
+		const created = await createSession();
+
+		expect(() =>
+			created.session.guardContextForRequest([
+				{ role: "user", content: [{ type: "text", text: "This exceeds one token." }], timestamp: 0 },
+			]),
+		).not.toThrow();
+	});
+
+	it("does not classify the context guard marker as retryable", async () => {
+		const created = await createSession();
+		const isRetryable = (created.session as unknown as { _isRetryableError: (message: AssistantMessage) => boolean })
+			._isRetryableError.bind(created.session);
+
+		expect(
+			isRetryable(
+				createAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: new ContextGuardError().message,
+				}),
+			),
+		).toBe(false);
 	});
 
 	it("prompt waits for full agent loop when retry produces tool calls", async () => {
