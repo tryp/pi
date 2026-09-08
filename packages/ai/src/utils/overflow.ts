@@ -25,7 +25,8 @@ import type { AssistantMessage } from "../types.ts";
  * - MiniMax: "invalid params, context window exceeds limit"
  * - Kimi For Coding: "Your request exceeded model token limit: X (requested: Y)"
  * - DS4: "Prompt has X tokens, but the configured context size is Y tokens"
- * - Cerebras: "400/413 status code (no body)"
+ * - Cerebras: "400/413 status code (no body)" (provider-scoped: only Cerebras's
+ *   bare-4xx/no-body errors are treated as overflow — see `isBareNoBodyOverflow`)
  * - Mistral: "Prompt contains X tokens ... too large for model with Y maximum context length"
  * - z.ai: Does NOT error, accepts overflow silently - handled via usage.input > contextWindow
  * - Xiaomi MiMo: Truncates input to fill contextWindow exactly, then returns finish_reason "length"
@@ -59,8 +60,27 @@ const OVERFLOW_PATTERNS = [
 	/context[_ ]length[_ ]exceeded/i, // Generic fallback
 	/too many tokens/i, // Generic fallback
 	/token limit exceeded/i, // Generic fallback
-	/^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i, // Cerebras: 400/413 with no body
 ];
+
+/**
+ * Bare 4xx with no response body, e.g. `400 status code (no body)`.
+ *
+ * This is NOT a generic overflow signal: any provider or gateway that answers
+ * a bad or transient request with a bare 400/413 (and whose SDK strips the
+ * body — see `error-body.ts`) yields this exact string, with zero diagnostic
+ * content. It is treated as overflow only for providers documented to return
+ * bare 4xx for context overflow (see `isBareNoBodyOverflow`), and is kept out
+ * of `OVERFLOW_PATTERNS` so generic detection never matches it.
+ */
+const BARE_4XX_NO_BODY_PATTERN = /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i;
+
+/**
+ * Providers that signal context overflow with a bare 400/413 and no response
+ * body. Cerebras is the documented case; other providers' bare 4xx errors are
+ * undiagnosable (transient gateway rejection, request validation failure, ...)
+ * and must not trigger overflow recovery.
+ */
+const BARE_4XX_NO_BODY_OVERFLOW_PROVIDERS: ReadonlySet<string> = new Set(["cerebras"]);
 
 /**
  * Patterns that indicate non-overflow errors (e.g. rate limiting, server errors).
@@ -76,6 +96,18 @@ const NON_OVERFLOW_PATTERNS = [
 	/rate limit/i, // Generic rate limiting
 	/too many requests/i, // Generic HTTP 429 style
 ];
+
+/**
+ * True when the error is a bare 4xx/no-body overflow signal from a provider
+ * documented to return such errors for context overflow (Cerebras).
+ */
+export function isBareNoBodyOverflow(message: AssistantMessage): boolean {
+	return (
+		message.provider !== undefined &&
+		BARE_4XX_NO_BODY_OVERFLOW_PROVIDERS.has(message.provider) &&
+		BARE_4XX_NO_BODY_PATTERN.test(message.errorMessage ?? "")
+	);
+}
 
 /**
  * Check if an assistant message represents a context overflow error.
@@ -96,7 +128,7 @@ const NON_OVERFLOW_PATTERNS = [
  * - Google Gemini: "input token count exceeds the maximum"
  * - xAI (Grok): "maximum prompt length is X but request contains Y"
  * - Groq: "reduce the length of the messages"
- * - Cerebras: 400/413 status code (no body)
+ * - Cerebras: 400/413 status code (no body) (provider-scoped via isBareNoBodyOverflow)
  * - Mistral: "Prompt contains X tokens ... too large for model with Y maximum context length"
  * - OpenRouter (most backends): "maximum context length is X tokens"
  * - OpenRouter/Poolside: "Input length X exceeds the maximum allowed input length of Y tokens."
@@ -137,6 +169,13 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 		// Skip messages matching known non-overflow patterns (e.g. throttling / rate-limit)
 		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!));
 		if (!isNonOverflow && OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!))) {
+			return true;
+		}
+		// Bare 4xx "no body" errors are only overflow for providers documented to
+		// signal it that way (Cerebras). Any other provider's bare 4xx is an
+		// undiagnosable error (transient gateway rejection, validation failure,
+		// ...) and must not trigger overflow recovery / compaction.
+		if (!isNonOverflow && isBareNoBodyOverflow(message)) {
 			return true;
 		}
 	}
