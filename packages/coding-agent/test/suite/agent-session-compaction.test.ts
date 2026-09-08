@@ -625,6 +625,30 @@ describe("AgentSession compaction characterization", () => {
 		);
 	});
 
+	it("does not compact bare 4xx no-body errors from non-Cerebras providers", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const bareErrorMessage = createAssistant(harness, {
+			stopReason: "error",
+			errorMessage: "400 status code (no body)",
+			timestamp: Date.now(),
+		});
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+		const compactionErrors: string[] = [];
+		harness.session.subscribe((event) => {
+			if (event.type === "compaction_end" && event.errorMessage) {
+				compactionErrors.push(event.errorMessage);
+			}
+		});
+
+		await sessionInternals._checkCompaction(bareErrorMessage);
+		await sessionInternals._checkCompaction({ ...bareErrorMessage, timestamp: Date.now() + 1 });
+
+		expect(runAutoCompactionSpy).not.toHaveBeenCalled();
+		expect(compactionErrors).toEqual([]);
+	});
+
 	it("compacts successful overflow responses without retrying", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
