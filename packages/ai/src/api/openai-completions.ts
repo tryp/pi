@@ -706,8 +706,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			const hasHttpStatus = (error as any)?.status != null || (error as any)?.statusCode != null;
 			if (output.usage.totalTokens === 0 && !hasHttpStatus && !options?.signal?.aborted) {
 				const requestSizeKb = params === undefined ? 0 : Math.round(JSON.stringify(params).length / 1024);
-				output.errorMessage =
-					`Provider aborted request before any output (request ~${requestSizeKb} KB, ${context.messages.length} messages): ${formattedError}`;
+				output.errorMessage = `Provider aborted request before any output (request ~${requestSizeKb} KB, ${context.messages.length} messages): ${formattedError}`;
 			} else {
 				output.errorMessage = formattedError;
 			}
@@ -1353,11 +1352,17 @@ export function convertMessages(
 			if (preservedReasoningDetails) {
 				assistantMsg.reasoning_details = preservedReasoningDetails;
 			}
-			if (
-				compat.requiresReasoningContentOnAssistantMessages &&
-				model.reasoning &&
-				assistantMsg.reasoning_content === undefined
-			) {
+			// DeepSeek-family upstreams run thinking mode by default for these
+			// models regardless of the client's reasoning flag (the `thinking`
+			// param is optional; omission behaves like enabled), and reject the
+			// request when any assistant message in a tools conversation lacks
+			// the `reasoning_content` field, even one with no preserved thinking.
+			// So the field must be guaranteed whenever the compat flag is set,
+			// not gated on `model.reasoning` -- a runtime model whose reasoning
+			// flag is false (e.g. a discovery alias shadowing the catalog entry)
+			// otherwise produces "The `reasoning_content` in the thinking mode
+			// must be passed back to the API" 400s.
+			if (compat.requiresReasoningContentOnAssistantMessages && assistantMsg.reasoning_content === undefined) {
 				assistantMsg.reasoning_content = "";
 			}
 			// Skip assistant messages that have no content and no tool calls.
