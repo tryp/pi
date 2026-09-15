@@ -27,17 +27,44 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
-function resolveTimeoutMs(timeout: number | undefined): number | undefined {
-	if (timeout === undefined) return undefined;
-	if (!Number.isFinite(timeout) || timeout <= 0) {
-		throw new Error("Invalid timeout: must be a finite number of seconds");
-	}
+/**
+ * Default budget for foreground bash commands (4 minutes).
+ * A supervising agent blocked on a foreground tool cannot check outstanding
+ * background jobs or subagent completions, so a foreground command that is
+ * still running when the budget elapses is detached to the background (it
+ * keeps running) and control returns to the agent with a notice, instead of
+ * killing it. Override with PI_BASH_DEFAULT_TIMEOUT_MS (milliseconds). An
+ * explicit `timeout` parameter always wins (including longer runs) and keeps
+ * kill semantics.
+ */
+export const DEFAULT_BASH_TIMEOUT_MS = 240_000;
 
-	const timeoutMs = timeout * 1000;
-	if (timeoutMs > MAX_TIMEOUT_MS) {
-		throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+export function resolveDefaultBashTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+	const raw = env.PI_BASH_DEFAULT_TIMEOUT_MS;
+	if (raw !== undefined) {
+		const normalized = raw.trim();
+		if (/^\d+$/.test(normalized)) {
+			const parsed = Number(normalized);
+			// Clamp: beyond MAX_TIMEOUT_MS setTimeout overflows (Node clamps
+			// to ~1ms), which would instantly time out every command.
+			if (Number.isSafeInteger(parsed) && parsed > 0) return Math.min(parsed, MAX_TIMEOUT_MS);
+		}
 	}
-	return timeoutMs;
+	return DEFAULT_BASH_TIMEOUT_MS;
+}
+
+function resolveTimeoutMs(timeout: number | undefined, env: NodeJS.ProcessEnv = process.env): number {
+	if (timeout !== undefined) {
+		if (!Number.isFinite(timeout) || timeout <= 0) {
+			throw new Error("Invalid timeout: must be a finite number of seconds");
+		}
+		const timeoutMs = timeout * 1000;
+		if (timeoutMs > MAX_TIMEOUT_MS) {
+			throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+		}
+		return timeoutMs;
+	}
+	return resolveDefaultBashTimeoutMs(env);
 }
 
 function getErrorCode(error: unknown): string | undefined {
@@ -48,7 +75,12 @@ function getErrorCode(error: unknown): string | undefined {
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	timeout: Type.Optional(
+		Type.Number({
+			description:
+				"Timeout in seconds (optional). An explicit value always wins and kills the command when it elapses. Without an explicit timeout, a command still running after the default budget (240s unless PI_BASH_DEFAULT_TIMEOUT_MS (ms) is set) is detached to the background and keeps running; the tool returns a notice with the pid, and the command can be checked with `ps` or stopped with `kill -TERM -<pid>`. Use a dedicated background job tool (e.g. bash_bg where available) when you need log capture for long commands.",
+		}),
+	),
 	cwd: Type.Optional(
 		Type.String({
 			description:
@@ -69,6 +101,16 @@ export interface BashToolDetails {
 	fullOutputPath?: string;
 }
 
+/** Outcome of a shell command execution. */
+export interface BashExecOutcome {
+	/** Process exit code (null if the command is still running or was killed). */
+	exitCode: number | null;
+	/** True when the default budget detached a still-running command to the background. */
+	backgrounded?: boolean;
+	/** Shell (process-group leader) pid of a backgrounded command. */
+	pid?: number;
+}
+
 /**
  * Pluggable operations for the bash tool.
  * Override these to delegate command execution to remote systems (for example SSH).
@@ -79,7 +121,7 @@ export interface BashOperations {
 	 * @param command The command to execute
 	 * @param cwd Working directory
 	 * @param options Execution options
-	 * @returns Promise resolving to exit code (null if killed)
+	 * @returns Promise resolving to exit code (null if killed or detached to the background)
 	 */
 	exec: (
 		command: string,
@@ -90,14 +132,15 @@ export interface BashOperations {
 			timeout?: number;
 			env?: NodeJS.ProcessEnv;
 		},
-	) => Promise<{ exitCode: number | null }>;
+	) => Promise<BashExecOutcome>;
 }
 
 /** Shared process execution used by the built-in shell tools. */
 export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
-			const timeoutMs = resolveTimeoutMs(timeout);
+			const explicitTimeout = timeout !== undefined;
+			const timeoutMs = resolveTimeoutMs(timeout, env);
 			if (signal?.aborted) {
 				throw new Error("aborted");
 			}
@@ -122,19 +165,46 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			}
 			if (child.pid) trackDetachedChildPid(child.pid);
 			let timedOut = false;
+			let backgrounded = false;
+			let settleExec: ((outcome: BashExecOutcome) => void) | undefined;
+			const execOutcome = new Promise<BashExecOutcome>((resolve) => {
+				settleExec = resolve;
+			});
 			let timeoutHandle: NodeJS.Timeout | undefined;
 			const onAbort = () => {
 				if (child.pid) killProcessTree(child.pid);
 			};
 
+			// Detach a still-running command at the default budget: the work
+			// keeps running in its own process group, and the caller is
+			// unblocked (woken) with a notice instead of the command being
+			// killed. Only an explicit `timeout` parameter keeps kill semantics.
+			const background = () => {
+				if (backgrounded || child.exitCode !== null || child.signalCode !== null) return;
+				backgrounded = true;
+				// Stop delivering output to the caller (the tool has already
+				// returned); waitForChildProcess keeps draining the pipes, so
+				// the detached process never stalls on backpressure and no
+				// output is buffered in the parent.
+				child.stdout?.removeListener("data", onData);
+				child.stderr?.removeListener("data", onData);
+				settleExec?.({ exitCode: null, backgrounded: true, pid: child.pid ?? undefined });
+			};
+
 			try {
-				// Set timeout if provided.
-				if (timeoutMs !== undefined) {
-					timeoutHandle = setTimeout(() => {
+				// Always armed: resolveTimeoutMs falls back to the 4-minute
+				// default so no foreground command runs indefinitely and
+				// blocks outstanding-job/subagent checks. At the default
+				// budget the command is detached to the background, not killed.
+				timeoutHandle = setTimeout(() => {
+					if (child.exitCode !== null || child.signalCode !== null) return;
+					if (explicitTimeout) {
 						timedOut = true;
 						if (child.pid) killProcessTree(child.pid);
-					}, timeoutMs);
-				}
+					} else {
+						background();
+					}
+				}, timeoutMs);
 				// Stream stdout and stderr.
 				child.stdout?.on("data", onData);
 				child.stderr?.on("data", onData);
@@ -144,33 +214,37 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					else signal.addEventListener("abort", onAbort, { once: true });
 				}
 				// Handle shell spawn errors and wait for the process to terminate without hanging
-				// on inherited stdio handles held by detached descendants. A cwd can
+				// on inherited stdio handles held by detached descendants — unless
+				// the default budget detaches it to the background first. A cwd can
 				// disappear between the access check above and spawn(), for example when a
 				// worktree is removed concurrently; translate that race into a useful tool
 				// error instead of leaking Node's ambiguous ENOENT message.
-				let exitCode: number | null;
-				try {
-					exitCode = await waitForChildProcess(child);
-				} catch (error) {
-					if (getErrorCode(error) === "ENOENT") {
-						try {
-							await fsAccess(cwd, constants.F_OK);
-						} catch {
-							throw new Error(
-								`Working directory disappeared while starting bash: ${cwd}\nCannot execute bash commands.`,
-								{ cause: error },
-							);
+				const childExit = waitForChildProcess(child)
+					.then((exitCode) => ({ exitCode }))
+					.catch(async (error: unknown) => {
+						if (getErrorCode(error) === "ENOENT") {
+							try {
+								await fsAccess(cwd, constants.F_OK);
+							} catch {
+								throw new Error(
+									`Working directory disappeared while starting bash: ${cwd}\nCannot execute bash commands.`,
+									{ cause: error },
+								);
+							}
 						}
-					}
-					throw error;
-				}
+						throw error;
+					});
+				const outcome = await Promise.race<BashExecOutcome>([childExit, execOutcome]);
 				if (signal?.aborted) {
 					throw new Error("aborted");
 				}
 				if (timedOut) {
-					throw new Error(`timeout:${timeout}`);
+					// Carry the resolved milliseconds, not the raw `timeout`
+					// param: on the default path `timeout` is undefined and the
+					// old interpolation printed "after undefined seconds".
+					throw new Error(`timeout:${timeoutMs}`);
 				}
-				return { exitCode };
+				return outcome;
 			} finally {
 				if (child.pid) untrackDetachedChildPid(child.pid);
 				if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -269,7 +343,15 @@ function formatDuration(ms: number): string {
 function formatShellCall(args: { command?: string; timeout?: number } | undefined, prompt: string): string {
 	const command = str(args?.command);
 	const timeout = args?.timeout as number | undefined;
-	const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
+	// Resolve the env default so an operator-set PI_BASH_DEFAULT_TIMEOUT_MS
+	// renders its real value, not the hardcoded 240s. An explicit timeout is
+	// a kill bound; the default budget detaches a still-running command to
+	// the background instead of killing it.
+	const effectiveTimeout = timeout ?? resolveDefaultBashTimeoutMs() / 1000;
+	const timeoutSuffix = theme.fg(
+		"muted",
+		timeout ? ` (timeout ${effectiveTimeout}s)` : ` (backgrounds after ${effectiveTimeout}s)`,
+	);
 	const commandDisplay = command === null ? invalidArgText(theme) : command ? command : theme.fg("toolOutput", "...");
 	return theme.fg("toolTitle", theme.bold(`${prompt} ${commandDisplay}`)) + timeoutSuffix;
 }
@@ -484,6 +566,7 @@ export function createShellToolDefinition(
 
 			try {
 				let exitCode: number | null;
+				let execOutcome: BashExecOutcome | undefined;
 				try {
 					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
@@ -492,6 +575,7 @@ export function createShellToolDefinition(
 						env: spawnContext.env,
 					});
 					exitCode = result.exitCode;
+					execOutcome = result;
 				} catch (err) {
 					const snapshot = await finishOutput();
 					const { text } = formatOutput(snapshot, "");
@@ -499,8 +583,10 @@ export function createShellToolDefinition(
 						throw new Error(appendStatus(text, "Command aborted"));
 					}
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
-						const timeoutSecs = err.message.split(":")[1];
-						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+						// Internal format is timeout:<resolved milliseconds>.
+						const timeoutMs = Number(err.message.split(":")[1]);
+						const display = Number.isFinite(timeoutMs) ? `${timeoutMs / 1000} seconds` : "the timeout";
+						throw new Error(appendStatus(text, `Command timed out after ${display}`));
 					}
 					throw err;
 				}
@@ -509,6 +595,15 @@ export function createShellToolDefinition(
 				const { text: outputText, details } = formatOutput(snapshot);
 				if (exitCode !== 0 && exitCode !== null) {
 					throw new Error(appendStatus(outputText, `Command exited with code ${exitCode}`));
+				}
+				if (execOutcome?.backgrounded) {
+					const pid = execOutcome.pid;
+					const defaultSeconds = Math.round(resolveDefaultBashTimeoutMs(spawnContext.env) / 1000);
+					const notice =
+						pid !== undefined
+							? `Command is still running in the background (pid ${pid}) after the default ${defaultSeconds}s budget; it was detached, not killed, and continues running. The tool no longer captures its output. Check on it with \`ps -p ${pid}\` or inspect the files it writes; stop the whole process group with \`kill -TERM -${pid}\`.`
+							: `Command is still running in the background after the default ${defaultSeconds}s budget; it was detached, not killed, and continues running. The tool no longer captures its output; check running processes with \`ps\` and stop it with \`kill\`.`;
+					return { content: [{ type: "text", text: appendStatus(outputText, notice) }], details };
 				}
 				return { content: [{ type: "text", text: outputText }], details };
 			} finally {

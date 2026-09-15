@@ -79,7 +79,7 @@ describe("SessionManager.newSession with custom id", () => {
 		const sessionFile = session.getSessionFile()!;
 		expect(sessionFile).toContain("created-session-id");
 		expect(basename(sessionFile)).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_created-session-id\.jsonl$/);
-		expect(existsSync(sessionFile)).toBe(false);
+		expect(existsSync(sessionFile)).toBe(true);
 	});
 
 	it("generates a UUIDv7 id when creating a branched session", () => {

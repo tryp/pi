@@ -763,11 +763,36 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 	const baselineModels = input.models;
 	let dynamicModels: readonly Model<TApi>[] = [];
 	const fetchModels = input.fetchModels;
+	/**
+	 * Merge a dynamically discovered model over a curated baseline entry with
+	 * the same id without letting vendor placeholder aliases downgrade it.
+	 * Discovery-backed providers (Console Go, et al.) publish deprecated ids
+	 * as identity aliases (zero cost, reasoning disabled, tiny window)
+	 * alongside the real renames; wholesale replacement silently downgrades
+	 * the model the user selected (e.g. opencode-go/deepseek-flash loses its
+	 * reasoning flag and context window). The curated fields protected here
+	 * are name, reasoning, cost, compat, and either side's larger token
+	 * limits; all other fields pass through from the discovery entry.
+	 */
+	const mergeDynamicModel = (base: Model<TApi>, dynamic: Model<TApi>): Model<TApi> => {
+		const mergedModel = { ...base, ...dynamic };
+		if (base.reasoning && !dynamic.reasoning) {
+			// The dynamic entry is a shadow placeholder (or a stray downgrade):
+			// keep the curated identity, capability, and pricing untouched.
+			mergedModel.name = base.name;
+			mergedModel.reasoning = base.reasoning;
+			mergedModel.cost = base.cost;
+		}
+		if (!mergedModel.compat && base.compat) mergedModel.compat = base.compat;
+		mergedModel.maxTokens = Math.max(base.maxTokens, dynamic.maxTokens);
+		mergedModel.contextWindow = Math.max(base.contextWindow, dynamic.contextWindow);
+		return mergedModel;
+	};
 	const currentModels = (): readonly Model<TApi>[] => {
 		const merged = [...baselineModels];
 		for (const model of dynamicModels) {
 			const index = merged.findIndex((entry) => entry.id === model.id);
-			if (index >= 0) merged[index] = model;
+			if (index >= 0) merged[index] = mergeDynamicModel(merged[index], model);
 			else merged.push(model);
 		}
 		return merged;

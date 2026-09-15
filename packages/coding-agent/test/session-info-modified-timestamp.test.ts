@@ -17,8 +17,7 @@ function createSessionFile(path: string): void {
 	};
 	writeFileSync(path, `${JSON.stringify(header)}\n`, "utf8");
 
-	// SessionManager only persists once it has seen at least one assistant message.
-	// Add a minimal assistant entry so subsequent appends are persisted.
+	// Seed the file with a minimal assistant entry so the test starts with a persisted conversation.
 	const mgr = SessionManager.open(path);
 	mgr.appendMessage({
 		role: "assistant",

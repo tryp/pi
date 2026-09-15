@@ -1,5 +1,15 @@
 import { constants as bufferConstants } from "buffer";
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "fs";
+import {
+	appendFileSync,
+	closeSync,
+	existsSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+	writeSync,
+} from "fs";
 import { tmpdir } from "os";
 import { basename, join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -310,6 +320,28 @@ describe("SessionManager.findById", () => {
 		);
 
 		expect(SessionManager.findById(tempDir, "target", tempDir)?.path).toBe(file);
+	});
+});
+
+describe("SessionManager.newSession persistence", () => {
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `session-test-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("creates the session file with a header before the first assistant response", () => {
+		const session = SessionManager.create(tempDir, tempDir);
+		const sessionFile = session.getSessionFile();
+
+		expect(sessionFile).toBeDefined();
+		expect(existsSync(sessionFile!)).toBe(true);
+		expect(readFileSync(sessionFile!, "utf-8").trim().split("\n")).toEqual([JSON.stringify(session.getHeader())]);
 	});
 });
 

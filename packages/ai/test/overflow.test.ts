@@ -1,14 +1,23 @@
 import { describe, expect, it } from "vitest";
 import type { AssistantMessage } from "../src/types.ts";
-import { isContextOverflow, isRecoverableLength } from "../src/utils/overflow.ts";
+import { isBareNoBodyOverflow, isContextOverflow, isRecoverableLength } from "../src/utils/overflow.ts";
 
-function createErrorMessage(errorMessage: string): AssistantMessage {
+function createErrorMessage(
+	errorMessage: string,
+	options?: {
+		api?: AssistantMessage["api"];
+		model?: string;
+		provider?: string;
+		omitErrorMessage?: boolean;
+	},
+): AssistantMessage {
+	const provider = options && "provider" in options ? options.provider : "ollama";
 	return {
 		role: "assistant",
 		content: [],
-		api: "openai-completions",
-		provider: "ollama",
-		model: "qwen3.5:35b",
+		api: options?.api ?? "openai-completions",
+		...(provider === undefined ? {} : { provider }),
+		model: options?.model ?? "qwen3.5:35b",
 		usage: {
 			input: 0,
 			output: 0,
@@ -24,12 +33,63 @@ function createErrorMessage(errorMessage: string): AssistantMessage {
 			},
 		},
 		stopReason: "error",
-		errorMessage,
+		...(options?.omitErrorMessage ? {} : { errorMessage }),
 		timestamp: Date.now(),
-	};
+	} as AssistantMessage;
 }
 
 describe("isContextOverflow", () => {
+	it.each([
+		["400 status code (no body)", 1_000_000],
+		["400 status code (no body)", 131072],
+		["413 (no body)", 131072],
+		["400 (no body)", 131072],
+		["413 status code (no body)", 131072],
+	])(
+		"does not treat bare 4xx no-body errors from non-Cerebras providers as overflow (%s, context %d)",
+		(errorMessage, contextWindow) => {
+			const message = createErrorMessage(errorMessage, {
+				provider: "opencode-go",
+				model: "deepseek-v4-flash",
+			});
+			expect(isContextOverflow(message, contextWindow)).toBe(false);
+		},
+	);
+
+	it("treats Cerebras bare 400 and 413 no-body errors as overflow", () => {
+		for (const errorMessage of ["400 status code (no body)", "413 (no body)"]) {
+			const message = createErrorMessage(errorMessage, { provider: "cerebras" });
+			expect(isContextOverflow(message)).toBe(true);
+			expect(isContextOverflow(message, 131072)).toBe(true);
+		}
+	});
+
+	it("detects Cerebras bare no-body overflow directly", () => {
+		expect(isBareNoBodyOverflow(createErrorMessage("400 status code (no body)", { provider: "cerebras" }))).toBe(
+			true,
+		);
+	});
+
+	it("rejects bare no-body overflow from non-Cerebras providers directly", () => {
+		expect(isBareNoBodyOverflow(createErrorMessage("400 status code (no body)", { provider: "opencode-go" }))).toBe(
+			false,
+		);
+	});
+
+	it("rejects bare no-body overflow without an error message", () => {
+		expect(
+			isBareNoBodyOverflow(
+				createErrorMessage("400 status code (no body)", { provider: "cerebras", omitErrorMessage: true }),
+			),
+		).toBe(false);
+	});
+
+	it("rejects bare no-body overflow without a provider", () => {
+		expect(isBareNoBodyOverflow(createErrorMessage("400 status code (no body)", { provider: undefined }))).toBe(
+			false,
+		);
+	});
+
 	it("detects explicit Ollama prompt-too-long errors", () => {
 		const message = createErrorMessage("400 `prompt too long; exceeded max context length by 100918 tokens`");
 		expect(isContextOverflow(message, 32768)).toBe(true);

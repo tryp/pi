@@ -23,6 +23,7 @@ import type {
 	OpenAICompletionsCompat,
 	OpenAIResponsesCompat,
 } from "../src/types.ts";
+import { isDeepSeekModelId } from "../src/providers/deepseek-compat.ts";
 import {
 	assertExactModelIds,
 	createModelDataManifest,
@@ -927,6 +928,7 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (model.api === "anthropic-messages" && isAnthropicTemperatureUnsupportedModel(model.id)) {
 		mergeAnthropicMessagesCompat(model, { supportsTemperature: false });
 	}
+	// Intentionally separate from replay compatibility: renamed-model thinking-level map selection is out of scope.
 	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
 		mergeThinkingLevelMap(
 			model,
@@ -2018,6 +2020,17 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					}
 				}
 
+				// Keep DeepSeek compatibility based on the shared family predicate so
+				// model renames such as deepseek-flash retain the required replay behavior.
+				if (api === "openai-completions" && isDeepSeekModelId(modelId)) {
+					compat = {
+						...(compat ?? {}),
+						...(variant.provider === "opencode-go"
+							? { requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek" }
+							: { requiresReasoningContentOnAssistantMessages: true }),
+					};
+				}
+
 				if (api === "openai-completions") {
 					compat = { ...(compat ?? {}), maxTokensField: "max_tokens" };
 					if (
@@ -2657,6 +2670,10 @@ async function generateModels() {
 	allModels.push(...antLingModels);
 
 	for (const candidate of allModels) {
+		// This pass is deliberately narrow and id-based. Do not switch it to the
+		// DeepSeek family predicate: it runs across providers without models.dev
+		// metadata, and broadening it would apply DeepSeek wire format to unrelated
+		// proxy/third-party implementations and non-reasoning models.
 		if (
 			candidate.api === "openai-completions" &&
 			candidate.id.includes("deepseek-v4") &&

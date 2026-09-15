@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
@@ -341,17 +341,48 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(events).toEqual([{ type: "session_before_fork", entryId: "missing-entry", position: "at" }]);
 	});
 
-	it("reports why an unflushed session cannot be forked", async () => {
+	it("creates a persisted session file before the first assistant response", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 		const sessionFile = runtime.session.sessionFile;
-		const leafId = runtime.session.sessionManager.getLeafId();
 		expect(sessionFile).toBeDefined();
-		expect(existsSync(sessionFile!)).toBe(false);
-		expect(leafId).toBeTruthy();
+		expect(existsSync(sessionFile!)).toBe(true);
+		expect(SessionManager.open(sessionFile!).getHeader()).toEqual(expect.objectContaining({ type: "session" }));
+	});
 
-		await expect(runtime.fork(leafId!, { position: "at" })).rejects.toThrow(
-			"This session has not been saved yet. Wait for the first assistant response before cloning or forking it.",
+	it("creates one persisted file when starting a session with a parent", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		const parentSession = runtime.session.sessionFile;
+		const sessionDir = runtime.session.sessionManager.getSessionDir();
+		expect(parentSession).toBeDefined();
+		const filesBefore = readdirSync(sessionDir).filter((file) => file.endsWith(".jsonl"));
+
+		const result = await runtime.newSession({ parentSession });
+		expect(result.cancelled).toBe(false);
+		expect(runtime.session.sessionManager.getHeader()).toEqual(
+			expect.objectContaining({ type: "session", parentSession }),
 		);
+		const filesAfter = readdirSync(sessionDir).filter((file) => file.endsWith(".jsonl"));
+		expect(filesAfter).toHaveLength(filesBefore.length + 1);
+	});
+
+	it("creates one persisted file when forking before the first user message", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+
+		const previousSessionFile = runtime.session.sessionFile;
+		const sessionDir = runtime.session.sessionManager.getSessionDir();
+		const filesBefore = readdirSync(sessionDir).filter((file) => file.endsWith(".jsonl"));
+		const userMessage = runtime.session.getUserMessagesForForking()[0]!;
+
+		const result = await runtime.fork(userMessage.entryId);
+		expect(result).toEqual({ cancelled: false, selectedText: "hello" });
+		expect(runtime.session.sessionFile).not.toBe(previousSessionFile);
+		expect(runtime.session.sessionManager.getHeader()).toEqual(
+			expect.objectContaining({ type: "session", parentSession: previousSessionFile }),
+		);
+
+		const filesAfter = readdirSync(sessionDir).filter((file) => file.endsWith(".jsonl"));
+		expect(filesAfter).toHaveLength(filesBefore.length + 1);
 	});
 
 	it("duplicates the current active branch when forking at the current position", async () => {

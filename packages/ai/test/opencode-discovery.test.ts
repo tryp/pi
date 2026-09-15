@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RefreshModelsContext } from "../src/models.ts";
 import { InMemoryModelsStore } from "../src/models-store.ts";
+import { isDeepSeekModelId } from "../src/providers/deepseek-compat.ts";
 import { opencodeProvider } from "../src/providers/opencode.ts";
 import { opencodeGoProvider } from "../src/providers/opencode-go.ts";
 import {
@@ -106,6 +107,107 @@ describe("opencode helpers", () => {
 		expect(mm.api).toBe("openai-completions");
 		const qwen = go.find((m) => m.id === "qwen3.5-plus")!;
 		expect((qwen.compat as any).thinkingFormat).toBe("qwen");
+	});
+
+	it("applies deepseek-v4 compat so replayed assistant messages keep reasoning_content", () => {
+		const entries = [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }];
+
+		// opencode keeps native reasoning effort; only the replay flag is forced
+		const zen = buildModelsFromEntries("opencode", "https://opencode.ai/zen", entries, undefined);
+		for (const m of zen) {
+			expect((m.compat as any).requiresReasoningContentOnAssistantMessages).toBe(true);
+			expect((m.compat as any).thinkingFormat).toBeUndefined();
+			expect(m.api).toBe("openai-completions");
+		}
+
+		// opencode-go gets the full deepseek compat (flag + deepseek thinking format)
+		const go = buildModelsFromEntries("opencode-go", "https://opencode.ai/zen/go", entries, undefined);
+		for (const m of go) {
+			expect((m.compat as any).requiresReasoningContentOnAssistantMessages).toBe(true);
+			expect((m.compat as any).thinkingFormat).toBe("deepseek");
+			expect((m.compat as any).maxTokensField).toBe("max_tokens");
+			expect(m.api).toBe("openai-completions");
+		}
+
+		// non-deepseek opencode-go models are untouched
+		const other = buildModelsFromEntries("opencode-go", "https://opencode.ai/zen/go", [{ id: "glm-5.2" }], undefined);
+		expect((other[0]?.compat as any)?.requiresReasoningContentOnAssistantMessages).toBeUndefined();
+	});
+
+	it("applies DeepSeek compat to renamed models without using interleaved metadata", () => {
+		const providerData = {
+			models: {
+				"deepseek-flash": {
+					id: "deepseek-flash",
+					family: "deepseek-flash",
+					reasoning: true,
+					provider: { npm: null },
+					interleaved: { field: "reasoning_content" },
+				},
+			},
+		};
+
+		const goWithMetadata = buildModelsFromEntries(
+			"opencode-go",
+			"https://opencode.ai/zen/go",
+			[{ id: "deepseek-flash" }],
+			providerData,
+		)[0]!;
+		expect(goWithMetadata.api).toBe("openai-completions");
+		expect((goWithMetadata.compat as any)?.requiresReasoningContentOnAssistantMessages).toBe(true);
+		expect((goWithMetadata.compat as any)?.thinkingFormat).toBe("deepseek");
+
+		const goWithoutMetadata = buildModelsFromEntries(
+			"opencode-go",
+			"https://opencode.ai/zen/go",
+			[{ id: "deepseek-flash" }],
+			undefined,
+		)[0]!;
+		expect(goWithoutMetadata.api).toBe("openai-completions");
+		expect((goWithoutMetadata.compat as any)?.requiresReasoningContentOnAssistantMessages).toBe(true);
+		expect((goWithoutMetadata.compat as any)?.thinkingFormat).toBe("deepseek");
+
+		const nonDeepSeekProviderData = {
+			models: {
+				"glm-5.2": {
+					id: "glm-5.2",
+					provider: { npm: null },
+					interleaved: { field: "reasoning_content" },
+				},
+			},
+		};
+		const nonDeepSeek = buildModelsFromEntries(
+			"opencode-go",
+			"https://opencode.ai/zen/go",
+			[{ id: "glm-5.2" }],
+			nonDeepSeekProviderData,
+		)[0]!;
+		expect((nonDeepSeek.compat as any)?.thinkingFormat).toBeUndefined();
+		expect((nonDeepSeek.compat as any)?.requiresReasoningContentOnAssistantMessages).toBeUndefined();
+
+		const zen = buildModelsFromEntries(
+			"opencode",
+			"https://opencode.ai/zen",
+			[{ id: "deepseek-flash" }],
+			undefined,
+		)[0]!;
+		expect(zen.api).toBe("openai-completions");
+		expect((zen.compat as any)?.requiresReasoningContentOnAssistantMessages).toBe(true);
+		expect((zen.compat as any)?.thinkingFormat).toBeUndefined();
+	});
+
+	it("pins the deliberate scope of the DeepSeek model ID predicate", () => {
+		for (const modelId of [
+			"deepseek-flash",
+			"deepseek-v4-flash",
+			"deepseek-v4-flash-vision-exp",
+			"deepseek-v4-pro",
+		]) {
+			expect(isDeepSeekModelId(modelId)).toBe(true);
+		}
+		for (const modelId of ["glm-5.2", "kimi-k2.6", "qwen3.6-plus", "gpt-5.6-luna", "deepseek/deepseek-v4-flash"]) {
+			expect(isDeepSeekModelId(modelId)).toBe(false);
+		}
 	});
 
 	it("deduplicates and trims entries", () => {
