@@ -310,6 +310,16 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
+export const CONTEXT_GUARD_ERROR_MESSAGE =
+	"Context guard: estimated context exceeds maxContextTokens - compacting before retry";
+
+export class ContextGuardError extends Error {
+	constructor() {
+		super(CONTEXT_GUARD_ERROR_MESSAGE);
+		this.name = "ContextGuardError";
+	}
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1226,6 +1236,14 @@ export class AgentSession {
 			this._compactionAbortController !== undefined ||
 			this._branchSummaryAbortController !== undefined
 		);
+	}
+
+	guardContextForRequest(messages: AgentMessage[]): void {
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled || settings.maxContextTokens == null || this.isCompacting) return;
+		if (estimateMessagesTokens(messages) > settings.maxContextTokens) {
+			throw new ContextGuardError();
+		}
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
