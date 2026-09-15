@@ -365,6 +365,26 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(filesAfter).toHaveLength(filesBefore.length + 1);
 	});
 
+	it("creates one persisted file when forking before the first user message", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("hello");
+
+		const previousSessionFile = runtime.session.sessionFile;
+		const sessionDir = runtime.session.sessionManager.getSessionDir();
+		const filesBefore = readdirSync(sessionDir).filter((file) => file.endsWith(".jsonl"));
+		const userMessage = runtime.session.getUserMessagesForForking()[0]!;
+
+		const result = await runtime.fork(userMessage.entryId);
+		expect(result).toEqual({ cancelled: false, selectedText: "hello" });
+		expect(runtime.session.sessionFile).not.toBe(previousSessionFile);
+		expect(runtime.session.sessionManager.getHeader()).toEqual(
+			expect.objectContaining({ type: "session", parentSession: previousSessionFile }),
+		);
+
+		const filesAfter = readdirSync(sessionDir).filter((file) => file.endsWith(".jsonl"));
+		expect(filesAfter).toHaveLength(filesBefore.length + 1);
+	});
+
 	it("duplicates the current active branch when forking at the current position", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 		await runtime.session.prompt("hello");
