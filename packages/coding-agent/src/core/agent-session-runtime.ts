@@ -235,12 +235,10 @@ export class AgentSessionRuntime {
 
 		const previousSessionFile = this.session.sessionFile;
 		const sessionDir = this.session.sessionManager.getSessionDir();
+		const newSessionOptions = options?.parentSession ? { parentSession: options.parentSession } : undefined;
 		const sessionManager = this.session.sessionManager.isPersisted()
-			? SessionManager.create(this.cwd, sessionDir)
-			: SessionManager.inMemory(this.cwd);
-		if (options?.parentSession) {
-			sessionManager.newSession({ parentSession: options.parentSession });
-		}
+			? SessionManager.create(this.cwd, sessionDir, newSessionOptions)
+			: SessionManager.inMemory(this.cwd, newSessionOptions);
 
 		await this.teardownCurrent("new", sessionManager.getSessionFile());
 		this.apply(
