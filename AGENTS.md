@@ -39,6 +39,31 @@
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 - Never commit unless the user asks.
 
+## Mainline and deployment guidance
+
+The maintained local pi line is merged into `main`. Keep behavior fixes on a
+reviewed branch, merge them into `main`, then deploy from `main`; do not leave
+validated fixes only on a feature branch. For the pinned runtime mirror use:
+
+```bash
+make deploy
+make verify
+make deployed-commit
+```
+
+`make deploy` builds the complete local package dependency closure, syncs the
+runtime mirror, and runs a fresh-process startup smoke test. A successful copy
+or an existing pi process is not deployment proof. Re-run `make verify` after
+any deploy and record the deployment event from pi-session-analysis.
+
+Session creation must persist its header before the first provider response.
+When changing session or fork construction, test immediate file creation and
+single-file fork behavior; do not reintroduce a construct-then-replace
+`SessionManager` path.
+
+For edit-tool changes, preserve actionable drift/disambiguation, missing-file,
+and nested-path guidance. Run the affected edit tests and `git diff --check`.
+
 ## Dependency and Install Security
 
 - Treat npm dep and lockfile changes as reviewed code. Direct external deps stay pinned to exact versions.
