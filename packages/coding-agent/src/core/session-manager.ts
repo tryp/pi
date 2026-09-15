@@ -905,8 +905,7 @@ export class SessionManager {
 				if (statSync(explicitPath).size > 0) {
 					throw new Error(`Session file is not a valid ${APP_NAME} session: ${explicitPath}`);
 				}
-				this.newSession();
-				this.sessionFile = explicitPath;
+				this._initializeNewSession(undefined, explicitPath);
 				this._rewriteFile();
 				this.flushed = true;
 				return;
@@ -923,12 +922,12 @@ export class SessionManager {
 			this.flushed = true;
 		} else {
 			const explicitPath = this.sessionFile;
-			this.newSession();
-			this.sessionFile = explicitPath; // preserve explicit path from --session flag
+			this._initializeNewSession(undefined, explicitPath);
+			this._createFile();
 		}
 	}
 
-	newSession(options?: NewSessionOptions): string | undefined {
+	private _initializeNewSession(options?: NewSessionOptions, sessionFile?: string): void {
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
@@ -950,8 +949,15 @@ export class SessionManager {
 		this.flushed = false;
 
 		if (this.persist) {
-			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-			this.sessionFile = join(this.getSessionDir(), `${fileTimestamp}_${this.sessionId}.jsonl`);
+			this.sessionFile =
+				sessionFile ?? join(this.getSessionDir(), `${timestamp.replace(/[:.]/g, "-")}_${this.sessionId}.jsonl`);
+		}
+	}
+
+	newSession(options?: NewSessionOptions): string | undefined {
+		this._initializeNewSession(options);
+		if (this.persist) {
+			this._createFile();
 		}
 		return this.sessionFile;
 	}
@@ -987,6 +993,20 @@ export class SessionManager {
 		} finally {
 			closeSync(fd);
 		}
+	}
+
+	/** Create a new session file without replacing a file created by another session. */
+	private _createFile(): void {
+		if (!this.persist || !this.sessionFile) return;
+		const fd = openSync(this.sessionFile, "wx");
+		try {
+			for (const entry of this.fileEntries) {
+				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+			}
+		} finally {
+			closeSync(fd);
+		}
+		this.flushed = true;
 	}
 
 	isPersisted(): boolean {
@@ -1476,18 +1496,10 @@ export class SessionManager {
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 
-			// Only write the file now if it contains an assistant message.
-			// Otherwise defer to _persist(), which creates the file on the
-			// first assistant response, matching the newSession() contract
-			// and avoiding the duplicate-header bug when _persist()'s
-			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-			if (hasAssistant) {
-				this._rewriteFile();
-				this.flushed = true;
-			} else {
-				this.flushed = false;
-			}
+			// Create the file before the first assistant response so a provider
+			// stall leaves the new branch resumable. _createFile() also marks
+			// the entries as flushed, preventing _persist() from duplicating them.
+			this._createFile();
 
 			return newSessionFile;
 		}
