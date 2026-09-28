@@ -1618,6 +1618,92 @@ describe("agentLoop with AgentMessage", () => {
 	});
 });
 
+describe("stream inactivity watchdog", () => {
+	it("emits stream_inactivity when the stream stops producing events", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			streamInactivityTimeoutMs: 15,
+		};
+		let mockStream: MockAssistantStream | undefined;
+		const streamFn = () => {
+			mockStream = new MockAssistantStream();
+			return mockStream;
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("hello")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+			if (event.type === "stream_inactivity") {
+				mockStream?.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "done" }]),
+				});
+			}
+		}
+		expect(events).toContainEqual({
+			type: "stream_inactivity",
+			timeoutMs: 15,
+			phase: "streaming",
+			elapsedMs: expect.any(Number),
+		});
+	});
+
+	it("reports inactivity while awaiting stream headers", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			streamInactivityTimeoutMs: 20,
+		};
+		const streamFn = async () => {
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			const stream = new MockAssistantStream();
+			queueMicrotask(() =>
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "done" }]),
+				}),
+			);
+			return stream;
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("hello")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		expect(events.filter((event) => event.type === "stream_inactivity")).toMatchObject([
+			{ type: "stream_inactivity", timeoutMs: 20, phase: "await_headers" },
+		]);
+	});
+
+	it("clears the watchdog after a settled stream", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			streamInactivityTimeoutMs: 15,
+		};
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() =>
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: createAssistantMessage([{ type: "text", text: "done" }]),
+				}),
+			);
+			return stream;
+		};
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("hello")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		expect(events.some((event) => event.type === "stream_inactivity")).toBe(false);
+	});
+});
+
 describe("agentLoopContinue with AgentMessage", () => {
 	it("should throw when context has no messages", () => {
 		const context: AgentContext = {
