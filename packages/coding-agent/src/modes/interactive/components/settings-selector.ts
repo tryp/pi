@@ -19,6 +19,7 @@ import type {
 	TuiMode,
 	WarningSettings,
 } from "../../../core/settings-manager.ts";
+import { STREAM_INACTIVITY_TIMEOUT_CHOICES, type StreamInactivityAction } from "../../../core/stream-watchdog.ts";
 import { getSettingsListTheme, parseAutoThemeSetting, type TerminalTheme, theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyDisplayText } from "./keybinding-hints.ts";
@@ -60,6 +61,8 @@ export interface SettingsConfig {
 	followUpMode: "all" | "one-at-a-time";
 	transport: Transport;
 	httpIdleTimeoutMs: number;
+	streamInactivityTimeoutMs: number;
+	onStreamInactivity: StreamInactivityAction;
 	thinkingLevel: ThinkingLevel;
 	availableThinkingLevels: ThinkingLevel[];
 	modelThinkingLevels: Record<string, ThinkingLevel>;
@@ -99,6 +102,8 @@ export interface SettingsCallbacks {
 	onFollowUpModeChange: (mode: "all" | "one-at-a-time") => void;
 	onTransportChange: (transport: Transport) => void;
 	onHttpIdleTimeoutMsChange: (timeoutMs: number) => void;
+	onStreamInactivityTimeoutMsChange: (timeoutMs: number) => void;
+	onStreamInactivityChange: (action: StreamInactivityAction) => void;
 	onModelThinkingLevelChange: (provider: string, modelId: string, level: ThinkingLevel) => void;
 	onModelThinkingLevelRemove: (provider: string, modelId: string) => void;
 	onThemeChange: (theme: string) => void;
@@ -493,6 +498,23 @@ export class SettingsSelectorComponent extends Container {
 				values: HTTP_IDLE_TIMEOUT_CHOICES.map((choice) => choice.label),
 			},
 			{
+				id: "stream-inactivity-timeout",
+				label: "Stream inactivity timeout",
+				description:
+					"Show a warning when the model stream emits no events for this long. Disabled stops monitoring.",
+				currentValue:
+					STREAM_INACTIVITY_TIMEOUT_CHOICES.find((choice) => choice.timeoutMs === config.streamInactivityTimeoutMs)
+						?.label ?? `${Math.ceil(config.streamInactivityTimeoutMs / 1000)} seconds`,
+				values: STREAM_INACTIVITY_TIMEOUT_CHOICES.map((choice) => choice.label),
+			},
+			{
+				id: "on-stream-inactivity",
+				label: "On stream inactivity",
+				description: "Choose whether an inactivity warning only notifies or also aborts the current turn.",
+				currentValue: config.onStreamInactivity,
+				values: ["notify", "abort"],
+			},
+			{
 				id: "hide-thinking",
 				label: "Hide thinking",
 				description: "Hide thinking blocks in assistant responses",
@@ -859,6 +881,14 @@ export class SettingsSelectorComponent extends Container {
 						}
 						break;
 					}
+					case "stream-inactivity-timeout": {
+						const choice = STREAM_INACTIVITY_TIMEOUT_CHOICES.find((item) => item.label === newValue);
+						if (choice) callbacks.onStreamInactivityTimeoutMsChange(choice.timeoutMs);
+						break;
+					}
+					case "on-stream-inactivity":
+						callbacks.onStreamInactivityChange(newValue as StreamInactivityAction);
+						break;
 					case "hide-thinking":
 						callbacks.onHideThinkingBlockChange(newValue === "true");
 						break;
