@@ -375,6 +375,7 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _pendingAbortReason: "user" | "stream_inactivity" | undefined;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -613,6 +614,19 @@ export class AgentSession {
 		}
 	}
 
+	private _appendDiagnostic(data: Record<string, unknown>): void {
+		try {
+			this.sessionManager.appendCustomEntry("pi.session_diagnostic", { timestamp: Date.now(), ...data });
+		} catch {
+			// Diagnostics must never interrupt the agent lifecycle.
+		}
+	}
+
+	private _emitAutoRetryEnd(event: Extract<AgentSessionEvent, { type: "auto_retry_end" }>): void {
+		this._appendDiagnostic({ kind: "auto_retry_end", ...event });
+		this._emit(event);
+	}
+
 	private _emitQueueUpdate(): void {
 		this._emit({
 			type: "queue_update",
@@ -840,11 +854,27 @@ export class AgentSession {
 			}
 		}
 
+		if (event.type === "stream_inactivity") {
+			const model = this.agent.state.model;
+			this._appendDiagnostic({
+				kind: "stream_inactivity",
+				timeoutMs: event.timeoutMs,
+				elapsedMs: event.elapsedMs,
+				phase: event.phase,
+				provider: model.provider,
+				model: model.id,
+			});
+		}
+
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
 
 		// Notify all listeners
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+		if (event.type === "stream_inactivity" && this.settingsManager.getOnStreamInactivity() === "abort") {
+			this._pendingAbortReason = "stream_inactivity";
+			this.agent.abort();
+		}
 
 		// Handle session persistence
 		if (event.type === "message_end") {
@@ -876,6 +906,22 @@ export class AgentSession {
 				this._lastAssistantMessage = event.message;
 
 				const assistantMsg = event.message as AssistantMessage;
+				if (assistantMsg.stopReason === "aborted") {
+					this._appendDiagnostic({
+						kind: "turn_aborted",
+						reason: this._pendingAbortReason ?? "unknown",
+						contentTypes: assistantMsg.content.map((content) => content.type),
+						toolCallIds: assistantMsg.content
+							.filter(
+								(content): content is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
+									content.type === "toolCall",
+							)
+							.map((content) => content.id),
+						provider: assistantMsg.provider,
+						model: assistantMsg.model,
+					});
+					this._pendingAbortReason = undefined;
+				}
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {
 					this._overflowRecoveryAttempted = false;
 				}
@@ -883,7 +929,7 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
-					this._emit({
+					this._emitAutoRetryEnd({
 						type: "auto_retry_end",
 						success: true,
 						attempt: this._retryAttempt,
@@ -1384,7 +1430,7 @@ export class AgentSession {
 		}
 
 		if (msg.stopReason === "error" && this._retryAttempt > 0) {
-			this._emit({
+			this._emitAutoRetryEnd({
 				type: "auto_retry_end",
 				success: false,
 				attempt: this._retryAttempt,
@@ -1942,6 +1988,7 @@ export class AgentSession {
 		this._cancelQueuedMessageWake();
 		if (settlementWasActive) this._queuedMessageWakePending = true;
 		this.abortRetry();
+		if (this.isStreaming) this._pendingAbortReason = "user";
 		this.agent.abort();
 
 		// An active wake owns the continuation that is currently running. Wait for
@@ -3259,13 +3306,15 @@ export class AgentSession {
 
 		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
 
-		this._emit({
-			type: "auto_retry_start",
+		const retryStart = {
+			type: "auto_retry_start" as const,
 			attempt: this._retryAttempt,
 			maxAttempts: settings.maxRetries,
 			delayMs,
 			errorMessage: message.errorMessage || "Unknown error",
-		});
+		};
+		this._appendDiagnostic({ kind: "auto_retry_start", ...retryStart });
+		this._emit(retryStart);
 
 		// Remove error message from agent state (keep in session for history)
 		const messages = this.agent.state.messages;
@@ -3281,7 +3330,7 @@ export class AgentSession {
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this._retryAttempt;
 			this._retryAttempt = 0;
-			this._emit({
+			this._emitAutoRetryEnd({
 				type: "auto_retry_end",
 				success: false,
 				attempt,

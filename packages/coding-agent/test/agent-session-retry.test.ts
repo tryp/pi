@@ -74,6 +74,9 @@ describe("AgentSession retry", () => {
 		delayAssistantMessageEndMs?: number;
 		maxContextTokens?: number;
 		compactionEnabled?: boolean;
+		streamInactivityTimeoutMs?: number;
+		onStreamInactivity?: "notify" | "abort";
+		hangUntilAbort?: boolean;
 	}) {
 		const failCount = options?.failCount ?? 1;
 		const maxRetries = options?.maxRetries ?? 3;
@@ -84,10 +87,30 @@ describe("AgentSession retry", () => {
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "Test", tools: [] },
-			streamFn: () => {
+			streamInactivityTimeoutMs: options?.streamInactivityTimeoutMs,
+			streamFn: (_model, _context, streamOptions) => {
 				callCount++;
 				const stream = new MockAssistantStream();
-				queueMicrotask(() => {
+				if (options?.hangUntilAbort) {
+					const partial = createAssistantMessage("", {
+						content: [{ type: "toolCall", id: "call-stalled", name: "run", arguments: {} }],
+						stopReason: "toolUse",
+					});
+					stream.push({ type: "start", partial });
+					streamOptions?.signal?.addEventListener(
+						"abort",
+						() => {
+							const aborted = createAssistantMessage("", {
+								content: [{ type: "toolCall", id: "call-stalled", name: "run", arguments: {} }],
+								stopReason: "aborted",
+							});
+							stream.push({ type: "error", reason: "aborted", error: aborted });
+						},
+						{ once: true },
+					);
+					return stream;
+				}
+				const sendResult = () => {
 					if (callCount <= failCount) {
 						const msg = createAssistantMessage("", {
 							stopReason: "error",
@@ -100,7 +123,9 @@ describe("AgentSession retry", () => {
 						stream.push({ type: "start", partial: msg });
 						stream.push({ type: "done", reason: "stop", message: msg });
 					}
-				});
+				};
+				if (options?.streamInactivityTimeoutMs) setTimeout(sendResult, 50);
+				else queueMicrotask(sendResult);
 				return stream;
 			},
 		});
@@ -110,7 +135,13 @@ describe("AgentSession retry", () => {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
-		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries, baseDelayMs: 1 } });
+		settingsManager.applyOverrides({
+			retry: { enabled: true, maxRetries, baseDelayMs: 1 },
+			...(options?.streamInactivityTimeoutMs !== undefined
+				? { streamInactivityTimeoutMs: options.streamInactivityTimeoutMs }
+				: {}),
+			...(options?.onStreamInactivity ? { onStreamInactivity: options.onStreamInactivity } : {}),
+		});
 		if (options?.maxContextTokens !== undefined || options?.compactionEnabled !== undefined) {
 			settingsManager.applyOverrides({
 				compaction: {
@@ -142,6 +173,70 @@ describe("AgentSession retry", () => {
 
 		return { session, getCallCount: () => callCount };
 	}
+
+	it("persists retry lifecycle diagnostics without prompt text", async () => {
+		const created = await createSession({ failCount: 1 });
+		await created.session.prompt("private prompt text");
+
+		const diagnostics = created.session.sessionManager.getEntries().filter((entry) => entry.type === "custom");
+		const retryEntries = diagnostics.filter((entry) => entry.customType === "pi.session_diagnostic");
+		expect(retryEntries.map((entry) => (entry.data as { kind: string }).kind)).toEqual([
+			"auto_retry_start",
+			"auto_retry_end",
+		]);
+		expect(JSON.stringify(retryEntries)).not.toContain("private prompt text");
+	});
+
+	it("records stream inactivity without aborting by default", async () => {
+		const created = await createSession({ failCount: 0, streamInactivityTimeoutMs: 10 });
+		const seen: string[] = [];
+		created.session.subscribe((event) => {
+			if (event.type === "stream_inactivity") seen.push(event.phase);
+		});
+
+		await created.session.prompt("private prompt text");
+
+		const diagnostics = created.session.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic");
+		expect(seen).toEqual(["streaming"]);
+		expect(
+			diagnostics.some(
+				(entry) => entry.type === "custom" && (entry.data as { kind?: string }).kind === "stream_inactivity",
+			),
+		).toBe(true);
+		expect(
+			diagnostics.some(
+				(entry) => entry.type === "custom" && (entry.data as { kind?: string }).kind === "turn_aborted",
+			),
+		).toBe(false);
+	});
+
+	it("aborts an inactive stream only when configured and records the pending tool call", async () => {
+		const created = await createSession({
+			failCount: 0,
+			streamInactivityTimeoutMs: 10,
+			onStreamInactivity: "abort",
+			hangUntilAbort: true,
+		});
+		await created.session.prompt("private prompt text");
+
+		const diagnostics = created.session.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic");
+		const aborted = diagnostics.find(
+			(entry) => entry.type === "custom" && (entry.data as { kind?: string }).kind === "turn_aborted",
+		);
+		expect(aborted?.type).toBe("custom");
+		if (aborted?.type === "custom") {
+			expect(aborted.data).toMatchObject({
+				kind: "turn_aborted",
+				reason: "stream_inactivity",
+				toolCallIds: ["call-stalled"],
+			});
+		}
+		expect(JSON.stringify(diagnostics)).not.toContain("private prompt text");
+	});
 
 	it("retries after a transient error and succeeds", async () => {
 		const created = await createSession({ failCount: 1 });
