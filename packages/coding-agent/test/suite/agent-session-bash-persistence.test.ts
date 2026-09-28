@@ -278,14 +278,22 @@ describe("AgentSession bash and persistence characterization", () => {
 		await harness.session.abort();
 		await promptPromise;
 
-		const lastEntry = harness.sessionManager.getEntries()[harness.sessionManager.getEntries().length - 1];
-		expect(lastEntry?.type).toBe("message");
-		if (lastEntry?.type === "message") {
-			expect(lastEntry.message.role).toBe("assistant");
-			if (lastEntry.message.role === "assistant") {
-				expect(lastEntry.message.stopReason).toBe("aborted");
+		const entries = harness.sessionManager.getEntries();
+		const lastMessageEntry = [...entries].reverse().find((entry) => entry.type === "message");
+		expect(lastMessageEntry?.type).toBe("message");
+		if (lastMessageEntry?.type === "message") {
+			expect(lastMessageEntry.message.role).toBe("assistant");
+			if (lastMessageEntry.message.role === "assistant") {
+				expect(lastMessageEntry.message.stopReason).toBe("aborted");
 			}
 		}
+
+		const trailingEntry = entries.at(-1);
+		expect(trailingEntry).toMatchObject({
+			type: "custom",
+			customType: "pi.session_diagnostic",
+			data: { kind: "turn_aborted", reason: "user" },
+		});
 	});
 
 	it("records bash output through custom operations", async () => {
