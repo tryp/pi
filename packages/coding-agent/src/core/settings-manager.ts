@@ -9,6 +9,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
+import { DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS, type StreamInactivityAction } from "./stream-watchdog.ts";
 
 export interface ContextSettings {
 	/**
@@ -166,6 +167,8 @@ export interface Settings {
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
 	httpProxy?: string; // Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for Pi-managed HTTP clients
 	httpIdleTimeoutMs?: number; // HTTP header/body idle timeout in milliseconds; 0 disables it
+	streamInactivityTimeoutMs?: number; // Assistant stream event inactivity timeout in milliseconds; 0 disables it
+	onStreamInactivity?: StreamInactivityAction; // default: "notify"; optionally abort stalled streams
 	websocketConnectTimeoutMs?: number; // WebSocket connect/open handshake timeout in milliseconds; 0 disables it
 	tuiMode?: TuiMode; // default: "regular"
 	fullscreenExitOutput?: FullscreenExitOutput; // default: "transcript"; no effect in regular TUI mode
@@ -947,6 +950,40 @@ export class SettingsManager {
 
 	getHttpIdleTimeoutMs(): number {
 		return parseTimeoutSetting(this.settings.httpIdleTimeoutMs, "httpIdleTimeoutMs") ?? DEFAULT_HTTP_IDLE_TIMEOUT_MS;
+	}
+
+	getStreamInactivityTimeoutMs(): number {
+		const value = this.settings.streamInactivityTimeoutMs;
+		if (value === undefined) return DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS;
+		if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+			throw new Error(`Invalid streamInactivityTimeoutMs setting: ${String(value)}`);
+		}
+		return Math.floor(value);
+	}
+
+	setStreamInactivityTimeoutMs(timeoutMs: number): void {
+		if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+			throw new Error(`Invalid streamInactivityTimeoutMs setting: ${String(timeoutMs)}`);
+		}
+		this.globalSettings.streamInactivityTimeoutMs = Math.floor(timeoutMs);
+		this.markModified("streamInactivityTimeoutMs");
+		this.save();
+	}
+
+	getOnStreamInactivity(): StreamInactivityAction {
+		const value = this.settings.onStreamInactivity;
+		if (value === undefined) return "notify";
+		if (value === "notify" || value === "abort") return value;
+		throw new Error(`Invalid onStreamInactivity setting: ${String(value)}`);
+	}
+
+	setOnStreamInactivity(action: StreamInactivityAction): void {
+		if (action !== "notify" && action !== "abort") {
+			throw new Error(`Invalid onStreamInactivity setting: ${String(action)}`);
+		}
+		this.globalSettings.onStreamInactivity = action;
+		this.markModified("onStreamInactivity");
+		this.save();
 	}
 
 	setHttpIdleTimeoutMs(timeoutMs: number): void {

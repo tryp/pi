@@ -174,6 +174,8 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 | `followUpMode` | string | `"one-at-a-time"` | How follow-up messages are sent: `"all"` or `"one-at-a-time"` |
 | `transport` | string | `"auto"` | Preferred transport for providers that support multiple transports: `"sse"`, `"websocket"`, `"websocket-cached"`, or `"auto"` |
 | `httpIdleTimeoutMs` | number | `300000` | HTTP header/body idle timeout in milliseconds, also used by providers with explicit stream idle timeouts. Set to `0` to disable. |
+| `streamInactivityTimeoutMs` | number | `120000` | Assistant stream inactivity warning timeout in milliseconds. Set to `0` to disable. |
+| `onStreamInactivity` | string | `"notify"` | Whether a stream inactivity warning only notifies or aborts the turn (`"notify"` or `"abort"`) |
 | `websocketConnectTimeoutMs` | number | `15000` | WebSocket connect/open handshake timeout in milliseconds for providers that support WebSocket transports. Set to `0` to disable. |
 
 ### Terminal & Images

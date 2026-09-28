@@ -4,6 +4,7 @@ import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS } from "../src/core/http-dispatcher.ts";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
+import { DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS } from "../src/core/stream-watchdog.ts";
 
 describe("SettingsManager", () => {
 	const testDir = join(process.cwd(), "test-settings-tmp");
@@ -395,6 +396,36 @@ describe("SettingsManager", () => {
 			await manager.flush();
 			const reloaded = SettingsManager.create(projectDir, agentDir);
 			expect(reloaded.getHideQueuePanel()).toBe(false);
+		});
+	});
+
+	describe("stream inactivity settings", () => {
+		it("defaults to notify with a two-minute timeout and supports disabled/project overrides", () => {
+			const defaults = SettingsManager.create(projectDir, agentDir);
+			expect(defaults.getStreamInactivityTimeoutMs()).toBe(DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS);
+			expect(defaults.getOnStreamInactivity()).toBe("notify");
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ streamInactivityTimeoutMs: 0 }));
+			expect(SettingsManager.create(projectDir, agentDir).getStreamInactivityTimeoutMs()).toBe(0);
+			writeFileSync(
+				join(projectDir, ".pi", "settings.json"),
+				JSON.stringify({ streamInactivityTimeoutMs: 2500, onStreamInactivity: "abort" }),
+			);
+			const overridden = SettingsManager.create(projectDir, agentDir);
+			expect(overridden.getStreamInactivityTimeoutMs()).toBe(2500);
+			expect(overridden.getOnStreamInactivity()).toBe("abort");
+		});
+
+		it("rejects invalid timeout and action settings", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ streamInactivityTimeoutMs: -1 }));
+			const invalidTimeout = SettingsManager.create(projectDir, agentDir);
+			expect(() => invalidTimeout.getStreamInactivityTimeoutMs()).toThrow(
+				"Invalid streamInactivityTimeoutMs setting",
+			);
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ onStreamInactivity: "ignore" }));
+			const invalidAction = SettingsManager.create(projectDir, agentDir);
+			expect(() => invalidAction.getOnStreamInactivity()).toThrow("Invalid onStreamInactivity setting");
 		});
 	});
 

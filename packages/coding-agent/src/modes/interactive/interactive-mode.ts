@@ -146,6 +146,7 @@ import {
 	CompactionStatusIndicator,
 	IdleStatus,
 	RetryStatusIndicator,
+	StalledStatusIndicator,
 	type StatusIndicator,
 	WorkingStatusIndicator,
 } from "./components/status-indicator.ts";
@@ -1991,6 +1992,7 @@ export class InteractiveMode {
 	private applyRuntimeSettings(): void {
 		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
+		this.session.agent.streamInactivityTimeoutMs = this.settingsManager.getStreamInactivityTimeoutMs();
 		this.applyFullscreenScrollbarSetting();
 		if (this.renderer instanceof TuiAltScreen) {
 			this.renderer.setCopyOnSelect(this.settingsManager.getFullscreenCopyOnSelect());
@@ -3401,6 +3403,7 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				this.clearStatusIndicator("working");
+				this.clearStatusIndicator("stalled");
 				if (this.streamingComponent) {
 					this.chatContainer.removeChild(this.streamingComponent);
 					this.streamingComponent = undefined;
@@ -3412,6 +3415,7 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
+				this.clearStatusIndicator("stalled");
 				await this.checkShutdownRequested();
 				break;
 
@@ -3479,6 +3483,11 @@ export class InteractiveMode {
 				this.ui.requestRender();
 				break;
 			}
+
+			case "stream_inactivity":
+				this.showStatusIndicator(new StalledStatusIndicator(this.ui, event.phase));
+				this.ui.requestRender();
+				break;
 
 			case "auto_retry_start": {
 				// Set up escape to abort retry
@@ -4577,6 +4586,8 @@ export class InteractiveMode {
 					followUpMode: this.session.followUpMode,
 					transport: this.settingsManager.getTransport(),
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
+					streamInactivityTimeoutMs: this.settingsManager.getStreamInactivityTimeoutMs(),
+					onStreamInactivity: this.settingsManager.getOnStreamInactivity(),
 					thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
 					availableThinkingLevels: [...THINKING_LEVEL_OPTIONS],
 					modelThinkingLevels: this.settingsManager.getAllModelThinkingLevels(),
@@ -4649,6 +4660,17 @@ export class InteractiveMode {
 						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
 						configureHttpDispatcher(timeoutMs);
 						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
+					},
+					onStreamInactivityTimeoutMsChange: (timeoutMs) => {
+						this.settingsManager.setStreamInactivityTimeoutMs(timeoutMs);
+						this.session.agent.streamInactivityTimeoutMs = timeoutMs;
+						this.showStatus(
+							`Stream inactivity timeout: ${timeoutMs === 0 ? "disabled" : `${Math.ceil(timeoutMs / 1000)} seconds`}`,
+						);
+					},
+					onStreamInactivityChange: (action) => {
+						this.settingsManager.setOnStreamInactivity(action);
+						this.showStatus(`Stream inactivity action: ${action}`);
 					},
 					onModelThinkingLevelChange: (provider, modelId, level) => {
 						this.settingsManager.setModelThinkingLevel(provider, modelId, level);

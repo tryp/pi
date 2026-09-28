@@ -18,10 +18,14 @@ describe("SettingsSelectorComponent", () => {
 		const onExitOutputChange = vi.fn();
 		const onScrollbarChange = vi.fn();
 		const onCopyOnSelectChange = vi.fn();
+		const onStreamInactivityTimeoutMsChange = vi.fn();
+		const onStreamInactivityChange = vi.fn();
 		const config = {
 			fullscreenExitOutput: "transcript",
 			fullscreenScrollbar: "auto",
 			fullscreenCopyOnSelect: true,
+			streamInactivityTimeoutMs: 120000,
+			onStreamInactivity: "notify",
 			warnings: {},
 			defaultModel: "not set",
 			availableDefaultModels: [],
@@ -33,6 +37,8 @@ describe("SettingsSelectorComponent", () => {
 			onFullscreenExitOutputChange: onExitOutputChange,
 			onFullscreenScrollbarChange: onScrollbarChange,
 			onFullscreenCopyOnSelectChange: onCopyOnSelectChange,
+			onStreamInactivityTimeoutMsChange,
+			onStreamInactivityChange,
 		} as unknown as SettingsCallbacks;
 
 		const cycle = (label: string, count: number) => {
@@ -47,5 +53,9 @@ describe("SettingsSelectorComponent", () => {
 		expect(onScrollbarChange.mock.calls.flat()).toEqual(["always", "hidden", "auto"]);
 		cycle("Fullscreen copy on select", 2);
 		expect(onCopyOnSelectChange.mock.calls.flat()).toEqual([false, true]);
+		cycle("Stream inactivity timeout", 1);
+		expect(onStreamInactivityTimeoutMsChange.mock.calls.flat()).toEqual([300000]);
+		cycle("On stream inactivity", 1);
+		expect(onStreamInactivityChange.mock.calls.flat()).toEqual(["abort"]);
 	});
 });
