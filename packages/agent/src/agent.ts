@@ -119,6 +119,7 @@ export interface AgentOptions {
 	thinkingBudgets?: ThinkingBudgets;
 	transport?: Transport;
 	maxRetryDelayMs?: number;
+	streamInactivityTimeoutMs?: number;
 	toolExecution?: ToolExecutionMode;
 }
 
@@ -222,6 +223,8 @@ export class Agent {
 	public transport: Transport;
 	/** Optional cap for provider-requested retry delays. */
 	public maxRetryDelayMs?: number;
+	/** Maximum time without assistant stream events before emitting a diagnostic event. 0 disables the watchdog. */
+	public streamInactivityTimeoutMs?: number;
 	/** Tool execution strategy for assistant messages that contain multiple tool calls. */
 	public toolExecution: ToolExecutionMode;
 
@@ -246,6 +249,7 @@ export class Agent {
 		this.thinkingBudgets = runtimeOptions.thinkingBudgets;
 		this.transport = runtimeOptions.transport ?? "auto";
 		this.maxRetryDelayMs = runtimeOptions.maxRetryDelayMs;
+		this.streamInactivityTimeoutMs = runtimeOptions.streamInactivityTimeoutMs;
 		this.toolExecution = runtimeOptions.toolExecution ?? "parallel";
 	}
 
@@ -473,6 +477,7 @@ export class Agent {
 			transport: this.transport,
 			thinkingBudgets: this.thinkingBudgets,
 			maxRetryDelayMs: this.maxRetryDelayMs,
+			streamInactivityTimeoutMs: this.streamInactivityTimeoutMs,
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
