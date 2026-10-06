@@ -273,13 +273,22 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		newLines = this.applyLineResets(newLines);
 
 		// Helper to clear scrollback and viewport and render all new lines
-		const fullRender = (clear: boolean): void => {
+		// clearScrollback defaults to clear: a full render that clears the screen
+		// usually also invalidates the scrollback. Height-only changes are the
+		// exception - see the call site below.
+		const fullRender = (clear: boolean, clearScrollback: boolean = clear): void => {
 			this.fullRedrawCount += 1;
 			const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
 			output.append("\x1b[?2026h"); // Begin synchronized output
 			if (clear) {
 				output.append(this.deleteKittyImages(this.previousKittyImageIds));
-				output.append("\x1b[2J\x1b[H\x1b[3J"); // Clear screen, home, then clear scrollback
+				// Clear screen and home. The scrollback is only discarded when the
+				// width changed: re-wrapped scrollback lines are unreadable garbage,
+				// but on a height-only change they are still valid. Wiping them
+				// there destroys scrollback the user can no longer get back, and
+				// height changes are common under multiplexers, which resize a
+				// pane whenever the focused client changes size.
+				output.append(clearScrollback ? "\x1b[2J\x1b[H\x1b[3J" : "\x1b[2J\x1b[H");
 			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) output.append("\r\n");
@@ -340,12 +349,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			return;
 		}
 
-		// Height changes normally need a full re-render to keep the visible viewport aligned,
-		// but Termux changes height when the software keyboard shows or hides.
-		// In that environment, a full redraw causes the entire history to replay on every toggle.
+		// Height changes need a full re-render to keep the visible viewport aligned,
+		// but they must not discard the scrollback: the content there did not change,
+		// only how much of it is visible. Termux is handled separately because its
+		// height changes (software keyboard) can skip the re-render entirely - there,
+		// a full redraw causes the entire history to replay on every toggle.
 		if (heightChanged && !isTermuxSession()) {
 			logRedraw(`terminal height changed (${this.previousHeight} -> ${height})`);
-			fullRender(true);
+			fullRender(true, false);
 			return;
 		}
 
