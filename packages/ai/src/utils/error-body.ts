@@ -15,6 +15,9 @@
 
 export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 
+/** Depth bound for the formatted `cause` chain. */
+export const MAX_ERROR_CAUSE_DEPTH = 5;
+
 export interface NormalizedProviderError {
 	/** HTTP status code, when one could be extracted from the SDK error object. */
 	status?: number;
@@ -24,6 +27,20 @@ export interface NormalizedProviderError {
 	message: string;
 	/** True when `message` already contains the body (no separate body to add). */
 	messageCarriesBody: boolean;
+	/**
+	 * `error.name`, preserved for origin classification. A transport abort
+	 * (`AbortError`) and a provider rejection can both arrive as an `Error` whose
+	 * message is uninformative; the name is what distinguishes them.
+	 */
+	name?: string;
+	/** `error.code`, preserved for origin classification (e.g. 20, `ECONNRESET`). */
+	code?: string | number;
+	/**
+	 * Innermost `error.cause` chain, formatted and bounded. Provider SDKs wrap the
+	 * real abort under generic layers (`APIConnectionError: Connection error.`),
+	 * so the useful cause is at the bottom of the chain, not on `error`.
+	 */
+	cause?: string;
 }
 
 type SdkErrorShape = Error & {
@@ -50,7 +67,47 @@ export function normalizeProviderError(error: unknown): NormalizedProviderError 
 		body,
 		message: error.message,
 		messageCarriesBody,
+		name: error.name || undefined,
+		code:
+			typeof (error as Error & { code?: unknown }).code === "string" ||
+			typeof (error as Error & { code?: unknown }).code === "number"
+				? ((error as Error & { code?: string | number }).code as string | number)
+				: undefined,
+		cause: formatErrorCause(error.cause),
 	} satisfies NormalizedProviderError;
+}
+
+/**
+ * Formats the `cause` chain bottom-up, innermost last, so a wrapped transport
+ * abort reads as `APIConnectionError: Connection error. <- AbortError: This
+ * operation was aborted`. Bounded in both depth and length: a cyclic or
+ * enormous cause chain must not turn an error message into a transcript.
+ */
+export function formatErrorCause(cause: unknown, maxDepth = MAX_ERROR_CAUSE_DEPTH): string | undefined {
+	const segments: string[] = [];
+	let current = cause;
+	for (let depth = 0; depth < maxDepth; depth++) {
+		if (current === undefined || current === null) break;
+		if (current instanceof Error) {
+			segments.push(`${current.name}: ${current.message}`);
+		} else {
+			segments.push(formatThrownCause(current));
+		}
+		if (typeof current !== "object" || !("cause" in current)) break;
+		current = (current as { cause?: unknown }).cause;
+	}
+	if (segments.length === 0) return undefined;
+	return truncateErrorText(segments.join(" <- "), MAX_PROVIDER_ERROR_BODY_CHARS);
+}
+
+function formatThrownCause(value: unknown): string {
+	if (typeof value === "object" && value !== null && "name" in value && "message" in value) {
+		const named = value as { name?: unknown; message?: unknown };
+		if (typeof named.name === "string" && typeof named.message === "string") {
+			return `${named.name}: ${named.message}`;
+		}
+	}
+	return safeJsonStringify(value);
 }
 
 /**
