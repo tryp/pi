@@ -266,6 +266,54 @@ describe("pre-send compaction gate", () => {
 	});
 });
 
+it("recovers a refusal that crosses the limit only once tool schemas are counted", async () => {
+	const messages = [userMessage("m".repeat(4_000))];
+	// A tool schema large enough that the messages-only estimate stays under the limit
+	// while the estimate the guard actually uses goes over it. This is the common shape
+	// of a refusal: the guard fires the moment the estimate crosses the line, so the
+	// overshoot is usually smaller than the tool schemas.
+	const tools = [{ name: "t", description: "x".repeat(4_000), parameters: {} }];
+	const messagesOnly = estimateContextTokens(messages).tokens;
+	const schemaTokens = estimateToolSchemaTokens(tools);
+	expect(schemaTokens).toBeGreaterThan(0);
+	const maxContextTokens = messagesOnly + 1;
+	expect(messagesOnly).toBeLessThanOrEqual(maxContextTokens);
+	expect(messagesOnly + schemaTokens).toBeGreaterThan(maxContextTokens);
+
+	const calls: Array<[string, boolean]> = [];
+	const { session } = fakeSession({ messages, tools, maxContextTokens, compactionCalls: calls });
+
+	// Before this threshold counted tool schemas, `shouldCompact` was false here and the
+	// refusal was silently unhandled: no compaction, no event, and a message promising one.
+	const handled = await internals._checkCompaction.call(
+		session as unknown as SessionInternals,
+		guardRefusalMessage(messagesOnly + schemaTokens, maxContextTokens),
+	);
+	expect(handled).toBe(true);
+	expect(calls).toEqual([["threshold", true]]);
+});
+
+it("recovers a refusal even when the newest usage predates the last compaction", async () => {
+	const calls: Array<[string, boolean]> = [];
+	const { session } = fakeSession({ messages: [], maxContextTokens: 100, compactionCalls: calls });
+	// A kept pre-compaction message carrying usage: the stale-usage heuristic would skip
+	// compaction for a provider-reported error, but a refusal is a fresh local signal and
+	// must still be recovered.
+	session.agent.state.messages = [
+		{
+			...userMessage("m".repeat(4_000)),
+			role: "assistant",
+			usage: { input: 9_000, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 9_001 },
+			timestamp: 1,
+		} as never,
+	];
+	session.sessionManager.getBranch = () => [{ type: "compaction", timestamp: new Date(5).toISOString() }] as never;
+
+	const handled = await internals._checkCompaction.call(session as unknown as SessionInternals, guardRefusalMessage());
+	expect(handled).toBe(true);
+	expect(calls).toEqual([["threshold", true]]);
+});
+
 describe("guard refusal is never retried", () => {
 	it("vetoes the refusal even when its threshold digits collide with an HTTP status pattern", () => {
 		const session = {

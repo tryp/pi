@@ -2680,13 +2680,18 @@ export class AgentSession {
 		// This ensures sessions that hit persistent API errors (e.g. 529) or malformed zero-usage
 		// responses can still compact and do not reset context accounting.
 		let contextTokens: number;
+		// A guard refusal is a fresh, local, estimate-based signal, so the stale-usage
+		// heuristic below (which exists to stop a *provider-reported* pre-compaction
+		// usage from re-triggering compaction) must not apply to it: it would silently
+		// skip the recovery the refusal's own message promises.
+		const guardRefusal = isContextGuardRefusal(assistantMessage);
 		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
 		if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
 			const estimate = estimateContextTokens(messages);
 			// Without provider usage, estimate.tokens is the pure message-size estimate.
 			// Only usage-backed estimates need the stale pre-compaction check.
-			if (estimate.lastUsageIndex !== null) {
+			if (estimate.lastUsageIndex !== null && !guardRefusal) {
 				// Verify the usage source is post-compaction. Kept pre-compaction messages
 				// have stale usage reflecting the old (larger) context and would falsely
 				// trigger compaction right after one just finished.
@@ -2699,7 +2704,17 @@ export class AgentSession {
 					return false;
 				}
 			}
-			contextTokens = estimate.tokens;
+			// A guard refusal must satisfy this threshold, and the guard counts tool
+			// schemas, so a refusal has to be measured the same way. Otherwise a refusal
+			// that crosses the limit only once the schemas are added leaves `shouldCompact`
+			// false, the recovery never runs, and the turn dies on a refusal whose message
+			// says it is compacting. Scoped to refusals deliberately: for a
+			// provider-reported error or a zero-usage response the message-only estimate is
+			// the established threshold (issue #8328), and widening it would make a session
+			// with a small window compact on every error.
+			contextTokens = guardRefusal
+				? estimate.tokens + estimateToolSchemaTokens(this.agent.state.tools)
+				: estimate.tokens;
 		} else {
 			contextTokens = directContextTokens;
 		}
@@ -2708,7 +2723,6 @@ export class AgentSession {
 			// replace the oversized context before the interrupted turn continues. That
 			// continuation is the entire point of the guard: without it the turn dies on
 			// a request that was never sent.
-			const guardRefusal = isContextGuardRefusal(assistantMessage);
 			if (guardRefusal && this._overflowRecoveryAttempted) {
 				// Already compacted once for this refusal. Surfacing the failure beats
 				// compacting again, which cannot help if the kept messages are themselves
