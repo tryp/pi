@@ -36,6 +36,11 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import {
+	appendRequestFailureDiagnostic,
+	classifyRequestFailure,
+	formatRequestFailureMessage,
+} from "../utils/abort-origin.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
@@ -333,6 +338,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 		// Keep them in memory during streaming and serialize once when the block is finalized.
 		let streamedReasoningDetails: OpenAIReasoningDetail[] | undefined;
 		let params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming | undefined;
+		let phase: "before_headers" | "streaming" = "before_headers";
 		const applyStreamedReasoningDetails = (block: ThinkingContent): void => {
 			if (streamedReasoningDetails !== undefined) {
 				block.thinkingSignature = JSON.stringify(streamedReasoningDetails);
@@ -542,6 +548,10 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				return block;
 			};
 
+			// The SDK call has returned a response stream. Mark the streaming phase
+			// immediately before asking the iterator for its first chunk, so an error
+			// while obtaining headers remains distinguishable from a body-read abort.
+			phase = "streaming";
 			for await (const chunk of openaiStream) {
 				if (!chunk || typeof chunk !== "object") continue;
 
@@ -702,14 +712,33 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const formattedError = formatProviderError(normalizeProviderError(error));
-			const hasHttpStatus = (error as any)?.status != null || (error as any)?.statusCode != null;
-			if (output.usage.totalTokens === 0 && !hasHttpStatus && !options?.signal?.aborted) {
-				const requestSizeKb = params === undefined ? 0 : Math.round(JSON.stringify(params).length / 1024);
-				output.errorMessage = `Provider aborted request before any output (request ~${requestSizeKb} KB, ${context.messages.length} messages): ${formattedError}`;
-			} else {
-				output.errorMessage = formattedError;
-			}
+			const normalized = normalizeProviderError(error);
+			const formattedError = formatProviderError(normalized);
+			const requestJson = params === undefined ? undefined : JSON.stringify(params);
+			// Undefined rather than 0 when the request body is unavailable: a rendered
+			// "request ~0 KB" reads like a measurement instead of an absence.
+			const requestBytes = requestJson === undefined ? undefined : requestJson.length;
+			const failureInput = {
+				error,
+				normalized,
+				signal: options?.signal,
+				phase,
+				transport: "openai-completions",
+				usageTokens: output.usage.totalTokens,
+				requestBytes,
+				messageCount: context.messages.length,
+			};
+			const origin = classifyRequestFailure(failureInput);
+			appendRequestFailureDiagnostic(output, origin, { ...failureInput, formattedError });
+
+			// Keep explicit caller cancellation exactly as before: its stopReason and
+			// display message are unchanged. Every other failure goes through the shared
+			// formatter, which decides between the outputless-abort envelope and a
+			// provider-formatted message plus origin detail from the classified origin
+			// (`isOutputlessRequestFailure`), so no wording is pattern-matched here.
+			output.errorMessage = options?.signal?.aborted
+				? formattedError
+				: formatRequestFailureMessage(formattedError, origin, failureInput);
 			// Some providers via OpenRouter give additional information in this field.
 			// normalizeProviderError already stringifies the parsed body (error.error)
 			// into errorMessage, so only append the raw metadata when it is not already

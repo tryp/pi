@@ -20,6 +20,11 @@ import type {
 	StreamOptions,
 	Usage,
 } from "../types.ts";
+import {
+	appendRequestFailureDiagnostic,
+	classifyRequestFailure,
+	formatRequestFailureMessage,
+} from "../utils/abort-origin.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
 import { splitDeferredTools } from "../utils/deferred-tools.ts";
 import {
@@ -252,6 +257,11 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			stopReason: "pending",
 			timestamp: Date.now(),
 		};
+		let startEmitted = false;
+		let activeTransport: "websocket" | "sse" = "sse";
+		let activePhase: "before_headers" | "streaming" = "before_headers";
+		let ssePhase: "before_headers" | "streaming" = "before_headers";
+		let requestBytes = 0;
 
 		try {
 			const apiKey = options?.apiKey;
@@ -281,16 +291,18 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				websocketRequestId,
 			);
 			const bodyJson = JSON.stringify(body);
+			requestBytes = new TextEncoder().encode(bodyJson).byteLength;
 			const httpTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 			const websocketConnectTimeoutMs = normalizeTimeoutMs(options?.websocketConnectTimeoutMs);
 			const transport = options?.transport || "auto";
-			let startEmitted = false;
 			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(cacheSessionId);
 			if (websocketDisabledForSession) {
 				recordWebSocketSseFallback(cacheSessionId);
 			}
 
 			if (transport !== "sse" && !websocketDisabledForSession) {
+				activeTransport = "websocket";
+				activePhase = "before_headers";
 				let websocketStarted = false;
 				let retriedWebSocketConnectionLimit = false;
 				let retriedMissingWebSocketContinuation = false;
@@ -306,6 +318,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							model,
 							() => {
 								websocketStarted = true;
+								activePhase = "streaming";
 								if (!startEmitted) {
 									startEmitted = true;
 									stream.push({ type: "start", partial: output });
@@ -360,11 +373,15 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							throw error;
 						}
 						recordWebSocketSseFallback(cacheSessionId);
+						activeTransport = "sse";
+						activePhase = "before_headers";
 						break;
 					}
 				}
 			}
 
+			activeTransport = "sse";
+			activePhase = "before_headers";
 			// Compress the request body once for the SSE path. The Codex backend
 			// decodes Content-Encoding: zstd; the WebSocket transport above sends the
 			// uncompressed JSON frame, matching the official Codex client.
@@ -373,6 +390,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				sseHeaders.set("content-encoding", "zstd");
 			}
 			const sseBody: Uint8Array | string = compressedBody ?? bodyJson;
+			requestBytes = typeof sseBody === "string" ? new TextEncoder().encode(sseBody).byteLength : sseBody.byteLength;
 
 			// Fetch with retry logic for rate limits and transient errors
 			let response: Response | undefined;
@@ -430,12 +448,14 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					throw Object.assign(new Error(info.friendlyMessage || info.message), { status: response.status });
 				} catch (error) {
-					if (error instanceof Error) {
-						if (error.name === "AbortError" || error.message === "Request was aborted") {
-							throw new Error("Request was aborted");
-						}
+					if (error instanceof Error && (error.name === "AbortError" || error.message === "Request was aborted")) {
+						// Keep the historical cancellation wording, but preserve a transport
+						// AbortError when our own signal is still untouched. Re-throwing still
+						// exits this retry loop immediately; the outer catch records its origin.
+						if (options?.signal?.aborted) throw new Error("Request was aborted");
+						throw error;
 					}
 					lastError = error instanceof Error ? error : new Error(String(error));
 					// Network errors are retryable
@@ -459,6 +479,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			if (!response.body) {
 				throw new Error("No response body");
 			}
+			ssePhase = "streaming";
+			activePhase = ssePhase;
 
 			if (!startEmitted) {
 				startEmitted = true;
@@ -480,7 +502,33 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			const normalized = normalizeProviderError(error);
+			const formattedError = formatProviderError(normalized);
+			if (options?.signal?.aborted) {
+				// Keep intentional cancellation byte-identical to the old behavior.
+				output.errorMessage = formattedError;
+			} else {
+				const failureInput = {
+					error,
+					normalized,
+					signal: options?.signal,
+					phase: activePhase,
+					transport: activeTransport,
+					usageTokens: output.usage.totalTokens,
+					requestBytes,
+					messageCount: context.messages.length,
+					eventsEmitted: startEmitted,
+				};
+				const origin = classifyRequestFailure(failureInput);
+				// The shared formatter already returns the provider-formatted message
+				// unchanged for a non-abort failure, so there is no local gate to apply
+				// here; the recorded diagnostic covers every class either way.
+				output.errorMessage = formatRequestFailureMessage(formattedError, origin, failureInput);
+				appendRequestFailureDiagnostic(output, origin, {
+					...failureInput,
+					formattedError: normalized.cause ? `${formattedError}; cause=${normalized.cause}` : formattedError,
+				});
+			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

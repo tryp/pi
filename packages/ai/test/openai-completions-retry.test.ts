@@ -143,8 +143,31 @@ describe("openai-completions provider retries", () => {
 		const result = await consume();
 
 		expect(result.stopReason).toBe("error");
+		// A plain Error carries no abort shape, so the honest classification is
+		// `unknown`; the envelope still applies because the request produced no
+		// status, no usage, and the local signal was untouched.
 		expect(result.errorMessage).toMatch(
-			/^Provider aborted request before any output \(request ~\d+ KB, 1 messages\): This operation was aborted$/,
+			/^Provider aborted request before any output \(request ~\d+ KB, 1 messages, failure=[a-z_]+, phase=before_headers, transport=openai-completions, signal=unchanged\): This operation was aborted$/,
 		);
+	});
+
+	it("records a transport abort origin that the message alone cannot express", async () => {
+		// The real-world shape: undici rejects a body read with a DOMException
+		// AbortError whose message is the same generic wording. The abort shape is
+		// what makes it retryable, and only the diagnostic can carry that.
+		mockState.requestErrors = [new DOMException("This operation was aborted", "AbortError")];
+
+		const result = await consume();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("failure=abort_transport");
+		expect(result.errorMessage).toContain("signal=unchanged");
+		const diagnostic = (result.diagnostics ?? []).find((entry) => entry.type === "provider_request_failure");
+		expect(diagnostic?.details).toMatchObject({
+			failureCode: "abort_transport",
+			retryVerdict: "retry",
+			phase: "before_headers",
+			signalAborted: false,
+		});
 	});
 });
