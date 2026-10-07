@@ -386,7 +386,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			sessionRef.current?.guardContextForRequest({ messages: context.messages, tools: context.tools });
+			// The guard evaluates the session's own message list, not the request's
+			// transformed one: an over-limit context is compacted and the turn continued,
+			// never silently trimmed down to fit. The request built from that list is
+			// still budget-trimmed as a backstop when compaction is unavailable.
+			const session = sessionRef.current;
+			session?.guardContextForRequest({
+				messages: session.agent.state.messages,
+				tools: context.tools,
+			});
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
 			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
@@ -435,8 +443,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		sessionId: sessionManager.getSessionId(),
 		transformContext: async (messages) => {
+			// Pre-send gate first: compacting here rewrites session state before the
+			// request is built, so the submitted request already reflects the compaction.
+			// This hook runs before the request is assembled and before the stream
+			// inactivity watchdog is armed, which is why the gate lives here.
+			const compacted = await sessionRef.current?.compactBeforeSubmit();
+			const source = compacted ?? messages;
 			const runner = extensionRunnerRef.current;
-			const transformed = runner ? await runner.emitContext(messages) : messages;
+			const transformed = runner ? await runner.emitContext(source) : source;
 			return enforceRequestContextBudget(
 				transformed,
 				agent.state.systemPrompt ?? "",

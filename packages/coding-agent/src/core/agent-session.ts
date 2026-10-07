@@ -305,6 +305,15 @@ function getAgentQueueCompatibility(agent: Agent): AgentQueueCompatibility {
 export const CONTEXT_GUARD_ERROR_MESSAGE =
 	"Context guard: estimated context exceeds maxContextTokens — compacting before retry";
 
+/**
+ * Fraction of `maxContextTokens` at which the pre-send gate compacts before the
+ * request is built. At or above this line a request is close enough to the hard
+ * limit that a transport abort is as likely to be a size rejection as a dropped
+ * connection, so the gate compacts instead of submitting, and transport-abort
+ * retries are withheld.
+ */
+export const CONTEXT_BORDERLINE_FRACTION = 0.9;
+
 export class ContextGuardError extends Error {
 	constructor(estimatedTokens?: number, maxContextTokens?: number) {
 		const details =
@@ -314,6 +323,20 @@ export class ContextGuardError extends Error {
 		super(`${CONTEXT_GUARD_ERROR_MESSAGE}${details}`);
 		this.name = "ContextGuardError";
 	}
+}
+
+/**
+ * Whether a failed assistant message is the pre-send guard refusing a request.
+ *
+ * A thrown {@link ContextGuardError} does not reach the session as an error: the
+ * agent run converts it into an assistant message with `stopReason: "error"` and
+ * the guard text as `errorMessage`. Post-run handling therefore classifies the
+ * refusal from the message, the same way provider-reported context overflow is
+ * classified. The match is a prefix so the `(estimated N tokens, threshold M)`
+ * diagnostic suffix does not have to be reconstructed here.
+ */
+export function isContextGuardRefusal(message: AssistantMessage): boolean {
+	return typeof message.errorMessage === "string" && message.errorMessage.startsWith(CONTEXT_GUARD_ERROR_MESSAGE);
 }
 
 // ============================================================================
@@ -364,6 +387,11 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	/**
+	 * Message count at the last pre-send compaction, so a request that already
+	 * compacted does not compact again until new messages arrive.
+	 */
+	private _lastPreSendCompactionLength = -1;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -832,6 +860,7 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
+			this._lastPreSendCompactionLength = -1;
 			const messageText = contentText(event.message.content, "");
 			if (messageText) {
 				// Check steering queue first
@@ -1295,6 +1324,72 @@ export class AgentSession {
 		if (estimatedTokens > settings.maxContextTokens) {
 			throw new ContextGuardError(estimatedTokens, settings.maxContextTokens);
 		}
+	}
+
+	/**
+	 * Pre-send gate: compact before the request is built when the context is close
+	 * to the hard limit, so the request is submitted from compacted state instead
+	 * of being refused by {@link guardContextForRequest} or trimmed.
+	 *
+	 * Measured with the same estimate as the guard (messages plus tool schemas),
+	 * so the two gates cannot disagree about where the limit is. The system prompt
+	 * is not counted here; the headroom below {@link CONTEXT_BORDERLINE_FRACTION}
+	 * covers it for the configured reserve.
+	 *
+	 * Best effort by construction: this calls the same `prepareCompaction` the
+	 * manual path uses, and that returns `undefined` when the branch ends inside an
+	 * in-progress turn, where the only valid cut point is the turn start and there
+	 * is nothing left to summarize. Measured in a live session at 10242 estimated
+	 * tokens against an 8000 limit: the gate declined, the guard refused, and the
+	 * refusal's own compaction then succeeded, because the failed assistant message
+	 * supplies the turn boundary preparation needs. The turn continued and
+	 * completed. The gate is therefore an optimization that avoids the refusal in
+	 * the common case, not the mechanism that guarantees recovery - the guard's
+	 * refusal path is.
+	 *
+	 * @returns The compacted message list when a compaction ran, so the caller can
+	 * build the request from it; `undefined` when no compaction was needed or the
+	 * compaction did not change the message list.
+	 */
+	async compactBeforeSubmit(): Promise<AgentMessage[] | undefined> {
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled || settings.maxContextTokens == null || this.isCompacting) return undefined;
+
+		const messages = this.agent.state.messages;
+		if (messages.length === this._lastPreSendCompactionLength) return undefined;
+
+		const estimatedTokens = estimateContextTokens(messages).tokens + estimateToolSchemaTokens(this.agent.state.tools);
+		if (estimatedTokens < CONTEXT_BORDERLINE_FRACTION * settings.maxContextTokens) return undefined;
+
+		// `_runAutoCompaction` rewrites agent state from the new session context, so a
+		// changed array identity is the reliable "a compaction ran" signal: its return
+		// value only reports whether the caller should continue the turn. The latch is
+		// set only on success, so a compaction that changed nothing does not suppress
+		// the next attempt.
+		await this._runAutoCompaction("threshold", false);
+		const compacted = this.agent.state.messages;
+		if (compacted === messages) return undefined;
+		this._lastPreSendCompactionLength = compacted.length;
+		return compacted;
+	}
+
+	/**
+	 * Whether a transport abort may be retried: only when the request that failed
+	 * was comfortably under the context budget. At or above
+	 * {@link CONTEXT_BORDERLINE_FRACTION} the abort may be a size rejection, and
+	 * re-sending the same request would fail the same way, so the retry is withheld
+	 * and {@link compactBeforeSubmit} handles the band instead. When the limit
+	 * cannot be evaluated (compaction disabled or no threshold configured) the
+	 * retry is withheld too: without a budget there is no way to know the request
+	 * was small, and an unbounded retry of an oversized request is the failure mode
+	 * this gate exists to prevent.
+	 */
+	private _transportAbortRetryAllowed(): boolean {
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled || settings.maxContextTokens == null) return false;
+		const estimatedTokens =
+			estimateContextTokens(this.agent.state.messages).tokens + estimateToolSchemaTokens(this.agent.state.tools);
+		return estimatedTokens < CONTEXT_BORDERLINE_FRACTION * settings.maxContextTokens;
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -2609,7 +2704,28 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
+			// A pre-send context guard deliberately fails the request so compaction can
+			// replace the oversized context before the interrupted turn continues. That
+			// continuation is the entire point of the guard: without it the turn dies on
+			// a request that was never sent.
+			const guardRefusal = isContextGuardRefusal(assistantMessage);
+			if (guardRefusal && this._overflowRecoveryAttempted) {
+				// Already compacted once for this refusal. Surfacing the failure beats
+				// compacting again, which cannot help if the kept messages are themselves
+				// over the limit.
+				this._emit({
+					type: "compaction_end",
+					reason: "threshold",
+					result: undefined,
+					aborted: false,
+					willRetry: false,
+					errorMessage:
+						"Context guard recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+				});
+				return false;
+			}
+			if (guardRefusal) this._overflowRecoveryAttempted = true;
+			return await this._runAutoCompaction("threshold", guardRefusal);
 		}
 		return false;
 	}
@@ -3259,7 +3375,13 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
-		return isRetryableAssistantError(message);
+		// A guard refusal is likewise handled by compaction (see `_checkCompaction`),
+		// and it must be vetoed here rather than left to the message patterns: the
+		// refusal carries an `(estimated N tokens, threshold M)` suffix, and the
+		// shared retryable pattern matches a bare `500` inside a threshold like
+		// `5000`, which would retry a request that was never sent.
+		if (isContextGuardRefusal(message)) return false;
+		return isRetryableAssistantError(message, { retryTransportAborts: this._transportAbortRetryAllowed() });
 	}
 
 	/**
