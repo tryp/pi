@@ -198,6 +198,8 @@ export interface ContextUsageEstimate {
 	lastUsageIndex: number | null;
 }
 
+const CHARS_PER_TOKEN = 4;
+
 function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; index: number } | undefined {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const usage = getAssistantUsage(messages[i]);
@@ -238,6 +240,16 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 		trailingTokens,
 		lastUsageIndex: usageInfo.index,
 	};
+}
+
+/**
+ * Estimate tool schema tokens from the actual serialized tool definitions sent
+ * to the provider, using the same chars-per-token assumption as estimateTokens.
+ * No fixed per-tool or per-request allowance is assumed.
+ */
+export function estimateToolSchemaTokens(tools: readonly unknown[] | undefined): number {
+	if (tools === undefined || tools.length === 0) return 0;
+	return Math.ceil(JSON.stringify(tools).length / CHARS_PER_TOKEN);
 }
 
 /**
@@ -292,14 +304,14 @@ export function estimateTokens(message: AgentMessage): number {
 			chars = estimateTextAndImageContentChars(
 				(message as { content: string | Array<{ type: string; text?: string }> }).content,
 			);
-			return Math.ceil(chars / 4);
+			return Math.ceil(chars / CHARS_PER_TOKEN);
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
 			const assistantContent = assistant.content as string | Array<TextContent | ThinkingContent | ToolCall>;
 			if (typeof assistantContent === "string") {
 				chars = assistantContent.length;
-				return Math.ceil(chars / 4);
+				return Math.ceil(chars / CHARS_PER_TOKEN);
 			}
 			if (!Array.isArray(assistantContent)) {
 				return 0;
@@ -313,21 +325,21 @@ export function estimateTokens(message: AgentMessage): number {
 					chars += block.name.length + JSON.stringify(block.arguments).length;
 				}
 			}
-			return Math.ceil(chars / 4);
+			return Math.ceil(chars / CHARS_PER_TOKEN);
 		}
 		case "custom":
 		case "toolResult": {
 			chars = estimateTextAndImageContentChars(message.content);
-			return Math.ceil(chars / 4);
+			return Math.ceil(chars / CHARS_PER_TOKEN);
 		}
 		case "bashExecution": {
 			chars = message.command.length + message.output.length;
-			return Math.ceil(chars / 4);
+			return Math.ceil(chars / CHARS_PER_TOKEN);
 		}
 		case "branchSummary":
 		case "compactionSummary": {
 			chars = message.summary.length;
-			return Math.ceil(chars / 4);
+			return Math.ceil(chars / CHARS_PER_TOKEN);
 		}
 	}
 

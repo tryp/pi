@@ -5,7 +5,7 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
-import { estimateTokens } from "./compaction/compaction.ts";
+import { estimateContextTokens, estimateTokens, estimateToolSchemaTokens } from "./compaction/compaction.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm } from "./messages.ts";
@@ -191,6 +191,7 @@ export function enforceRequestContextBudget(
 	model: { contextWindow?: number } | undefined,
 	maxContextTokens: number | undefined,
 	reserveTokens: number,
+	tools?: readonly unknown[],
 ): AgentMessage[] {
 	let budget: number | undefined;
 	if (maxContextTokens != null) {
@@ -200,10 +201,11 @@ export function enforceRequestContextBudget(
 	}
 	if (budget == null || budget <= 0 || messages.length === 0) return messages;
 
-	let total = estimateTokens({ role: "user", content: systemPrompt } as AgentMessage);
-	for (const message of messages) {
-		total += estimateTokens(message);
-	}
+	const systemPromptTokens = estimateTokens({ role: "user", content: systemPrompt } as AgentMessage);
+	const toolSchemaTokens = estimateToolSchemaTokens(tools);
+	const estimateTotal = (remainingMessages: AgentMessage[]) =>
+		systemPromptTokens + estimateContextTokens(remainingMessages).tokens + toolSchemaTokens;
+	let total = estimateTotal(messages);
 	if (total <= budget) return messages;
 
 	// Trim whole turns from the oldest end. A turn ends at a user message
@@ -213,20 +215,22 @@ export function enforceRequestContextBudget(
 	while (dropCount < messages.length - 1 && total > budget) {
 		const frontier = messages[dropCount];
 		if (frontier?.role === "user") {
-			total -= estimateTokens(frontier);
 			dropCount++;
-			continue;
+		} else {
+			// Frontier is an assistant toolCall or a toolResult: advance past the
+			// whole turn up to the next user message (never past the final one).
+			let next = dropCount;
+			while (next < messages.length && messages[next]!.role !== "user") {
+				if (next >= messages.length - 1) break;
+				next++;
+			}
+			if (next === dropCount) break;
+			dropCount = next;
 		}
-		// Frontier is an assistant toolCall or a toolResult: advance past the
-		// whole turn up to the next user message (never past the final one).
-		let next = dropCount;
-		while (next < messages.length && messages[next]!.role !== "user") {
-			if (next >= messages.length - 1) break;
-			total -= estimateTokens(messages[next]!);
-			next++;
-		}
-		if (next === dropCount) break;
-		dropCount = next;
+		// Usage describes a prefix, so removing a turn can also remove the latest
+		// usage source. Re-estimate the retained suffix instead of subtracting
+		// per-message chars/4 from a usage-backed total.
+		total = estimateTotal(messages.slice(dropCount));
 	}
 	// Safety pass: even when the budget is already met, never leave a
 	// leading assistant toolCall (provider 400) or orphaned toolResult as
@@ -382,7 +386,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			sessionRef.current?.guardContextForRequest(context.messages);
+			sessionRef.current?.guardContextForRequest({ messages: context.messages, tools: context.tools });
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
 			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
@@ -439,6 +443,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				agent.state.model,
 				settingsManager.getCompactionMaxContextTokens(),
 				settingsManager.getCompactionReserveTokens(),
+				agent.state.tools,
 			);
 		},
 		steeringMode: settingsManager.getSteeringMode(),

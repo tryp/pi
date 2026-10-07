@@ -8,7 +8,7 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { estimateTokens } from "../../src/core/compaction/index.ts";
+import { estimateContextTokens, estimateTokens, estimateToolSchemaTokens } from "../../src/core/compaction/index.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
@@ -137,11 +137,18 @@ describe("AgentSession compaction characterization", () => {
 
 		const result = await harness.session.compact();
 		const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
-		const estimatedTokensAfter = harness.session.messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+		// The reported value is usage-backed and includes the tool schemas sent with
+		// the request, so it is deliberately not the legacy message-only chars/4 sum
+		// (which is single digits for this tiny fixture).
+		const legacyMessageOnly = harness.session.messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+		const expectedEstimatedTokensAfter =
+			estimateContextTokens(harness.session.messages).tokens +
+			estimateToolSchemaTokens(harness.session.agent.state.tools);
 
 		expect(result.summary).toBe("summary from extension");
 		expect(result.usage).toEqual(summaryUsage);
-		expect(result.estimatedTokensAfter).toBe(estimatedTokensAfter);
+		expect(result.estimatedTokensAfter).toBe(expectedEstimatedTokensAfter);
+		expect(legacyMessageOnly).toBeLessThan(expectedEstimatedTokensAfter);
 		expect(compactionEntries).toHaveLength(1);
 		const compactionEntry = compactionEntries[0];
 		if (compactionEntry?.type === "compaction") {

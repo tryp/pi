@@ -52,6 +52,7 @@ import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
+import { estimateToolSchemaTokens } from "./compaction/compaction.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -59,7 +60,6 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
-	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -302,20 +302,16 @@ function getAgentQueueCompatibility(agent: Agent): AgentQueueCompatibility {
 	return agent as unknown as AgentQueueCompatibility;
 }
 
-function estimateMessagesTokens(messages: AgentMessage[]): number {
-	let tokens = 0;
-	for (const message of messages) {
-		tokens += estimateTokens(message);
-	}
-	return tokens;
-}
-
 export const CONTEXT_GUARD_ERROR_MESSAGE =
-	"Context guard: estimated context exceeds maxContextTokens - compacting before retry";
+	"Context guard: estimated context exceeds maxContextTokens — compacting before retry";
 
 export class ContextGuardError extends Error {
-	constructor() {
-		super(CONTEXT_GUARD_ERROR_MESSAGE);
+	constructor(estimatedTokens?: number, maxContextTokens?: number) {
+		const details =
+			estimatedTokens !== undefined && maxContextTokens !== undefined
+				? ` (estimated ${estimatedTokens} tokens, threshold ${maxContextTokens})`
+				: "";
+		super(`${CONTEXT_GUARD_ERROR_MESSAGE}${details}`);
 		this.name = "ContextGuardError";
 	}
 }
@@ -1284,11 +1280,20 @@ export class AgentSession {
 		);
 	}
 
-	guardContextForRequest(messages: AgentMessage[]): void {
+	guardContextForRequest(
+		contextOrMessages: AgentMessage[] | { messages: AgentMessage[]; tools?: readonly unknown[] },
+	): void {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled || settings.maxContextTokens == null || this.isCompacting) return;
-		if (estimateMessagesTokens(messages) > settings.maxContextTokens) {
-			throw new ContextGuardError();
+		// The array form remains accepted for direct session callers that do not
+		// have the provider Context object; the SDK passes the full context so
+		// tool schemas are included when available.
+		const context = Array.isArray(contextOrMessages)
+			? { messages: contextOrMessages, tools: undefined }
+			: contextOrMessages;
+		const estimatedTokens = estimateContextTokens(context.messages).tokens + estimateToolSchemaTokens(context.tools);
+		if (estimatedTokens > settings.maxContextTokens) {
+			throw new ContextGuardError(estimatedTokens, settings.maxContextTokens);
 		}
 	}
 
@@ -2405,7 +2410,8 @@ export class AgentSession {
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
+			const estimatedTokensAfter =
+				estimateContextTokens(sessionContext.messages).tokens + estimateToolSchemaTokens(this.agent.state.tools);
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -2730,7 +2736,8 @@ export class AgentSession {
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
+			const estimatedTokensAfter =
+				estimateContextTokens(sessionContext.messages).tokens + estimateToolSchemaTokens(this.agent.state.tools);
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
