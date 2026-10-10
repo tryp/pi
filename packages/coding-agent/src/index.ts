@@ -337,6 +337,13 @@ export {
 	withFileMutationQueue,
 } from "./core/tools/index.ts";
 export {
+	byteWindow,
+	formatLineNumber,
+	normalizeMaxBytes,
+	stripLineNumber,
+	withLineNumbers,
+} from "./core/tools/read.ts";
+export {
 	hasTrustRequiringProjectResources,
 	type ProjectTrustDecision,
 	ProjectTrustStore,

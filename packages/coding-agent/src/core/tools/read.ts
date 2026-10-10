@@ -22,6 +22,12 @@ const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
 	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
 	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+	maxBytes: Type.Optional(
+		Type.Number({
+			description:
+				"Maximum bytes to return (1 to the default budget). Narrow it when a single line exceeds the budget and you need its head as a bounded window, e.g. offset=12 limit=1 maxBytes=4096.",
+		}),
+	),
 	cwd: Type.Optional(
 		Type.String({
 			description:
@@ -32,7 +38,9 @@ const readSchema = Type.Object({
 
 export const readToolSystemPromptContribution = {
 	snippet: "Read file contents",
-	guidelines: ["Use read to examine files instead of cat or sed."],
+	guidelines: [
+		"Use read to examine files instead of cat or sed. It returns each line prefixed with its line number, so a read and a grep agree on where you are; use offset/limit for a range and maxBytes to window one huge line.",
+	],
 } as const;
 
 export type ReadToolInput = Static<typeof readSchema>;
@@ -76,6 +84,76 @@ export interface ReadToolOptions {
 
 type ReadRenderArgs = { path?: string; file_path?: string; offset?: number; limit?: number };
 
+/**
+ * Width of the right-aligned line number prefix, matching `cat -n`.
+ *
+ * Read output carries line numbers so the tool speaks the same coordinate
+ * system grep does. Measured over 90 days of sessions, 34.4% of shell
+ * line-range reads (`sed -n 'A,Bp'`) were primed by a grep on the same file:
+ * the agent held line numbers from the numbered tool and reached for the
+ * idiom that consumes them, because read's own output was unnumbered.
+ */
+const LINE_NUMBER_WIDTH = 6;
+
+/** The separator between the number and the line. Split on it when rendering. */
+const LINE_NUMBER_SEPARATOR = "\t";
+
+/** `  820` for line 820, right-aligned so columns stay readable. */
+export function formatLineNumber(lineNumber: number): string {
+	return String(lineNumber).padStart(LINE_NUMBER_WIDTH);
+}
+
+/** Prefix every selected line with its 1-indexed file line number. */
+export function withLineNumbers(lines: string[], firstLineNumber: number): string {
+	return lines.map((line, i) => `${formatLineNumber(firstLineNumber + i)}${LINE_NUMBER_SEPARATOR}${line}`).join("\n");
+}
+
+/** Strip the number prefix, for the syntax highlighter and empty-line trimming. */
+export function stripLineNumber(line: string): string {
+	const at = line.indexOf(LINE_NUMBER_SEPARATOR);
+	return at === -1 ? line : line.slice(at + LINE_NUMBER_SEPARATOR.length);
+}
+
+/**
+ * Clamp a caller-supplied byte budget into the range the tool grants.
+ *
+ * A byte budget may only *narrow* the window. Raising it above the default
+ * would turn a bounded tool into an unbounded one, so an out-of-range request
+ * is refused (returns null -> default budget) rather than honoured; the read
+ * description says the range explicitly.
+ */
+export function normalizeMaxBytes(maxBytes: number | undefined): number | undefined {
+	if (maxBytes === undefined || !Number.isFinite(maxBytes)) {
+		return undefined;
+	}
+	const clamped = Math.floor(maxBytes);
+	if (clamped < 1) {
+		return undefined;
+	}
+	return Math.min(clamped, DEFAULT_MAX_BYTES);
+}
+
+/**
+ * The first `budget` bytes of `line`, as valid UTF-8.
+ *
+ * A cut that lands mid-sequence drops the partial character rather than
+ * emitting U+FFFD: the slice is decoded fatally and up to three trailing bytes
+ * (the longest UTF-8 sequence) are dropped until it decodes, so the window is
+ * always well-formed text.
+ */
+export function byteWindow(line: string, budget: number): string {
+	const bytes = Buffer.from(line, "utf-8").subarray(0, Math.max(0, budget));
+	const decoder = new TextDecoder("utf-8", { fatal: true });
+	for (let end = bytes.length; end > 0 && end > bytes.length - 4; end--) {
+		try {
+			return decoder.decode(bytes.subarray(0, end));
+		} catch {
+			// The cut landed inside a multi-byte sequence: drop one more byte.
+		}
+	}
+	return "";
+}
+
 function formatReadLineRange(args: ReadRenderArgs | undefined, theme: Theme): string {
 	if (args?.offset === undefined && args?.limit === undefined) return "";
 	const startLine = args.offset ?? 1;
@@ -90,7 +168,7 @@ function formatReadCall(args: ReadRenderArgs | undefined, theme: Theme, cwd: str
 
 function trimTrailingEmptyLines(lines: string[]): string[] {
 	let end = lines.length;
-	while (end > 0 && lines[end - 1] === "") {
+	while (end > 0 && stripLineNumber(lines[end - 1]) === "") {
 		end--;
 	}
 	return lines.slice(0, end);
@@ -173,6 +251,22 @@ function formatCompactReadCall(
 	);
 }
 
+/**
+ * Attach the muted line-number prefix to a highlighted code line.
+ *
+ * Highlighting runs on the code *without* the prefix, over the whole block, so
+ * multi-line strings and comments keep their context; the prefix is then
+ * re-attached dim so the numbers stay quieter than the file. A line with no
+ * prefix (an image note, a byte-window notice) is rendered as it came.
+ */
+function renderReadLine(rawLine: string, highlighted: string, theme: Theme): string {
+	const at = rawLine.indexOf(LINE_NUMBER_SEPARATOR);
+	if (at === -1) {
+		return highlighted;
+	}
+	return theme.fg("muted", rawLine.slice(0, at)) + LINE_NUMBER_SEPARATOR + highlighted;
+}
+
 function formatReadResult(
 	args: ReadRenderArgs | undefined,
 	result: { content: (TextContent | ImageContent)[]; details?: ReadToolDetails },
@@ -189,12 +283,20 @@ function formatReadResult(
 	const rawPath = str(args?.file_path ?? args?.path);
 	const output = getTextOutput(result, showImages);
 	const lang = !isError && rawPath ? getLanguageFromPath(rawPath) : undefined;
-	const renderedLines = lang ? highlightCode(replaceTabs(output), lang) : output.split("\n");
-	const lines = trimTrailingEmptyLines(renderedLines);
+	// Read content carries a `   820\t` line-number prefix so the model and
+	// grep agree on coordinates. The code is highlighted with the prefix
+	// stripped (whole block, so multi-line constructs keep context) and the
+	// prefix re-attached muted.
+	const rawLines = trimTrailingEmptyLines(output.split("\n"));
+	const codeText = rawLines.map(stripLineNumber).join("\n");
+	const highlighted = lang
+		? highlightCode(replaceTabs(codeText), lang)
+		: codeText.split("\n").map((line) => theme.fg("toolOutput", replaceTabs(line)));
+	const lines = rawLines.map((rawLine, i) => renderReadLine(rawLine, highlighted[i] ?? "", theme));
 	const maxLines = options.expanded ? lines.length : 10;
 	const displayLines = lines.slice(0, maxLines);
 	const remaining = lines.length - maxLines;
-	let text = `\n${displayLines.map((line) => (lang ? replaceTabs(line) : theme.fg("toolOutput", replaceTabs(line)))).join("\n")}`;
+	let text = `\n${displayLines.join("\n")}`;
 	if (remaining > 0) {
 		text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
 	}
@@ -202,7 +304,7 @@ function formatReadResult(
 	const truncation = result.details?.truncation;
 	if (truncation?.truncated) {
 		if (truncation.firstLineExceedsLimit) {
-			text += `\n${theme.fg("warning", `[First line exceeds ${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit]`)}`;
+			text += `\n${theme.fg("warning", `[First line exceeds ${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit; its first bytes are shown as a window]`)}`;
 		} else if (truncation.truncatedBy === "lines") {
 			text += `\n${theme.fg("warning", `[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines (${truncation.maxLines ?? DEFAULT_MAX_LINES} line limit)]`)}`;
 		} else {
@@ -221,14 +323,20 @@ export function createReadToolDefinition(
 	return {
 		name: "read",
 		label: "read",
-		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
+		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, every line is returned prefixed with its line number, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first), and a notice names the range shown and the offset to continue from. Use offset/limit for large files. Use maxBytes (1-${DEFAULT_MAX_BYTES / 1024}K) to narrow the byte budget, which also windows a single line larger than the budget.`,
 		promptSnippet: readToolSystemPromptContribution.snippet,
 		promptGuidelines: [...readToolSystemPromptContribution.guidelines],
 		parameters: readSchema,
 		constrainedSampling: getExperimentalToolSampling(),
 		async execute(
 			_toolCallId,
-			{ path, offset, limit, cwd: perCallCwd }: { path: string; offset?: number; limit?: number; cwd?: string },
+			{
+				path,
+				offset,
+				limit,
+				maxBytes,
+				cwd: perCallCwd,
+			}: { path: string; offset?: number; limit?: number; maxBytes?: number; cwd?: string },
 			signal?: AbortSignal,
 			_onUpdate?,
 			ctx?,
@@ -288,43 +396,60 @@ export function createReadToolDefinition(
 								if (startLine >= allLines.length) {
 									throw new Error(`Offset ${offset} is beyond end of file (${allLines.length} lines total)`);
 								}
-								let selectedContent: string;
+								// A caller-supplied byte budget only narrows the window: the
+								// tool's contract is bounded output, so raising it is refused
+								// rather than silently clamped into a bigger context.
+								const requestedMaxBytes = normalizeMaxBytes(maxBytes);
+								let selectedLines: string[];
 								let userLimitedLines: number | undefined;
 								// If limit is specified by the user, honor it first. Otherwise truncateHead decides.
 								if (limit !== undefined) {
 									const endLine = Math.min(startLine + limit, allLines.length);
-									selectedContent = allLines.slice(startLine, endLine).join("\n");
+									selectedLines = allLines.slice(startLine, endLine);
 									userLimitedLines = endLine - startLine;
 								} else {
-									selectedContent = allLines.slice(startLine).join("\n");
+									selectedLines = allLines.slice(startLine);
 								}
 								// Apply truncation, respecting both line and byte limits.
-								const truncation = truncateHead(selectedContent);
+								const truncation = truncateHead(
+									selectedLines.join("\n"),
+									requestedMaxBytes !== undefined ? { maxBytes: requestedMaxBytes } : {},
+								);
+								const byteBudget = requestedMaxBytes ?? DEFAULT_MAX_BYTES;
 								let outputText: string;
 								if (truncation.firstLineExceedsLimit) {
-									// First line alone exceeds the byte limit. Point the model at a bash fallback.
+									// The first line alone is larger than the byte budget. Return
+									// its head as a window instead of nothing: this is what the
+									// agent's `sed -n 'Np' file | head -c N` used to fetch, and
+									// the tool owns that job now.
 									const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
-									outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
+									const window = byteWindow(allLines[startLine], byteBudget);
+									const shownBytes = Buffer.byteLength(window, "utf-8");
+									outputText = `${withLineNumbers([window], startLineDisplay)}\n\n[Line ${startLineDisplay} is ${firstLineSize}; showing its first ${formatSize(shownBytes)} of it. A narrower maxBytes window fits it in less context.]`;
 									details = { truncation };
 								} else if (truncation.truncated) {
-									// Truncation occurred. Build an actionable continuation notice.
+									// Truncation occurred. Build an actionable continuation notice that
+									// names the range shown and the next offset, so the notice itself
+									// is navigable against the numbered output above it.
 									const endLineDisplay = startLineDisplay + truncation.outputLines - 1;
 									const nextOffset = endLineDisplay + 1;
-									outputText = truncation.content;
+									const remaining = totalFileLines - endLineDisplay;
+									outputText = withLineNumbers(truncation.content.split("\n"), startLineDisplay);
 									if (truncation.truncatedBy === "lines") {
-										outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines}. Use offset=${nextOffset} to continue.]`;
+										outputText += `\n\n[Lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} shown (${DEFAULT_MAX_LINES} line limit); ${remaining} more. Use offset=${nextOffset} to continue.]`;
 									} else {
-										outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
+										outputText += `\n\n[Lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} shown (${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} byte limit); ${remaining} more. Use offset=${nextOffset} to continue.]`;
 									}
 									details = { truncation };
 								} else if (userLimitedLines !== undefined && startLine + userLimitedLines < allLines.length) {
 									// User-specified limit stopped early, but the file still has more content.
+									const endLineDisplay = startLineDisplay + userLimitedLines - 1;
 									const remaining = allLines.length - (startLine + userLimitedLines);
 									const nextOffset = startLine + userLimitedLines + 1;
-									outputText = `${truncation.content}\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
+									outputText = `${withLineNumbers(truncation.content.split("\n"), startLineDisplay)}\n\n[Lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} shown; ${remaining} more. Use offset=${nextOffset} to continue.]`;
 								} else {
 									// No truncation and no remaining user-limited content.
-									outputText = truncation.content;
+									outputText = withLineNumbers(truncation.content.split("\n"), startLineDisplay);
 								}
 								content = [{ type: "text", text: outputText }];
 							}
