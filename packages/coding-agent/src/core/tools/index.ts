@@ -54,12 +54,17 @@ export {
 	type PowerShellToolOptions,
 } from "./powershell.ts";
 export {
+	byteWindow,
 	createReadTool,
 	createReadToolDefinition,
+	formatLineNumber,
+	normalizeMaxBytes,
 	type ReadOperations,
 	type ReadToolDetails,
 	type ReadToolInput,
 	type ReadToolOptions,
+	stripLineNumber,
+	withLineNumbers,
 } from "./read.ts";
 export {
 	DEFAULT_MAX_BYTES,
