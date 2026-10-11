@@ -11,8 +11,8 @@
  * Run: node tmp/verify-production-cache-path.mjs [--pi <cli.js>]
  */
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const args = process.argv.slice(2);
@@ -23,7 +23,10 @@ const PI =
 		: resolve(args[index + 1] ?? "");
 const CACHE = join(homedir(), ".pi", "agent", "models-dev-cache.json");
 const STORE = join(homedir(), ".pi", "agent", "models-store.json");
-const SESSIONS = join(homedir(), "tmp", `pi-prod-cache-check-${process.pid}`);
+const SESSIONS = mkdtempSync(join(tmpdir(), "pi-prod-cache-check-"));
+
+// Session files are incidental to this check; do not leave them behind.
+process.on("exit", () => rmSync(SESSIONS, { recursive: true, force: true }));
 
 const statOf = (path) => {
 	try {
@@ -55,6 +58,9 @@ if (!existsSync(PI)) {
 }
 const before = statOf(CACHE);
 console.log(`before: ${before ? `${before.size} bytes, mtime ${new Date(before.mtimeMs).toISOString()}` : "(no file)"}`);
+if (before) {
+	console.log("(the cache pre-exists, so run 1 below checks that it is served, not that it is written)");
+}
 
 console.log("\nrun 1 (production env, real agent dir): expect the cache file to appear");
 await runPi("run1", 20);
