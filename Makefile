@@ -42,7 +42,10 @@
 #    methods raise TypeError, or startup fails on a missing export.
 # 3. The coding-agent bundle build is a required step. Missing sparse-checkout
 #    build scripts or bundle failures must stop deployment rather than leave a
-#    partially refreshed runtime.
+#    partially refreshed runtime. The bundle is the entry point npm users run
+#    (`bin.pi` -> dist/bundle/cli.js), so it gets the same freshness assertion as
+#    the package dists and is content-compared by `make verify` -- it is built by
+#    esbuild from the dists, and esbuild strips types without checking them.
 # 4. Verify the staged tree before the live runtime is replaced, then verify
 #    again through the public deployed interface.
 
@@ -62,7 +65,7 @@ define assert-dist-fresh
 		echo "FAIL: packages/$(1)/$(2) not emitted" >&2; exit 1; \
 	fi; \
 	if [ -n "$$(find packages/$(1)/src -name '*.ts' -newer packages/$(1)/$(2) -print -quit 2>/dev/null)" ]; then \
-		echo "FAIL: packages/$(1)/$(2) is older than its sources (compile did not emit)" >&2; exit 1; \
+		echo "FAIL: packages/$(1)/$(2) is older than its sources (it was not rebuilt)" >&2; exit 1; \
 	fi
 endef
 
@@ -81,15 +84,14 @@ build-agent:
 # which hid a regeneration failure behind the same `|| true` that exists for
 # tsgo's emit-with-error behavior (trap 1); the follow-up check only asserted
 # that dist/index.js existed, so an older dist passed and the deploy shipped a
-# pi-ai whose catalog was missing a provider. Regeneration and data validation
-# are now hard gates, tsgo keeps its emit tolerance, and the post-steps run
-# unconditionally (same reasoning as build-coding-agent below).
+# pi-ai whose catalog was missing a provider.
 #
-# Regeneration and data validation are hard gates, and so is the typecheck: a
-# regeneration that drops a provider deletes its generated shard and leaves the
-# importing module with a TS2307, which is the only signal left when the generated
-# output agrees with itself (check:model-data compares generated to generated, so
-# it cannot see it). See `make mutcheck-deploy-gates`.
+# All three steps are hard gates now, the typecheck included: a regeneration that
+# drops a provider deletes its generated shard and leaves the importing module with
+# a TS2307, which is the only signal left when the generated output agrees with
+# itself (check:model-data compares generated to generated, so it cannot see it).
+# See `make mutcheck-deploy-gates`. The post-steps run unconditionally (same
+# reasoning as build-coding-agent below).
 #
 # Keep the emit/copy steps in sync with `build:offline` in packages/ai/package.json.
 build-ai:
@@ -122,7 +124,7 @@ build-coding-agent:
 	chmod +x packages/coding-agent/dist/cli.js packages/coding-agent/dist/rpc-entry.js
 	cd packages/coding-agent && npm run copy-assets
 	node scripts/build-coding-agent-bundle.mjs
-	test -x packages/coding-agent/dist/bundle/cli.js || { echo "FAIL: coding-agent bundle not emitted" >&2; exit 1; }
+	$(call assert-dist-fresh,coding-agent,dist/bundle/cli.js)
 
 # Refuse to build from a tree that is mid-merge or carries conflict markers.
 #
@@ -155,6 +157,11 @@ deploy-full: deploy  ## Compatibility alias for the complete local-package deplo
 # loudly instead.
 build-extra: build-ai build-protocol build-client build-tui
 
+# Compare the deployed tree against this build. The bundle is included because it
+# is the entry point npm users run (`bin.pi` -> dist/bundle/cli.js): it is built by
+# esbuild from the dists, and esbuild strips types without checking them, so it is
+# only as good as the gated dists behind it. Asserting that it merely existed left
+# the one artifact `pi` executes uncompared.
 verify:  ## Verify deployed dist matches this build (versions + content + exec bits)
 	@test -x $(RUNTIME_DIR)/dist/cli.js || { echo "FAIL: $(RUNTIME_DIR)/dist/cli.js missing or not executable" >&2; exit 1; }
 	@test "$$(sed -n 's/^commit: //p' $(RUNTIME_DIR)/.deployed-commit 2>/dev/null)" = "$$(git rev-parse HEAD)" || { \
@@ -174,6 +181,9 @@ verify:  ## Verify deployed dist matches this build (versions + content + exec b
 		echo "FAIL: pi-agent-core dist drift (run make deploy)" >&2; exit 1; }
 	@cmp -s packages/coding-agent/dist/cli.js $(RUNTIME_DIR)/dist/cli.js || { \
 		echo "FAIL: coding-agent dist drift (run make deploy)" >&2; exit 1; }
+	@diff -rq packages/coding-agent/dist/bundle $(RUNTIME_DIR)/dist/bundle >/dev/null 2>&1 || { \
+		echo "FAIL: coding-agent bundle drift (run make deploy); first differences:" >&2; \
+		diff -rq packages/coding-agent/dist/bundle $(RUNTIME_DIR)/dist/bundle 2>&1 | head -10 >&2; exit 1; }
 	@src=$$(node -p "require('./packages/coding-agent/package.json').version"); \
 	dep=$$(node -p "require('$(RUNTIME_DIR)/package.json').version"); \
 	[ "$$src" = "$$dep" ] || { echo "FAIL: coding-agent version drift: source $$src vs deployed $$dep" >&2; exit 1; }
