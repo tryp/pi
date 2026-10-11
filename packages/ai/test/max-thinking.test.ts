@@ -30,7 +30,7 @@ describe("max thinking level", () => {
 		expect(clampThinkingLevel(model, "max")).toBe("high");
 	});
 
-	it.each(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] as const)(
+	it.each(["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-luna"] as const)(
 		"exposes xhigh and max for openai-codex/%s",
 		(modelId) => {
 			const model = getModel("openai-codex", modelId);
