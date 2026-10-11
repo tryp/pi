@@ -13,7 +13,10 @@ export function opencodeGoProvider(): Provider<"anthropic-messages" | "openai-co
 		auth: { apiKey: envApiKeyAuth("OpenCode API key", ["OPENCODE_API_KEY"]) },
 		models: Object.values(OPENCODE_GO_MODELS),
 		fetchModels: (ctx) =>
-			fetchOpencodeModels("opencode-go", ctx.signal) as unknown as Promise<
+			fetchOpencodeModels("opencode-go", ctx.signal, {
+				allowNetwork: ctx.allowNetwork,
+				force: ctx.force,
+			}) as unknown as Promise<
 				readonly import("../types.ts").Model<"anthropic-messages" | "openai-completions" | "openai-responses">[]
 			>,
 		api: {

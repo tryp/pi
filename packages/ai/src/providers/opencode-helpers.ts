@@ -9,10 +9,18 @@
 
 import type { Api, Model, ModelCost } from "../types.ts";
 import { isDeepSeekModelId } from "./deepseek-compat.ts";
+import {
+	getModelsDevCatalog,
+	MODELS_DEV_CATALOG_URL,
+	type ModelsDevCatalog,
+	type ModelsDevModelEntry,
+	type ModelsDevProviderEntry,
+} from "./models-dev-client.ts";
 
 export const ZEN_MODELS_ENDPOINT = "https://opencode.ai/zen/v1/models";
 export const GO_MODELS_ENDPOINT = "https://opencode.ai/zen/go/v1/models";
-export const MODELS_DEV_ENDPOINT = "https://models.dev/api.json";
+/** The models.dev catalog endpoint. Owned by `models-dev-client.ts`. */
+export const MODELS_DEV_ENDPOINT = MODELS_DEV_CATALOG_URL;
 
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
 export const DEFAULT_MAX_TOKENS = 16_384;
@@ -89,20 +97,10 @@ export const GO_ANTHROPIC_MODEL_IDS = new Set([
 export type OpenCodeModelListEntry = { id?: string; name?: string };
 export type OpenCodeModelListResponse = { data?: OpenCodeModelListEntry[] };
 
-export type ModelsDevModelEntry = {
-	id?: string;
-	name?: string;
-	reasoning?: boolean;
-	tool_call?: boolean;
-	status?: string;
-	limit?: { context?: number; output?: number };
-	modalities?: { input?: string[] };
-	cost?: { input?: number; output?: number; cache_read?: number; cache_write?: number };
-	provider?: { npm?: string | null };
-};
+export type { ModelsDevModelEntry, ModelsDevProviderEntry };
 
-export type ModelsDevProviderEntry = { models?: Record<string, ModelsDevModelEntry> };
-export type ModelsDevResponse = Record<string, ModelsDevProviderEntry>;
+/** The whole models.dev payload, keyed by provider. */
+export type ModelsDevResponse = ModelsDevCatalog;
 
 function normalizePositiveNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
@@ -126,8 +124,25 @@ export async function fetchOfficialEntries(url: string, signal?: AbortSignal): P
 	return payload.data.filter((e) => typeof e.id === "string" && e.id.trim().length > 0);
 }
 
-export async function fetchModelsDev(signal?: AbortSignal): Promise<ModelsDevResponse> {
-	return fetchJson<ModelsDevResponse>(MODELS_DEV_ENDPOINT, signal);
+/**
+ * models.dev enrichment for opencode discovery.
+ *
+ * Routed through the shared rate-limited client: one fetch per refresh window per
+ * process, revalidated with the ETag models.dev serves (0 bytes on 304), shared between
+ * concurrent callers, and deferred when models.dev answers 429. A failed refresh returns
+ * the cached payload when there is one, so an upstream outage degrades enrichment rather
+ * than failing discovery; it throws only when nothing is cached.
+ */
+export async function fetchModelsDev(
+	signal?: AbortSignal,
+	options: { allowNetwork?: boolean; force?: boolean } = {},
+): Promise<ModelsDevResponse> {
+	const result = await getModelsDevCatalog({
+		signal,
+		allowNetwork: options.allowNetwork,
+		force: options.force,
+	});
+	return result.catalog;
 }
 
 export function getModelsDevModel(
@@ -341,6 +356,7 @@ export function buildFallbackEntriesFromModelsDev(
 export async function fetchOpencodeModels(
 	variant: OpencodeVariant,
 	signal?: AbortSignal,
+	options: { allowNetwork?: boolean; force?: boolean } = {},
 ): Promise<readonly Model<Api>[]> {
 	const basePath = variant === "opencode" ? "https://opencode.ai/zen" : "https://opencode.ai/zen/go";
 	const endpoint = variant === "opencode" ? ZEN_MODELS_ENDPOINT : GO_MODELS_ENDPOINT;
@@ -353,7 +369,7 @@ export async function fetchOpencodeModels(
 	// Concurrent fetches with individual error handling so one failure doesn't block the other
 	const [officialResult, devResult] = await Promise.allSettled([
 		fetchOfficialEntries(endpoint, signal),
-		fetchModelsDev(signal),
+		fetchModelsDev(signal, options),
 	]);
 
 	if (officialResult.status === "fulfilled") official = officialResult.value;

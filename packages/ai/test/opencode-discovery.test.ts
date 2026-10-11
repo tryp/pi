@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RefreshModelsContext } from "../src/models.ts";
 import { InMemoryModelsStore } from "../src/models-store.ts";
 import { isDeepSeekModelId } from "../src/providers/deepseek-compat.ts";
+import { resetModelsDevClientState } from "../src/providers/models-dev-client.ts";
 import { opencodeProvider } from "../src/providers/opencode.ts";
 import { opencodeGoProvider } from "../src/providers/opencode-go.ts";
 import {
@@ -14,8 +15,16 @@ import {
 	ZEN_MODELS_ENDPOINT,
 } from "../src/providers/opencode-helpers.ts";
 
-afterEach(() => vi.restoreAllMocks());
-beforeEach(() => vi.restoreAllMocks());
+afterEach(() => {
+	vi.restoreAllMocks();
+	// The models.dev client caches across calls by design, so a test that stubs fetch
+	// would otherwise be served the previous test's payload.
+	resetModelsDevClientState();
+});
+beforeEach(() => {
+	vi.restoreAllMocks();
+	resetModelsDevClientState();
+});
 
 describe("opencode helpers", () => {
 	it("builds Zen models with correct transport mapping (npm-aware)", () => {

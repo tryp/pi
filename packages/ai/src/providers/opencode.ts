@@ -16,7 +16,10 @@ export function opencodeProvider(): Provider<
 		auth: { apiKey: envApiKeyAuth("OpenCode API key", ["OPENCODE_API_KEY"]) },
 		models: Object.values(OPENCODE_MODELS),
 		fetchModels: (ctx) =>
-			fetchOpencodeModels("opencode", ctx.signal) as unknown as Promise<
+			fetchOpencodeModels("opencode", ctx.signal, {
+				allowNetwork: ctx.allowNetwork,
+				force: ctx.force,
+			}) as unknown as Promise<
 				readonly import("../types.ts").Model<
 					"anthropic-messages" | "google-generative-ai" | "openai-completions" | "openai-responses"
 				>[]
