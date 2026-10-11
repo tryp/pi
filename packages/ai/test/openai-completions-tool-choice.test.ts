@@ -1,8 +1,9 @@
 import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { convertMessages } from "../src/api/openai-completions.ts";
-import { getModel, stream, streamSimple } from "../src/compat.ts";
+import { type BuiltinProvider, getModel, stream, streamSimple } from "../src/compat.ts";
 import type { AssistantMessage, Model, SimpleStreamOptions, Tool, ToolResultMessage } from "../src/types.ts";
+import { catalogModels } from "./catalog-utils.ts";
 
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as unknown,
@@ -101,6 +102,18 @@ async function captureSimpleParams(
 	).result();
 
 	return (payload ?? mockState.lastParams) as CapturedParams;
+}
+
+/**
+ * The completions-API models of a provider, with `compat` narrowed to the completions shape.
+ * The catalog is rebuilt from live models.dev data on every build, so vendor ids move;
+ * selecting models by shape keeps a test on the behavior instead of on an id a catalog
+ * refresh can rename.
+ */
+function catalogCompletionsModels(provider: BuiltinProvider): Model<"openai-completions">[] {
+	return catalogModels(provider).filter(
+		(model): model is Model<"openai-completions"> => model.api === "openai-completions",
+	);
 }
 
 describe("openai-completions tool_choice", () => {
@@ -320,33 +333,54 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("stores z.ai effort metadata", () => {
+		// The z.ai family carries an effort profile: every model with a thinking level map
+		// declares reasoning-effort support and covers every level. Asserted against whatever
+		// models the catalog holds, so a vendor rename cannot quietly drop the check.
 		for (const provider of ["zai", "zai-coding-cn"] as const) {
-			for (const modelId of ["glm-5.2", "glm-5.2-highspeed"] as const) {
-				const model = getModel(provider, modelId)!;
-				expect(model.compat?.supportsReasoningEffort).toBe(true);
-				expect(model.thinkingLevelMap).toEqual({
-					off: "none",
-					minimal: null,
-					low: null,
-					medium: null,
-					high: "high",
-					xhigh: null,
-					max: "max",
-				});
-			}
+			const profiled = catalogCompletionsModels(provider).filter((model) => model.thinkingLevelMap !== undefined);
+			expect(profiled.length, `${provider} has no model with a thinking level map`).toBeGreaterThan(0);
 
-			const glm53 = getModel(provider, "glm-5.3")!;
-			expect(glm53.compat?.supportsReasoningEffort).toBe(true);
-			expect(glm53.thinkingLevelMap).toEqual({
-				off: null,
-				minimal: null,
-				low: "low",
-				medium: null,
-				high: "high",
-				xhigh: null,
-				max: "max",
-			});
+			for (const model of profiled) {
+				expect(model.compat?.supportsReasoningEffort, `${provider}/${model.id}`).toBe(true);
+				expect(Object.keys(model.thinkingLevelMap ?? {}).sort(), `${provider}/${model.id}`).toEqual([
+					"high",
+					"low",
+					"max",
+					"medium",
+					"minimal",
+					"off",
+					"xhigh",
+				]);
+			}
 		}
+
+		// GLM-5.2 and GLM-5.3 get different effort profiles from the generator; both shapes
+		// must still reach the catalog, matched by shape rather than by model id.
+		const glm52Profile = {
+			off: "none",
+			minimal: null,
+			low: null,
+			medium: null,
+			high: "high",
+			xhigh: null,
+			max: "max",
+		};
+		const glm53Profile = {
+			off: null,
+			minimal: null,
+			low: "low",
+			medium: null,
+			high: "high",
+			xhigh: null,
+			max: "max",
+		};
+
+		const zaiProfiles = catalogCompletionsModels("zai").map((model) => model.thinkingLevelMap);
+		expect(zaiProfiles).toContainEqual(glm52Profile);
+		expect(zaiProfiles).toContainEqual(glm53Profile);
+
+		const zaiCodingCnProfiles = catalogCompletionsModels("zai-coding-cn").map((model) => model.thinkingLevelMap);
+		expect(zaiCodingCnProfiles).toContainEqual(glm53Profile);
 	});
 
 	it("maps z.ai GLM-5.2 thinking levels to reasoning_effort", async () => {
@@ -652,7 +686,9 @@ describe("openai-completions tool_choice", () => {
 		).result();
 
 		expect(response.stopReason).toBe("error");
-		expect(response.errorMessage).toBe("Stream ended without finish_reason");
+		// The subject here is that the reason survives; the pre-output abort marker that
+		// wraps it is pinned exactly in openai-completions-retry.test.ts.
+		expect(response.errorMessage).toContain("Stream ended without finish_reason");
 	});
 
 	it("accepts streams without finish_reason when compat disables it", async () => {
@@ -1244,7 +1280,12 @@ describe("openai-completions tool_choice", () => {
 			},
 		];
 
-		const { compat: _compat, ...baseModel } = getModel("opencode-go", "kimi-k2.6")!;
+		// The normalization is keyed on the provider, not the model id, so any opencode-go
+		// completions model exercises it; take one from the catalog so a catalog refresh
+		// cannot break the test.
+		const [opencodeGoModel] = catalogCompletionsModels("opencode-go");
+		expect(opencodeGoModel, "opencode-go has no completions model").toBeDefined();
+		const { compat: _compat, ...baseModel } = opencodeGoModel!;
 		const model = { ...baseModel, api: "openai-completions" } as const;
 		const response = await streamSimple(
 			model,
@@ -1291,7 +1332,11 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("replays OpenCode Go reasoning thinking blocks as reasoning_content", () => {
-		const { compat: _compat, ...baseModel } = getModel("opencode-go", "kimi-k2.6")!;
+		// Provider-keyed like the streaming test above; the vendor id is not what the
+		// behavior depends on.
+		const [opencodeGoModel] = catalogCompletionsModels("opencode-go");
+		expect(opencodeGoModel, "opencode-go has no completions model").toBeDefined();
+		const { compat: _compat, ...baseModel } = opencodeGoModel!;
 		const model = { ...baseModel, api: "openai-completions" } as Model<"openai-completions">;
 		const messages = convertMessages(
 			model,
@@ -1301,7 +1346,7 @@ describe("openai-completions tool_choice", () => {
 						role: "assistant",
 						api: "openai-completions",
 						provider: "opencode-go",
-						model: "kimi-k2.6",
+						model: model.id,
 						content: [
 							{ type: "thinking", thinking: "think", thinkingSignature: "reasoning" },
 							{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "README.md" } },
@@ -1349,49 +1394,37 @@ describe("openai-completions tool_choice", () => {
 		expect(messages[0]).not.toHaveProperty("reasoning");
 	});
 
-	it("sends thinking disabled for OpenCode Go Kimi K2.6 when thinking is off", async () => {
-		const model = getModel("opencode-go", "kimi-k2.6")!;
-		let payload: unknown;
+	it("sends thinking disabled for OpenCode Go deepseek-format models when thinking is off", async () => {
+		// `thinking: { type: ... }` is emitted by the compat.thinkingFormat === "deepseek"
+		// branch, so derive the models that take it instead of naming a vendor id that a
+		// catalog refresh can rename.
+		const models = catalogCompletionsModels("opencode-go").filter(
+			(model) =>
+				model.compat?.thinkingFormat === "deepseek" && model.reasoning && model.thinkingLevelMap?.off !== null,
+		);
+		expect(models.length, "opencode-go has no model on the deepseek thinking format").toBeGreaterThan(0);
 
-		await streamSimple(
-			model,
-			{
-				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
-			},
-			{
-				apiKey: "test",
-				onPayload: (params: unknown) => {
-					payload = params;
-				},
-			},
-		).result();
-
-		const params = (payload ?? mockState.lastParams) as { thinking?: unknown; reasoning_effort?: string };
-		expect(params.thinking).toEqual({ type: "disabled" });
-		expect(params.reasoning_effort).toBeUndefined();
+		for (const model of models) {
+			const params = await captureSimpleParams(model, undefined);
+			expect(params.thinking, `${model.provider}/${model.id}`).toEqual({ type: "disabled" });
+			expect(params.reasoning_effort, `${model.provider}/${model.id}`).toBeUndefined();
+		}
 	});
 
-	it("sends thinking enabled for OpenCode Go Kimi K2.6 when thinking is enabled", async () => {
-		const model = getModel("opencode-go", "kimi-k2.6")!;
-		let payload: unknown;
+	it("sends thinking enabled for OpenCode Go deepseek-format models when thinking is enabled", async () => {
+		const models = catalogCompletionsModels("opencode-go").filter(
+			(model) => model.compat?.thinkingFormat === "deepseek" && model.reasoning,
+		);
+		expect(models.length, "opencode-go has no model on the deepseek thinking format").toBeGreaterThan(0);
 
-		await streamSimple(
-			model,
-			{
-				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
-			},
-			{
-				apiKey: "test",
-				reasoning: "high",
-				onPayload: (params: unknown) => {
-					payload = params;
-				},
-			},
-		).result();
-
-		const params = (payload ?? mockState.lastParams) as { thinking?: unknown; reasoning_effort?: string };
-		expect(params.thinking).toEqual({ type: "enabled" });
-		expect(params.reasoning_effort).toBeUndefined();
+		for (const model of models) {
+			const params = await captureSimpleParams(model, "high");
+			expect(params.thinking, `${model.provider}/${model.id}`).toEqual({ type: "enabled" });
+			// The endpoint resolves as effort-capable (the compat layer defaults
+			// supportsReasoningEffort from the base URL), so this branch also maps the requested
+			// level onto reasoning_effort rather than staying silent.
+			expect(params.reasoning_effort, `${model.provider}/${model.id}`).toBe(model.thinkingLevelMap?.high ?? "high");
+		}
 	});
 
 	it("omits disabled thinking for Moonshot Kimi K2.7 Code models", async () => {
@@ -1443,14 +1476,27 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("sends max_tokens for OpenCode completions models", async () => {
-		const cases = [getModel("opencode-go", "kimi-k2.6")!, getModel("opencode", "kimi-k2.6")!] as const;
+		// Every OpenCode (Go) completions model declares the max_tokens field; the payload
+		// follows that field, checked on one model per provider.
+		const providerModels = [
+			{ provider: "opencode-go", models: catalogCompletionsModels("opencode-go") },
+			{ provider: "opencode", models: catalogCompletionsModels("opencode") },
+		];
 
-		for (const model of cases) {
+		for (const { provider, models } of providerModels) {
+			expect(models.length, `${provider} has no completions model`).toBeGreaterThan(0);
+			for (const model of models) {
+				expect(model.compat?.maxTokensField, `${provider}/${model.id}`).toBe("max_tokens");
+			}
+		}
+
+		for (const { provider, models } of providerModels) {
+			const model = models[0];
+			expect(model, `${provider} has no completions model`).toBeDefined();
+
 			let payload: unknown;
-			expect(model.compat?.maxTokensField).toBe("max_tokens");
-
 			await streamSimple(
-				model,
+				model!,
 				{
 					messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
 				},
@@ -1464,8 +1510,8 @@ describe("openai-completions tool_choice", () => {
 			).result();
 
 			const params = (payload ?? mockState.lastParams) as { max_tokens?: number; max_completion_tokens?: number };
-			expect(params.max_tokens).toBe(123);
-			expect(params.max_completion_tokens).toBeUndefined();
+			expect(params.max_tokens, `${provider}/${model!.id}`).toBe(123);
+			expect(params.max_completion_tokens, `${provider}/${model!.id}`).toBeUndefined();
 		}
 	});
 

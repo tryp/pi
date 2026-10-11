@@ -28,6 +28,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { completeSimple, getEnvApiKey, getModel } from "../src/compat.ts";
 import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage } from "../src/types.ts";
 import { hasAzureOpenAICredentials } from "./azure-utils.ts";
+import { catalogDrift } from "./catalog-utils.ts";
 import { hasCloudflareAiGatewayCredentials, hasCloudflareWorkersAICredentials } from "./cloudflare-utils.ts";
 import { resolveApiKey } from "./oauth.ts";
 
@@ -68,10 +69,10 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	// OpenAI Codex
 	{ provider: "openai-codex", model: "gpt-5.5", label: "openai-codex-gpt-5.5" },
 	// GitHub Copilot
-	{ provider: "github-copilot", model: "claude-sonnet-4.5", label: "copilot-claude-sonnet-4.5" },
-	{ provider: "github-copilot", model: "gpt-5.1-codex", label: "copilot-gpt-5.1-codex" },
-	{ provider: "github-copilot", model: "gemini-3-flash-preview", label: "copilot-gemini-3-flash-preview" },
-	{ provider: "github-copilot", model: "grok-code-fast-1", label: "copilot-grok-code-fast-1" },
+	{ provider: "github-copilot", model: "claude-sonnet-4.6", label: "copilot-claude-sonnet-4.6" },
+	{ provider: "github-copilot", model: "gpt-5.3-codex", label: "copilot-gpt-5.3-codex" },
+	{ provider: "github-copilot", model: "gemini-3.5-flash", label: "copilot-gemini-3.5-flash" },
+	{ provider: "github-copilot", model: "grok-4.5", label: "copilot-grok-4.5" },
 	// Amazon Bedrock
 	{
 		provider: "amazon-bedrock",
@@ -81,7 +82,7 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	// xAI
 	{ provider: "xai", model: "grok-4.3", label: "xai-grok-4.3" },
 	// Cerebras
-	{ provider: "cerebras", model: "zai-glm-4.7", label: "cerebras-zai-glm-4.7" },
+	{ provider: "cerebras", model: "qwen-3.8-27b", label: "cerebras-qwen-3.8-27b" },
 	// Cloudflare Workers AI
 	{ provider: "cloudflare-workers-ai", model: "@cf/moonshotai/kimi-k2.6", label: "cloudflare-kimi-k2.6" },
 	// Cloudflare AI Gateway
@@ -92,8 +93,8 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	},
 	{
 		provider: "cloudflare-ai-gateway",
-		model: "claude-sonnet-4-5",
-		label: "cloudflare-gateway-claude-sonnet-4-5",
+		model: "claude-sonnet-4.5",
+		label: "cloudflare-gateway-claude-sonnet-4.5",
 		upstreamApiKeyEnv: "ANTHROPIC_API_KEY",
 	},
 	{
@@ -107,7 +108,7 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	// Hugging Face
 	{ provider: "huggingface", model: "moonshotai/Kimi-K2.5", label: "huggingface-kimi-k2.5" },
 	// Together AI
-	{ provider: "together", model: "moonshotai/Kimi-K2.6", label: "together-kimi-k2.6" },
+	{ provider: "together", model: "moonshotai/Kimi-K3", label: "together-kimi-k3" },
 	// Baseten
 	{ provider: "baseten", model: "zai-org/GLM-5.2", label: "baseten-glm-5.2" },
 	// Kimi For Coding
@@ -121,12 +122,12 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "opencode", model: "big-pickle", label: "zen-big-pickle" },
 	{ provider: "opencode", model: "claude-sonnet-4-5", label: "zen-claude-sonnet-4-5" },
 	{ provider: "opencode", model: "gemini-3-flash", label: "zen-gemini-3-flash" },
-	{ provider: "opencode", model: "glm-4.7-free", label: "zen-glm-4.7-free" },
+	{ provider: "opencode", model: "exo-free", label: "zen-exo-free" },
 	{ provider: "opencode", model: "gpt-5.2-codex", label: "zen-gpt-5.2-codex" },
-	{ provider: "opencode", model: "minimax-m2.1-free", label: "zen-minimax-m2.1-free" },
+	{ provider: "opencode", model: "nemotron-3-ultra-free", label: "zen-nemotron-3-ultra-free" },
 	// OpenCode Go
-	{ provider: "opencode-go", model: "kimi-k2.5", label: "go-kimi-k2.5" },
-	{ provider: "opencode-go", model: "minimax-m2.5", label: "go-minimax-m2.5" },
+	{ provider: "opencode-go", model: "kimi-k2.7-code", label: "go-kimi-k2.7-code" },
+	{ provider: "opencode-go", model: "minimax-m2.7", label: "go-minimax-m2.7" },
 	// Xiaomi MiMo
 	{ provider: "xiaomi", model: "mimo-v2.5-pro", label: "xiaomi-mimo-v2.5-pro" },
 	{ provider: "xiaomi-token-plan-cn", model: "mimo-v2.5-pro", label: "xiaomi-token-plan-cn-mimo-v2.5-pro" },
@@ -346,6 +347,19 @@ async function generateContext(
 		api: model.api,
 	};
 }
+
+// The table above is `provider: string`/`model: string`, and `generateContext` casts `getModel`
+// away, so a stale id does not fail to compile and does not fail to run: it logs "Model not found"
+// and drops the pair from the live matrix. This is the counter for that silent path -- it runs
+// without credentials, so drift is visible before anyone spends a key on the fixture run.
+describe("Cross-Provider Handoff fixture table", () => {
+	it("names models that exist in the generated catalog", () => {
+		const drift = PROVIDER_MODEL_PAIRS.map((pair) => catalogDrift(pair.provider, pair.model)).filter(
+			(reason): reason is string => reason !== undefined,
+		);
+		expect(drift).toEqual([]);
+	});
+});
 
 describe.skipIf(!hasAnyApiKey())("Cross-Provider Handoff", () => {
 	let contexts: Record<string, CachedContext>;

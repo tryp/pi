@@ -347,7 +347,7 @@ describe("models.dev client conditional requests", () => {
 		const clock = createClock();
 		const signals: (AbortSignal | null | undefined)[] = [];
 		const headers: Headers[] = [];
-		const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+		const fetchImpl = vi.fn(async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
 			headers.push(new Headers(init?.headers));
 			signals.push(init?.signal);
 			return headers.length === 1 ? ok(CATALOG_A, { etag: "v1" }) : status(304);
@@ -409,7 +409,7 @@ describe("models.dev client single-flight", () => {
 		const clock = createClock();
 		const gate = deferred<Response>();
 		let requestSignal: AbortSignal | null | undefined;
-		const fetchImpl = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+		const fetchImpl = vi.fn((_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
 			requestSignal = init?.signal;
 			return gate.promise;
 		});

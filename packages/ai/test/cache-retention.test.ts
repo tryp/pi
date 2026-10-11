@@ -3,8 +3,9 @@ import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
 import { stream as streamOpenAIResponses } from "../src/api/openai-responses.ts";
 import { getModel, stream } from "../src/compat.ts";
-import { MODELS } from "../src/models.generated.ts";
+import type { BuiltinProvider } from "../src/providers/all.ts";
 import type { Context, Model } from "../src/types.ts";
+import { catalogModel } from "./catalog-utils.ts";
 
 class PayloadCaptured extends Error {
 	constructor() {
@@ -492,15 +493,32 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			expect(capturedPayload.prompt_cache_retention).toBeUndefined();
 		});
 
-		it.each([
-			MODELS.opencode["deepseek-v4-flash"],
-			MODELS.opencode["deepseek-v4-pro"],
-			MODELS.opencode["kimi-k2.5"],
-			MODELS.opencode["kimi-k2.6"],
-			MODELS.opencode["minimax-m2.7"],
-			MODELS["opencode-go"]["kimi-k2.6"],
-		] as const)("should omit long cache retention for $provider/$id", async (metadata) => {
-			const model = metadata as Model<"openai-completions">;
+		// Long cache retention is withheld from these models because they declare
+		// supportsLongCacheRetention: false. Ids are resolved through the builtin catalog by
+		// name: a renamed id then fails here, named, instead of reaching the stream as
+		// undefined and surfacing as a 30s timeout on an unrelated code path.
+		const longCacheUnsupported: Array<[BuiltinProvider, string]> = [
+			["opencode", "deepseek-v4-flash"],
+			["opencode", "deepseek-v4-pro"],
+			["opencode", "kimi-k2.5"],
+			["opencode", "kimi-k2.6"],
+			["opencode", "minimax-m2.7"],
+			// opencode-go/kimi-k2.6 used to sit here. No opencode-go model declares
+			// supportsLongCacheRetention: false any more (its kimi ids are now kimi-k2.7-code
+			// and kimi-k3, and neither declines long cache retention), so the row was dropped
+			// rather than re-pointed at a model that would fail the assertion below for a
+			// different reason.
+		];
+
+		it("has models that decline long cache retention", () => {
+			// An empty table would otherwise drop this coverage silently.
+			expect(longCacheUnsupported.length).toBeGreaterThan(0);
+		});
+
+		it.each(longCacheUnsupported)("should omit long cache retention for %s/%s", async (provider, id) => {
+			const model = catalogModel(provider, id) as Model<"openai-completions"> | undefined;
+			expect(model, `${provider}/${id} is missing from the generated catalog`).toBeDefined();
+			if (!model) return;
 			let capturedPayload: OpenAICompletionsCachePayload | undefined;
 
 			try {

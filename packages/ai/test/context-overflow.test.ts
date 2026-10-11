@@ -339,7 +339,7 @@ describe("Context overflow error handling", () => {
 
 	describe.skipIf(!process.env.TOGETHER_API_KEY)("Together AI", () => {
 		it("Kimi-K2.6 - should detect overflow via isContextOverflow", async () => {
-			const model = getModel("together", "moonshotai/Kimi-K2.6");
+			const model = getModel("together", "moonshotai/Kimi-K3");
 			const result = await testContextOverflow(model, process.env.TOGETHER_API_KEY!);
 			logResult(result);
 
@@ -599,57 +599,50 @@ describe("Context overflow error handling", () => {
 	// Ollama (local)
 	// =============================================================================
 
-	// Check if ollama is installed and local LLM tests are enabled
-	let ollamaInstalled = false;
-	if (!process.env.PI_NO_LOCAL_LLM) {
+	// Check if ollama is installed, the model is already pulled, and local LLM tests are
+	// enabled. The model check belongs here rather than in beforeAll: pulling it there can
+	// fail (offline, no disk), and the early return left `model` undefined while the test
+	// still ran and crashed on `model.contextWindow` instead of skipping.
+	let ollamaSkipReason: string | undefined;
+	if (process.env.PI_NO_LOCAL_LLM) {
+		ollamaSkipReason = "PI_NO_LOCAL_LLM is set";
+	} else {
 		try {
 			execSync("which ollama", { stdio: "ignore" });
-			ollamaInstalled = true;
+			execSync("ollama list | grep -q 'gpt-oss:20b'", { stdio: "ignore" });
 		} catch {
-			ollamaInstalled = false;
+			ollamaSkipReason = "ollama is not installed or gpt-oss:20b is not pulled (run: ollama pull gpt-oss:20b)";
 		}
 	}
+	const ollamaDescribeName = `Ollama (local)${ollamaSkipReason ? ` [skipped: ${ollamaSkipReason}]` : ""}`;
 
-	describe.skipIf(!ollamaInstalled)("Ollama (local)", () => {
+	describe.skipIf(ollamaSkipReason !== undefined)(ollamaDescribeName, () => {
 		let ollamaProcess: ChildProcess | null = null;
-		let model: Model<"openai-completions">;
+		let model: Model<"openai-completions"> | undefined;
+		let serverReady = false;
 
 		beforeAll(async () => {
-			// Check if model is available, if not pull it
-			try {
-				execSync("ollama list | grep -q 'gpt-oss:20b'", { stdio: "ignore" });
-			} catch {
-				console.log("Pulling gpt-oss:20b model for Ollama overflow tests...");
-				try {
-					execSync("ollama pull gpt-oss:20b", { stdio: "inherit" });
-				} catch (_e) {
-					console.warn("Failed to pull gpt-oss:20b model, tests will be skipped");
-					return;
-				}
-			}
-
 			// Start ollama server
 			ollamaProcess = spawn("ollama", ["serve"], {
 				detached: false,
 				stdio: "ignore",
 			});
 
-			// Wait for server to be ready
-			await new Promise<void>((resolve) => {
-				const checkServer = async () => {
-					try {
-						const response = await fetch("http://localhost:11434/api/tags");
-						if (response.ok) {
-							resolve();
-						} else {
-							setTimeout(checkServer, 500);
-						}
-					} catch {
-						setTimeout(checkServer, 500);
-					}
-				};
-				setTimeout(checkServer, 1000);
-			});
+			// Bounded wait: an unbounded poll burns the whole beforeAll budget and then
+			// reports a timeout instead of the cause. Readiness on a warm machine is well
+			// under a second, so 30s is a wide bound, not a plausible default.
+			const deadline = Date.now() + 30_000;
+			while (!serverReady && Date.now() < deadline) {
+				try {
+					const response = await fetch("http://localhost:11434/api/tags");
+					if (response.ok) serverReady = true;
+				} catch {
+					// not up yet
+				}
+				if (!serverReady) await new Promise((resolve) => setTimeout(resolve, 500));
+			}
+
+			if (!serverReady) return;
 
 			model = {
 				id: "gpt-oss:20b",
@@ -672,7 +665,13 @@ describe("Context overflow error handling", () => {
 			}
 		});
 
-		it("gpt-oss:20b - should detect overflow via isContextOverflow (ollama silently truncates)", async () => {
+		it("gpt-oss:20b - should detect overflow via isContextOverflow (ollama silently truncates)", async (ctx) => {
+			if (!model) {
+				console.warn("Skipping Ollama overflow test: ollama serve did not become ready within 30s");
+				ctx.skip();
+				return;
+			}
+
 			const result = await testContextOverflow(model, "ollama");
 			logResult(result);
 

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
 import { getModel } from "../src/compat.ts";
 import type { Model } from "../src/types.ts";
+import { catalogModels } from "./catalog-utils.ts";
 
 interface FakeOpenAIClientOptions {
 	apiKey: string;
@@ -171,15 +172,22 @@ describe("openai-completions prompt caching", () => {
 		expect(headers["x-session-affinity"]).toBe("session-affinity");
 	});
 
-	it.each(["accounts/fireworks/models/glm-5p2", "accounts/fireworks/routers/glm-5p2-fast"] as const)(
-		"sends Fireworks session affinity for %s",
-		async (modelId) => {
-			const model = getModel("fireworks", modelId);
-			const { headers } = await captureRequest({ sessionId: "fireworks-session" }, model);
+	// Derived from the catalog rather than two pinned ids: the glm-5p2 pair was renamed to
+	// glm-5p3 and moved to the Anthropic-compatible API, which broke only the fixture. The
+	// Anthropic path asserts the same rule in fireworks-models.test.ts.
+	const fireworksOpenAICompletionsModels = catalogModels("fireworks")
+		.filter((model): model is Model<"openai-completions"> => model.api === "openai-completions")
+		.filter((model) => model.compat?.sendSessionAffinityHeaders === true);
 
-			expect(headers["x-session-affinity"]).toBe("fireworks-session");
-		},
-	);
+	it("registers Fireworks models that request session affinity headers", () => {
+		expect(fireworksOpenAICompletionsModels.length).toBeGreaterThan(0);
+	});
+
+	it.each(fireworksOpenAICompletionsModels)("sends Fireworks session affinity for $id", async (model) => {
+		const { headers } = await captureRequest({ sessionId: "fireworks-session" }, model);
+
+		expect(headers["x-session-affinity"]).toBe("fireworks-session");
+	});
 
 	it("uses OpenAI no-session format when configured", async () => {
 		const model = createModel({

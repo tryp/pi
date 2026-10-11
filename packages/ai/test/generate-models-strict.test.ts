@@ -43,7 +43,25 @@ describe("strict model generation", () => {
 				},
 			]),
 		);
-		const catalog = { "alibaba-token-plan": { models: sourceModels } };
+		// The generator refuses to run unless models.dev still serves every provider it ships
+		// (requireModelsDevProviders), so a fixture holding only alibaba-token-plan exits 1 on
+		// that guard instead of reaching the assertion below. The guarded keys need to be
+		// present, not populated: the failure under test happens before anything is written.
+		const catalog: Record<string, { models: Record<string, unknown> }> = {
+			"alibaba-token-plan": { models: sourceModels },
+		};
+		for (const guardedProviderKey of [
+			"amazon-bedrock",
+			"cloudflare-ai-gateway",
+			"cloudflare-workers-ai",
+			"fireworks-ai",
+			"github-copilot",
+			"google-vertex",
+			"kimi-code-plan-cn",
+			"together-ai",
+		]) {
+			catalog[guardedProviderKey] = { models: {} };
+		}
 		writeFileSync(
 			preloadPath,
 			`const catalog = ${JSON.stringify(catalog)};\n` +

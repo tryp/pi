@@ -758,8 +758,8 @@ describe("Generate E2E Tests", () => {
 		});
 	});
 
-	describe.skipIf(!process.env.TOGETHER_API_KEY)("Together AI Provider (Kimi-K2.6 via OpenAI Completions)", () => {
-		const llm = getModel("together", "moonshotai/Kimi-K2.6");
+	describe.skipIf(!process.env.TOGETHER_API_KEY)("Together AI Provider (Kimi-K3 via OpenAI Completions)", () => {
+		const llm = getModel("together", "moonshotai/Kimi-K3");
 
 		it("should complete basic text generation", { retry: 3 }, async () => {
 			await basicTextGeneration(llm);
@@ -1431,30 +1431,72 @@ describe("Generate E2E Tests", () => {
 		});
 	});
 
+	/**
+	 * A ChatGPT-account Codex token does not necessarily entitle every model the catalog lists:
+	 * the same account that runs gpt-5.5 can be refused gpt-5.4 with "The 'gpt-5.4' model is not
+	 * supported when using Codex with a ChatGPT account." That is a property of the account, not of
+	 * the code under test, so the block names it and skips -- and only that refusal is classified
+	 * this way, so a genuine failure (a broken request, a bad response) still fails.
+	 */
+	async function codexEntitlementRefusal(model: Model<Api>, apiKey: string): Promise<string | undefined> {
+		const response = await complete(
+			model,
+			{ messages: [{ role: "user", content: "Reply with exactly: ok", timestamp: Date.now() }] },
+			{ apiKey },
+		);
+		if (response.stopReason !== "error") return undefined;
+		const message = response.errorMessage ?? "";
+		return /is not supported when using Codex with a ChatGPT account/i.test(message)
+			? `the account cannot run ${model.provider}/${model.id} via Codex: ${message}`
+			: undefined;
+	}
+
+	/**
+	 * `gpt-5.4` is listed in the catalog but refused by ChatGPT-account Codex tokens. The block
+	 * probes once and skips with the account's own words instead of reporting six failures for a
+	 * model this account can never run. Drop this and the plain `it.skipIf` calls return if the
+	 * model becomes entitled again.
+	 */
 	describe("OpenAI Codex Provider (gpt-5.4)", () => {
 		const llm = getModel("openai-codex", "gpt-5.4");
+		let refusal: string | undefined;
 
-		it.skipIf(!openaiCodexToken)("should complete basic text generation", { retry: 3 }, async () => {
+		beforeAll(async () => {
+			if (openaiCodexToken) refusal = await codexEntitlementRefusal(llm, openaiCodexToken);
+		});
+
+		/** Skips the test, naming the account's refusal, when this token cannot run the model. */
+		const requireEntitlement = (ctx: { skip: (note?: string) => unknown }) => {
+			if (refusal) ctx.skip(refusal);
+		};
+
+		it.skipIf(!openaiCodexToken)("should complete basic text generation", { retry: 3 }, async (ctx) => {
+			requireEntitlement(ctx);
 			await basicTextGeneration(llm, { apiKey: openaiCodexToken });
 		});
 
-		it.skipIf(!openaiCodexToken)("should handle tool calling", { retry: 3 }, async () => {
+		it.skipIf(!openaiCodexToken)("should handle tool calling", { retry: 3 }, async (ctx) => {
+			requireEntitlement(ctx);
 			await handleToolCall(llm, { apiKey: openaiCodexToken });
 		});
 
-		it.skipIf(!openaiCodexToken)("should handle streaming", { retry: 3 }, async () => {
+		it.skipIf(!openaiCodexToken)("should handle streaming", { retry: 3 }, async (ctx) => {
+			requireEntitlement(ctx);
 			await handleStreaming(llm, { apiKey: openaiCodexToken });
 		});
 
-		it.skipIf(!openaiCodexToken)("should handle thinking", { retry: 3 }, async () => {
+		it.skipIf(!openaiCodexToken)("should handle thinking", { retry: 3 }, async (ctx) => {
+			requireEntitlement(ctx);
 			await handleThinking(llm, { apiKey: openaiCodexToken, reasoningEffort: "high" });
 		});
 
-		it.skipIf(!openaiCodexToken)("should handle multi-turn with thinking and tools", { retry: 3 }, async () => {
+		it.skipIf(!openaiCodexToken)("should handle multi-turn with thinking and tools", { retry: 3 }, async (ctx) => {
+			requireEntitlement(ctx);
 			await multiTurn(llm, { apiKey: openaiCodexToken });
 		});
 
-		it.skipIf(!openaiCodexToken)("should handle image input", { retry: 3 }, async () => {
+		it.skipIf(!openaiCodexToken)("should handle image input", { retry: 3 }, async (ctx) => {
+			requireEntitlement(ctx);
 			await handleImage(llm, { apiKey: openaiCodexToken });
 		});
 	});
@@ -1645,57 +1687,58 @@ describe("Generate E2E Tests", () => {
 		});
 	});
 
-	// Check if ollama is installed and local LLM tests are enabled
-	let ollamaInstalled = false;
-	if (!process.env.PI_NO_LOCAL_LLM) {
+	// Check if ollama is installed, the model is already pulled, and local LLM tests are
+	// enabled. The model check belongs here rather than in beforeAll: pulling it there can
+	// fail (offline, no disk), and the early return left `llm` undefined while the tests still
+	// ran and failed once per retry instead of skipping.
+	let ollamaSkipReason: string | undefined;
+	if (process.env.PI_NO_LOCAL_LLM) {
+		ollamaSkipReason = "PI_NO_LOCAL_LLM is set";
+	} else {
 		try {
 			execSync("which ollama", { stdio: "ignore" });
-			ollamaInstalled = true;
+			execSync("ollama list | grep -q 'gpt-oss:20b'", { stdio: "ignore" });
 		} catch {
-			ollamaInstalled = false;
+			ollamaSkipReason = "ollama is not installed or gpt-oss:20b is not pulled (run: ollama pull gpt-oss:20b)";
 		}
 	}
+	const ollamaDescribeName = `Ollama Provider (gpt-oss-20b via OpenAI Completions)${ollamaSkipReason ? ` [skipped: ${ollamaSkipReason}]` : ""}`;
 
-	describe.skipIf(!ollamaInstalled)("Ollama Provider (gpt-oss-20b via OpenAI Completions)", () => {
+	describe.skipIf(ollamaSkipReason !== undefined)(ollamaDescribeName, () => {
 		let llm: Model<"openai-completions">;
 		let ollamaProcess: ChildProcess | null = null;
+		let serverReady = false;
+
+		/** Skips the test, naming the reason, unless the ollama server came up. */
+		const requireOllama = (ctx: { skip: () => void }) => {
+			if (!serverReady) {
+				console.warn("Skipping Ollama test: ollama serve did not become ready within 30s");
+				ctx.skip();
+			}
+		};
 
 		beforeAll(async () => {
-			// Check if model is available, if not pull it
-			try {
-				execSync("ollama list | grep -q 'gpt-oss:20b'", { stdio: "ignore" });
-			} catch {
-				console.log("Pulling gpt-oss:20b model for Ollama tests...");
-				try {
-					execSync("ollama pull gpt-oss:20b", { stdio: "inherit" });
-				} catch (_e) {
-					console.warn("Failed to pull gpt-oss:20b model, tests will be skipped");
-					return;
-				}
-			}
-
 			// Start ollama server
 			ollamaProcess = spawn("ollama", ["serve"], {
 				detached: false,
 				stdio: "ignore",
 			});
 
-			// Wait for server to be ready
-			await new Promise<void>((resolve) => {
-				const checkServer = async () => {
-					try {
-						const response = await fetch("http://localhost:11434/api/tags");
-						if (response.ok) {
-							resolve();
-						} else {
-							setTimeout(checkServer, 500);
-						}
-					} catch {
-						setTimeout(checkServer, 500);
-					}
-				};
-				setTimeout(checkServer, 1000); // Initial delay
-			});
+			// Bounded wait: an unbounded poll burns the whole beforeAll budget and then reports
+			// a timeout instead of the cause. Readiness on a warm machine is well under a second,
+			// so 30s is a wide bound, not a plausible default.
+			const deadline = Date.now() + 30_000;
+			while (!serverReady && Date.now() < deadline) {
+				try {
+					const response = await fetch("http://localhost:11434/api/tags");
+					if (response.ok) serverReady = true;
+				} catch {
+					// not up yet
+				}
+				if (!serverReady) await new Promise((resolve) => setTimeout(resolve, 500));
+			}
+
+			if (!serverReady) return;
 
 			llm = {
 				id: "gpt-oss:20b",
@@ -1714,7 +1757,7 @@ describe("Generate E2E Tests", () => {
 				},
 				name: "Ollama GPT-OSS 20B",
 			};
-		}, 30000); // 30 second timeout for setup
+		}, 60000); // 60s setup budget: the bounded server wait above is 30s
 
 		afterAll(() => {
 			// Kill ollama server
@@ -1724,23 +1767,28 @@ describe("Generate E2E Tests", () => {
 			}
 		});
 
-		it("should complete basic text generation", { retry: 3 }, async () => {
+		it("should complete basic text generation", { retry: 3 }, async (ctx) => {
+			requireOllama(ctx);
 			await basicTextGeneration(llm, { apiKey: "test" });
 		});
 
-		it("should handle tool calling", { retry: 3 }, async () => {
+		it("should handle tool calling", { retry: 3 }, async (ctx) => {
+			requireOllama(ctx);
 			await handleToolCall(llm, { apiKey: "test" });
 		});
 
-		it("should handle streaming", { retry: 3 }, async () => {
+		it("should handle streaming", { retry: 3 }, async (ctx) => {
+			requireOllama(ctx);
 			await handleStreaming(llm, { apiKey: "test" });
 		});
 
-		it("should handle thinking mode", { retry: 3 }, async () => {
+		it("should handle thinking mode", { retry: 3 }, async (ctx) => {
+			requireOllama(ctx);
 			await handleThinking(llm, { apiKey: "test", reasoningEffort: "medium" });
 		});
 
-		it("should handle multi-turn with thinking and tools", { retry: 3 }, async () => {
+		it("should handle multi-turn with thinking and tools", { retry: 3 }, async (ctx) => {
+			requireOllama(ctx);
 			await multiTurn(llm, { apiKey: "test", reasoningEffort: "medium" });
 		});
 	});

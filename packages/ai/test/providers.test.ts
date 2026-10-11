@@ -67,13 +67,17 @@ describe("builtin providers", () => {
 	});
 
 	it("uses official Kimi K3 pricing for Moonshot providers", () => {
+		// models.dev publishes kimi-k3's cache_write (3), and the generator prefers the published
+		// price over its KIMI_K3_COST fallback (generate-models.ts:2313), so the official price
+		// carries it. The subscription-backed kimi-coding provider keeps the implied 0 instead;
+		// that contrast is pinned in the next test.
 		const models = builtinModels();
 		for (const provider of ["moonshotai", "moonshotai-cn"]) {
 			expect(models.getModel(provider, "kimi-k3")?.cost).toEqual({
 				input: 3,
 				output: 15,
 				cacheRead: 0.3,
-				cacheWrite: 0,
+				cacheWrite: 3,
 			});
 		}
 	});

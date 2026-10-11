@@ -74,6 +74,8 @@ describe("OpenAI completions raw stop reasons", () => {
 
 		expect(message.stopReason).toBe("error");
 		expect(message.rawStopReason).toBe("content_filter");
-		expect(message.errorMessage).toBe("Provider finish_reason: content_filter");
+		// The subject here is that the raw reason survives; the pre-output abort marker that
+		// wraps it is pinned exactly in openai-completions-retry.test.ts.
+		expect(message.errorMessage).toContain("Provider finish_reason: content_filter");
 	});
 });

@@ -94,8 +94,10 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "high", "max"]);
 	});
 
-	it("includes only high plus off for OpenCode Go Kimi K2.6", () => {
-		const model = getModel("opencode-go", "kimi-k2.6");
+	it("includes only high plus off for OpenCode Go Hy4 preview", () => {
+		// Was Kimi K2.6, which the catalog no longer carries; Hy4 preview has the same
+		// two-level map (off plus high), which is what this assertion is about.
+		const model = getModel("opencode-go", "hy4-preview");
 		expect(model).toBeDefined();
 		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high"]);
 	});
