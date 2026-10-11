@@ -38,36 +38,67 @@ CORE_PKGS := telemetry agent coding-agent ai client protocol tui
 PI ?= pi
 SMOKE_TIMEOUT ?= 90
 
+# A dist that EXISTS is not a dist that was REBUILT. tsgo exits non-zero on
+# pre-existing type errors even though it emits (trap 1), so a failed compile is
+# tolerated by the `|| true` below; a missing or stale emit is not, and
+# `test -f` cannot tell the two apart. Compare mtimes against the sources
+# instead, so a build that silently stopped emitting cannot pass as success.
+# $1 = package directory, $2 = dist entry point relative to the package.
+define assert-dist-fresh
+	@if [ ! -e packages/$(1)/$(2) ]; then \
+		echo "FAIL: packages/$(1)/$(2) not emitted" >&2; exit 1; \
+	fi; \
+	if [ -n "$$(find packages/$(1)/src -name '*.ts' -newer packages/$(1)/$(2) -print -quit 2>/dev/null)" ]; then \
+		echo "FAIL: packages/$(1)/$(2) is older than its sources (compile did not emit)" >&2; exit 1; \
+	fi
+endef
+
 .PHONY: deploy deploy-full verify smoke-test test-deploy-runtime deployed-commit build-telemetry build-agent build-ai build-client build-protocol build-tui build-coding-agent build-extra
 
 build-telemetry:
 	cd packages/telemetry && npm run build || true
-	test -f packages/telemetry/dist/index.js || { echo "FAIL: packages/telemetry dist not emitted" >&2; exit 1; }
+	$(call assert-dist-fresh,telemetry,dist/index.js)
 
 build-agent:
 	cd packages/agent && npm run build || true
-	test -f packages/agent/dist/agent.js || { echo "FAIL: packages/agent dist not emitted" >&2; exit 1; }
+	$(call assert-dist-fresh,agent,dist/agent.js)
 
+# The generated catalog is an INPUT, not an artifact to shrug off. This target
+# used to be `npm run build || true` (i.e. `generate-models && build:offline`),
+# which hid a regeneration failure behind the same `|| true` that exists for
+# tsgo's emit-with-error behavior (trap 1); the follow-up check only asserted
+# that dist/index.js existed, so an older dist passed and the deploy shipped a
+# pi-ai whose catalog was missing a provider. Regeneration and data validation
+# are now hard gates, tsgo keeps its emit tolerance, and the post-steps run
+# unconditionally (same reasoning as build-coding-agent below).
+#
+# Keep the emit/copy steps in sync with `build:offline` in packages/ai/package.json.
 build-ai:
-	cd packages/ai && npm run build || true
-	test -f packages/ai/dist/index.js || { echo "FAIL: packages/ai dist not emitted" >&2; exit 1; }
+	cd packages/ai && npm run generate-models
+	cd packages/ai && npm run check:model-data
+	cd packages/ai && npx tsgo -p tsconfig.build.json || true
+	rm -rf packages/ai/dist/providers/data
+	cp -r packages/ai/src/providers/data packages/ai/dist/providers/data
+	$(call assert-dist-fresh,ai,dist/index.js)
+	@cmp -s packages/ai/src/providers/data/.manifest.json packages/ai/dist/providers/data/.manifest.json || { \
+		echo "FAIL: packages/ai/dist model data is stale (it does not match src/providers/data)" >&2; exit 1; }
 
 build-client:
 	cd packages/client && npm run build || true
-	test -f packages/client/dist/index.js || { echo "FAIL: packages/client dist not emitted" >&2; exit 1; }
+	$(call assert-dist-fresh,client,dist/index.js)
 
 build-protocol:
 	cd packages/protocol && npm run build || true
-	test -f packages/protocol/dist/index.js || { echo "FAIL: packages/protocol dist not emitted" >&2; exit 1; }
+	$(call assert-dist-fresh,protocol,dist/index.js)
 
 build-tui:
 	cd packages/tui && npm run build || true
-	test -f packages/tui/dist/index.js || { echo "FAIL: packages/tui dist not emitted" >&2; exit 1; }
+	$(call assert-dist-fresh,tui,dist/index.js)
 
 build-coding-agent:
 	test -f scripts/build-coding-agent-bundle.mjs || { echo "FAIL: coding-agent bundle script missing; hydrate it with 'git sparse-checkout add scripts'" >&2; exit 1; }
 	cd packages/coding-agent && npm run build:unbundled || true
-	test -f packages/coding-agent/dist/cli.js || { echo "FAIL: packages/coding-agent dist not emitted" >&2; exit 1; }
+	$(call assert-dist-fresh,coding-agent,dist/cli.js)
 	test -f packages/coding-agent/dist/index.js || { echo "FAIL: packages/coding-agent index dist not emitted" >&2; exit 1; }
 	chmod +x packages/coding-agent/dist/cli.js packages/coding-agent/dist/rpc-entry.js
 	cd packages/coding-agent && npm run copy-assets
@@ -81,7 +112,11 @@ deploy: build-telemetry build-agent build-extra build-coding-agent  ## Build all
 
 deploy-full: deploy  ## Compatibility alias for the complete local-package deployment
 
-build-extra: build-ai build-client build-protocol build-tui
+# protocol before client: packages/client imports @earendil-works/pi-protocol's
+# emitted types, so building client first fails on a clean tree. Every step here
+# is `|| true`-tolerant (tsgo emits on type errors), which is exactly why the
+# order has to be right: the failure is swallowed and only a stale dist saves it.
+build-extra: build-ai build-protocol build-client build-tui
 
 verify:  ## Verify deployed dist matches this build (versions + content + exec bits)
 	@test -x $(RUNTIME_DIR)/dist/cli.js || { echo "FAIL: $(RUNTIME_DIR)/dist/cli.js missing or not executable" >&2; exit 1; }

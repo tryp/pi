@@ -90,6 +90,19 @@ describe("builtin providers", () => {
 		}
 	});
 
+	it("keeps the kimi-coding catalog when models.dev renames the source provider", () => {
+		// models.dev renamed "kimi-for-coding" to "kimi-code-plan-cn". The generator
+		// read the old key behind an `if (data[key]?.models)` guard, so the rename
+		// silently emptied this provider: the generated shard was deleted as stale
+		// and the barrel dropped its import. Pin the model set so the next rename
+		// fails here (and in generate-models, which now refuses to run at all).
+		const ids = builtinModels()
+			.getModels("kimi-coding")
+			.map((model) => model.id)
+			.sort();
+		expect(ids).toEqual(["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"]);
+	});
+
 	it("resolves Anthropic bearer auth from env with auth token precedence", async () => {
 		const models = createModels({
 			authContext: fakeAuthContext({

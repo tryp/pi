@@ -128,6 +128,65 @@ interface ModelsDevProvider {
 
 type ModelsDevCatalog = Record<string, ModelsDevProvider>;
 
+/**
+ * models.dev provider keys this generator reads, newest alias first.
+ *
+ * Every consumer below is guarded by `data[key]?.models`, which cannot tell
+ * "models.dev renamed this provider" from "this provider has no models". On a
+ * rename the guard skips the block, the provider's generated shard is deleted as
+ * stale, and the provider module that imports that shard stops compiling. That is
+ * what the kimi-for-coding -> kimi-code-plan-cn rename did to the kimi-coding
+ * provider: no error, no log line, just a provider that vanished from the
+ * catalog. Resolving through this table turns a rename into a loud, named
+ * failure that says which key to update.
+ */
+const MODELS_DEV_PROVIDER_KEYS = {
+	amazonBedrock: ["amazon-bedrock"],
+	cloudflareAiGateway: ["cloudflare-ai-gateway"],
+	cloudflareWorkersAi: ["cloudflare-workers-ai"],
+	fireworks: ["fireworks-ai"],
+	githubCopilot: ["github-copilot"],
+	googleVertex: ["google-vertex"],
+	kimiCoding: ["kimi-code-plan-cn", "kimi-for-coding"],
+	together: ["together-ai", "togetherai"],
+} as const;
+
+/** Resolve a models.dev provider entry, tolerating an upstream rename. */
+function resolveModelsDevProvider(
+	data: ModelsDevCatalog,
+	candidates: readonly string[],
+): ModelsDevProvider | undefined {
+	for (const key of candidates) {
+		const provider = data[key];
+		if (provider?.models) return provider;
+	}
+	return undefined;
+}
+
+/**
+ * Refuse to generate when models.dev no longer serves a provider we ship.
+ *
+ * Generating anyway would silently drop the provider (see
+ * MODELS_DEV_PROVIDER_KEYS), so this fails before anything is written.
+ */
+function requireModelsDevProviders(data: ModelsDevCatalog): void {
+	const missing = Object.entries(MODELS_DEV_PROVIDER_KEYS).filter(
+		([, candidates]) => !candidates.some((key) => data[key]?.models),
+	);
+	if (missing.length === 0) return;
+
+	const detail = missing
+		.map(([label, candidates]) => `  ${label}: none of ${candidates.map((key) => `"${key}"`).join(", ")}`)
+		.join("\n");
+	throw new Error(
+		`models.dev no longer serves these providers:\n${detail}\n\n` +
+			"A missing key is not an empty catalog: the guarded `data[key]` blocks would skip the provider and its " +
+			"generated shard would be deleted, breaking the module that imports it. Look the provider up in " +
+			"https://models.dev/api.json and add the new key to MODELS_DEV_PROVIDER_KEYS in scripts/generate-models.ts " +
+			"(or remove the provider from src/providers/ deliberately).",
+	);
+}
+
 interface NvidiaNimModelListItem {
 	id: string;
 }
@@ -1433,6 +1492,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		const response = await fetch("https://models.dev/api.json");
 		if (!response.ok) throw new Error(`models.dev API returned ${response.status}`);
 		const data = (await response.json()) as ModelsDevCatalog;
+		requireModelsDevProviders(data);
 
 		const models: Model<any>[] = [];
 		const nvidiaNimModelIds = data.nvidia?.models ? await fetchNvidiaNimModelIds() : new Map<string, string>();
@@ -2154,8 +2214,13 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		}
 
 		// Process Kimi For Coding models
-		if (data["kimi-for-coding"]?.models) {
-			const kimiModels = data["kimi-for-coding"].models as Record<string, ModelsDevModel>;
+		// models.dev renamed this provider from "kimi-for-coding" to
+		// "kimi-code-plan-cn"; both keys are accepted so a rename on either side
+		// keeps working. The model set is unchanged (k3, k3-256k,
+		// kimi-for-coding, kimi-for-coding-highspeed).
+		const kimiSource = resolveModelsDevProvider(data, MODELS_DEV_PROVIDER_KEYS.kimiCoding);
+		if (kimiSource?.models) {
+			const kimiModels = kimiSource.models;
 			const hasCanonicalModel = Object.prototype.hasOwnProperty.call(kimiModels, "kimi-for-coding");
 
 			const kimiAliases = new Set(["k2p5", "k2p6", "k2p7"]);
