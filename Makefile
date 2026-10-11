@@ -105,7 +105,25 @@ build-coding-agent:
 	node scripts/build-coding-agent-bundle.mjs
 	test -x packages/coding-agent/dist/bundle/cli.js || { echo "FAIL: coding-agent bundle not emitted" >&2; exit 1; }
 
-deploy: build-telemetry build-agent build-extra build-coding-agent  ## Build all local runtime packages, stage dependencies, verify, install, and smoke-test
+# Refuse to build from a tree that is mid-merge or carries conflict markers.
+#
+# A conflicted file is not the loud compile error you would expect: tsgo's error
+# recovery dropped the marker lines and emitted BOTH sides of the conflict, so
+# `make deploy` bundled a merge of two branches and the only signal was an
+# esbuild "Duplicate member" warning. One bare `git stash pop` in a worktree
+# whose newest stash was months old was enough to ship that, which is why this
+# checks the index (unmerged paths) and the sources (markers) before any build.
+check-tree-clean:
+	@unmerged=$$(git diff --name-only --diff-filter=U); \
+	if [ -n "$$unmerged" ]; then \
+		echo "FAIL: unmerged paths (resolve them before building):" >&2; echo "$$unmerged" >&2; exit 1; \
+	fi; \
+	markers=$$(rg -n --no-heading '^(<<<<<<< |>>>>>>> |=======$$)' packages/*/src --type ts || true); \
+	if [ -n "$$markers" ]; then \
+		echo "FAIL: conflict markers in src:" >&2; echo "$$markers" >&2; exit 1; \
+	fi
+
+deploy: check-tree-clean build-telemetry build-agent build-extra build-coding-agent  ## Build all local runtime packages, stage dependencies, verify, install, and smoke-test
 	./scripts/deploy-runtime.sh --source-dir "$(CURDIR)" --runtime-dir "$(RUNTIME_DIR)"
 	@$(MAKE) --no-print-directory verify
 	@$(MAKE) --no-print-directory smoke-test
