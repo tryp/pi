@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RefreshModelsContext } from "../src/models.ts";
 import { InMemoryModelsStore } from "../src/models-store.ts";
@@ -15,15 +18,29 @@ import {
 	ZEN_MODELS_ENDPOINT,
 } from "../src/providers/opencode-helpers.ts";
 
-afterEach(() => {
+let tempAgentDir: string | undefined;
+let previousAgentDir: string | undefined;
+
+afterEach(async () => {
 	vi.restoreAllMocks();
 	// The models.dev client caches across calls by design, so a test that stubs fetch
 	// would otherwise be served the previous test's payload.
 	resetModelsDevClientState();
+	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	if (tempAgentDir !== undefined) await rm(tempAgentDir, { recursive: true, force: true });
+	tempAgentDir = undefined;
 });
-beforeEach(() => {
+beforeEach(async () => {
 	vi.restoreAllMocks();
 	resetModelsDevClientState();
+	// The client persists to <agent dir>/models-dev-cache.json by default. Point the
+	// agent dir at a temp directory: without this, a stubbed fetch in one test is
+	// written to the developer's real ~/.pi/agent cache and every later run (and every
+	// real pi process) is served that stub.
+	previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	tempAgentDir = await mkdtemp(join(tmpdir(), "opencode-discovery-"));
+	process.env.PI_CODING_AGENT_DIR = tempAgentDir;
 });
 
 describe("opencode helpers", () => {

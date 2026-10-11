@@ -1,15 +1,32 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-	getModelsDevCatalog,
+	getModelsDevCatalog as getCatalog,
 	MODELS_DEV_CATALOG_URL,
 	MODELS_DEV_FAILURE_RETRY_DELAY_MS,
 	MODELS_DEV_MIN_RATE_LIMIT_DELAY_MS,
 	MODELS_DEV_REFRESH_INTERVAL_MS,
+	type ModelsDevCatalogOptions,
 	modelsDevClientStats,
 	resetModelsDevClientState,
 } from "../src/providers/models-dev-client.ts";
 
 const START = 1_700_000_000_000;
+
+function getModelsDevCatalog(options: ModelsDevCatalogOptions = {}) {
+	return getCatalog({ cacheFile: null, ...options });
+}
+
+async function withTempCache(test: (cacheFile: string) => Promise<void>): Promise<void> {
+	const directory = await mkdtemp(join(tmpdir(), "models-dev-cache-"));
+	try {
+		await test(join(directory, "models-dev-cache.json"));
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+}
 
 const CATALOG_A = { opencode: { models: { a: { id: "a", name: "A" } } } };
 const CATALOG_B = { opencode: { models: { b: { id: "b", name: "B" } } } };
@@ -48,6 +65,219 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 }
 
 beforeEach(() => resetModelsDevClientState());
+
+describe("models.dev client disk cache", () => {
+	it("seeds a fresh cache from disk without fetching", async () => {
+		await withTempCache(async (cacheFile) => {
+			await writeFile(
+				cacheFile,
+				JSON.stringify({
+					version: 1,
+					fetchedAt: START - 100,
+					expiresAt: START + 10_000,
+					etag: "disk-v1",
+					catalog: CATALOG_A,
+				}),
+			);
+			const fetchImpl = vi.fn(async () => ok(CATALOG_B));
+
+			const result = await getModelsDevCatalog({
+				now: () => START,
+				fetchImpl,
+				cacheFile,
+			});
+
+			expect(result).toMatchObject({ source: "disk", catalog: CATALOG_A, fetchedAt: START - 100 });
+			expect(fetchImpl).not.toHaveBeenCalled();
+			expect(modelsDevClientStats()).toMatchObject({ diskSeeds: 1, cacheReads: 1 });
+		});
+	});
+
+	it("refreshes and replaces a stale disk cache", async () => {
+		await withTempCache(async (cacheFile) => {
+			await writeFile(
+				cacheFile,
+				JSON.stringify({ version: 1, fetchedAt: START - 20_000, expiresAt: START - 1, catalog: CATALOG_A }),
+			);
+			const result = await getModelsDevCatalog({
+				now: () => START,
+				fetchImpl: vi.fn(async () => ok(CATALOG_B)),
+				random: noJitter,
+				cacheFile,
+			});
+			const persisted = JSON.parse(await readFile(cacheFile, "utf8"));
+
+			expect(result.source).toBe("network");
+			expect(persisted).toMatchObject({
+				version: 1,
+				fetchedAt: START,
+				expiresAt: START + MODELS_DEV_REFRESH_INTERVAL_MS,
+			});
+			expect(persisted.catalog).toEqual(CATALOG_B);
+			expect(modelsDevClientStats()).toMatchObject({ cacheReads: 1, cacheWrites: 1 });
+		});
+	});
+
+	it("ignores corrupt cache files and proceeds with the network", async () => {
+		await withTempCache(async (cacheFile) => {
+			await writeFile(cacheFile, "not json");
+			const fetchImpl = vi.fn(async () => ok(CATALOG_A));
+			const result = await getModelsDevCatalog({ now: () => START, fetchImpl, cacheFile });
+
+			expect(result.source).toBe("network");
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+			expect(modelsDevClientStats()).toMatchObject({ cacheReadFailures: 1 });
+		});
+	});
+
+	it("does not read or write when persistence is disabled", async () => {
+		const result = await getModelsDevCatalog({
+			now: () => START,
+			fetchImpl: vi.fn(async () => ok(CATALOG_A)),
+			cacheFile: null,
+		});
+
+		expect(result.source).toBe("network");
+		expect(modelsDevClientStats()).toMatchObject({ cacheReads: 0, cacheWrites: 0 });
+	});
+
+	it("persists the refreshed timestamps after a 304", async () => {
+		await withTempCache(async (cacheFile) => {
+			const clock = createClock();
+			const fetchImpl = vi
+				.fn()
+				.mockResolvedValueOnce(ok(CATALOG_A, { etag: "v1" }))
+				.mockResolvedValueOnce(status(304));
+			await getModelsDevCatalog({ now: clock.now, fetchImpl, random: noJitter, cacheFile });
+			clock.advance(MODELS_DEV_REFRESH_INTERVAL_MS + 1);
+
+			const refreshed = await getModelsDevCatalog({ now: clock.now, fetchImpl, random: noJitter, cacheFile });
+			const persisted = JSON.parse(await readFile(cacheFile, "utf8"));
+			expect(refreshed.source).toBe("revalidated");
+			expect(persisted).toMatchObject({
+				fetchedAt: clock.now(),
+				expiresAt: clock.now() + MODELS_DEV_REFRESH_INTERVAL_MS,
+				etag: "v1",
+			});
+			expect(modelsDevClientStats()).toMatchObject({ cacheWrites: 2 });
+		});
+	});
+
+	it("does not fail a refresh when writing the cache fails", async () => {
+		await withTempCache(async (cacheFile) => {
+			const fetchImpl = vi.fn(async () => ok(CATALOG_A));
+			const result = await getModelsDevCatalog({
+				now: () => START,
+				fetchImpl,
+				cacheFile: join(cacheFile, "missing", "cache.json"),
+			});
+
+			expect(result.source).toBe("network");
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+			expect(modelsDevClientStats()).toMatchObject({ cacheWriteFailures: 1, networkFetches: 1 });
+		});
+	});
+
+	it("defaults the cache file to the agent dir", async () => {
+		// This is the cross-process guarantee: with no explicit cacheFile, a plain pi
+		// process persists under PI_CODING_AGENT_DIR (or ~/.pi/agent) and the next
+		// process reads it. `getCatalog`, not the wrapper, because the wrapper opts out.
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const directory = await mkdtemp(join(tmpdir(), "models-dev-agent-dir-"));
+		process.env.PI_CODING_AGENT_DIR = directory;
+		try {
+			const fetchImpl = vi.fn(async () => ok(CATALOG_A));
+			await getCatalog({ now: () => START, fetchImpl, random: noJitter });
+
+			const persisted = JSON.parse(await readFile(join(directory, "models-dev-cache.json"), "utf8"));
+			expect(persisted).toMatchObject({ version: 1, catalog: CATALOG_A });
+
+			resetModelsDevClientState();
+			const second = await getCatalog({ now: () => START + 1000, fetchImpl, random: noJitter });
+			expect(second.source).toBe("disk");
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("forces a refresh past a fresh disk cache", async () => {
+		await withTempCache(async (cacheFile) => {
+			await writeFile(
+				cacheFile,
+				JSON.stringify({
+					version: 1,
+					fetchedAt: START - 100,
+					expiresAt: START + 10_000,
+					catalog: CATALOG_A,
+				}),
+			);
+			const fetchImpl = vi.fn(async () => ok(CATALOG_B));
+
+			// A forced refresh must never be a silent no-op, which is what the package
+			// manager's `refresh({ allowNetwork: true, force: true })` asks for.
+			const result = await getModelsDevCatalog({
+				now: () => START,
+				fetchImpl,
+				random: noJitter,
+				cacheFile,
+				force: true,
+			});
+
+			expect(result.source).toBe("network");
+			expect(result.catalog).toEqual(CATALOG_B);
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	it("shares one disk read between concurrent first callers", async () => {
+		await withTempCache(async (cacheFile) => {
+			await writeFile(
+				cacheFile,
+				JSON.stringify({
+					version: 1,
+					fetchedAt: START - 100,
+					expiresAt: START + 10_000,
+					catalog: CATALOG_A,
+				}),
+			);
+			const fetchImpl = vi.fn(async () => ok(CATALOG_B));
+
+			const [first, second] = await Promise.all([
+				getModelsDevCatalog({ now: () => START, fetchImpl, cacheFile }),
+				getModelsDevCatalog({ now: () => START, fetchImpl, cacheFile }),
+			]);
+
+			// A caller that skipped the seed because another was still reading it would
+			// fetch the payload the disk cache was there to avoid.
+			expect(first.source).toBe("disk");
+			expect(second.source).toBe("disk");
+			expect(fetchImpl).not.toHaveBeenCalled();
+			expect(modelsDevClientStats()).toMatchObject({ cacheReads: 1, diskSeeds: 1 });
+		});
+	});
+
+	it("keeps a stale disk cache as a degraded fallback", async () => {
+		await withTempCache(async (cacheFile) => {
+			await writeFile(
+				cacheFile,
+				JSON.stringify({ version: 1, fetchedAt: START - 20_000, expiresAt: START - 1, catalog: CATALOG_A }),
+			);
+			const fetchImpl = vi.fn(async () => status(503));
+
+			const result = await getModelsDevCatalog({ now: () => START, fetchImpl, random: noJitter, cacheFile });
+
+			// Stale is not fresh, so it is not a seed, but it is still better than
+			// failing enrichment while offline.
+			expect(result.source).toBe("cache");
+			expect(result.degraded).toBe(true);
+			expect(result.catalog).toEqual(CATALOG_A);
+			expect(modelsDevClientStats()).toMatchObject({ diskSeeds: 0, degradedServes: 1, failures: 1 });
+		});
+	});
+});
 
 describe("models.dev client refresh window", () => {
 	it("fetches once and serves later callers from the cache", async () => {
@@ -163,7 +393,7 @@ describe("models.dev client single-flight", () => {
 
 		const first = getModelsDevCatalog({ now: clock.now, fetchImpl, random: noJitter });
 		const second = getModelsDevCatalog({ now: clock.now, fetchImpl, random: noJitter });
-		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
 
 		gate.resolve(ok(CATALOG_A, { etag: "v1" }));
 		const [a, b] = await Promise.all([first, second]);

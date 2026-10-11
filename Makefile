@@ -11,6 +11,13 @@
 #   make test-deploy-runtime # preflight failure must not alter live runtime
 #   make deployed-commit   # show what is deployed
 #
+# Verification that needs a real process, not a mock:
+#
+#   make verify-models-dev-cache    # the catalog is cached across pi processes
+#   make verify-production-cache-path # the default cache path works in ~/.pi/agent
+#   make measure-models-dev-latency # network fetch vs disk seed vs memory hit
+#   make compare-ai-failures        # is the ai suite's failure count mine?
+#
 # Deployment is staged: every package build, dependency install, and verification
 # runs before scripts/deploy-runtime.sh replaces RUNTIME_DIR. This keeps a failed
 # preflight from leaving a mixed live runtime. Do not replace the staged deploy
@@ -186,3 +193,21 @@ smoke-test:  ## Start a fresh pi process with the configured extensions
 
 deployed-commit:  ## Show what is deployed
 	@cat $(RUNTIME_DIR)/.deployed-commit 2>/dev/null || echo "no .deployed-commit marker in $(RUNTIME_DIR)"
+
+# The models.dev catalog cache. A unit test can prove the client reads and writes
+# the file; only a real process can prove the refresh path reaches it, and only a
+# second real process can prove the first one's file is what served it.
+verify-models-dev-cache:  ## Real pi: the disk cache is written, then served without a refetch
+	node scripts/verify-models-dev-cache.mjs --pi "$(RUNTIME_DIR)/dist/cli.js"
+
+verify-production-cache-path:  ## Real agent dir: the default cache path is written, then reused
+	node scripts/verify-production-cache-path.mjs --pi "$(RUNTIME_DIR)/dist/cli.js"
+
+measure-models-dev-latency:  ## Network fetch vs disk seed vs in-memory hit
+	node scripts/measure-models-dev-latency.ts
+
+# Fails loudly if a change to the ai package moves the suite's failure count: a
+# broken instrument reads as "no effect", which is indistinguishable from a
+# change that did not work. Pass test files to check a narrower set.
+compare-ai-failures:  ## Is the ai suite's failure count caused by my uncommitted changes?
+	./scripts/compare-ai-failures.sh $(ARGS)

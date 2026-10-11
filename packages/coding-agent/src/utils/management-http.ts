@@ -1,5 +1,7 @@
 type FetchInput = Parameters<typeof fetch>[0];
 
+type Sleep = (delayMs: number, signal?: AbortSignal) => Promise<void>;
+
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 export interface FetchRetryOptions {
@@ -11,10 +13,14 @@ export interface FetchRetryOptions {
 	timeoutMs?: number;
 	/** Per-attempt timeout. A new timeout is created for every attempt. */
 	attemptTimeoutMs?: number;
+	/** Maximum delay between retries. Defaults to one minute. */
+	maxRetryDelayMs?: number;
+	/** Sleep implementation, primarily for deterministic tests. */
+	sleep?: Sleep;
 }
 
 /**
- * Fetch a management HTTP resource with a bounded immediate retry.
+ * Fetch a management HTTP resource with a bounded retry.
  *
  * This is intentionally a transport-level helper for idempotent management
  * requests (version checks, catalogs, and downloads). It must not be used for
@@ -34,6 +40,14 @@ export async function fetchWithRetry(
 			? 2
 			: Math.max(0, Math.floor(options.maxRetries));
 	const retryOnStatus = options.retryOnStatus ?? true;
+	const maxRetryDelayMs =
+		options.maxRetryDelayMs !== undefined && Number.isFinite(options.maxRetryDelayMs)
+			? Math.max(0, options.maxRetryDelayMs)
+			: 60_000;
+	const sleep = options.sleep ?? sleepWithSignal;
+	const startedAt = Date.now();
+	const deadline =
+		options.timeoutMs !== undefined && options.timeoutMs > 0 ? startedAt + options.timeoutMs : undefined;
 	const parentSignal = init?.signal ?? undefined;
 	const timeoutSignal =
 		options.timeoutMs !== undefined && options.timeoutMs > 0 ? AbortSignal.timeout(options.timeoutMs) : undefined;
@@ -59,6 +73,12 @@ export async function fetchWithRetry(
 				// The response is being discarded before a retry. There is nothing useful to
 				// do if cancelling its body also fails.
 			}
+			const remainingMs = deadline === undefined ? undefined : Math.max(0, deadline - Date.now());
+			if (remainingMs === 0) return response;
+			const requestedDelayMs = retryDelayMs(response, attempt, maxRetryDelayMs);
+			const delayMs = remainingMs === undefined ? requestedDelayMs : Math.min(requestedDelayMs, remainingMs);
+			await sleep(delayMs, parentSignal);
+			if (remainingMs !== undefined && requestedDelayMs >= remainingMs) return response;
 		} catch (error) {
 			const attemptTimedOut =
 				attemptTimeoutSignal?.aborted === true && !parentSignal?.aborted && !timeoutSignal?.aborted;
@@ -73,6 +93,48 @@ export async function fetchWithRetry(
 			) {
 				throw error;
 			}
+			const remainingMs = deadline === undefined ? undefined : Math.max(0, deadline - Date.now());
+			if (remainingMs === 0) throw error;
+			const requestedDelayMs = retryDelayMs(undefined, attempt, maxRetryDelayMs);
+			const delayMs = remainingMs === undefined ? requestedDelayMs : Math.min(requestedDelayMs, remainingMs);
+			await sleep(delayMs, parentSignal);
+			if (remainingMs !== undefined && requestedDelayMs >= remainingMs) throw error;
 		}
 	}
+}
+
+function retryDelayMs(response: Response | undefined, attempt: number, maximum: number): number {
+	const retryAfterMs = response?.headers.get("retry-after-ms");
+	const retryAfter = response?.headers.get("retry-after");
+	let requestedDelay: number | undefined;
+	if (retryAfterMs !== null && retryAfterMs !== undefined && retryAfterMs.trim() !== "") {
+		const parsed = Number(retryAfterMs);
+		if (Number.isFinite(parsed) && parsed >= 0) requestedDelay = parsed;
+	}
+	if (requestedDelay === undefined && retryAfter !== null && retryAfter !== undefined) {
+		const seconds = Number(retryAfter);
+		if (retryAfter.trim() !== "" && Number.isFinite(seconds) && seconds >= 0) {
+			requestedDelay = seconds * 1000;
+		} else {
+			const date = Date.parse(retryAfter);
+			if (Number.isFinite(date)) requestedDelay = Math.max(0, date - Date.now());
+		}
+	}
+	const backoff = Math.random() * 500 * 2 ** attempt;
+	return Math.min(maximum, requestedDelay ?? backoff);
+}
+
+function sleepWithSignal(delayMs: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted) return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
+	return new Promise((resolve, reject) => {
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(new DOMException("The operation was aborted", "AbortError"));
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, delayMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }

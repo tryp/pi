@@ -29,6 +29,10 @@
  *   `degraded: true` and a reason, and counts it in {@link modelsDevClientStats}.
  */
 
+import { readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 /** The models.dev catalog payload. */
 export type ModelsDevCatalog = Record<string, ModelsDevProviderEntry>;
 
@@ -75,7 +79,7 @@ export const MODELS_DEV_ATTEMPT_TIMEOUT_MS = 10 * 1000;
 export interface ModelsDevCatalogResult {
 	catalog: ModelsDevCatalog;
 	/** How this payload was obtained. */
-	source: "network" | "revalidated" | "cache" | "shared";
+	source: "network" | "revalidated" | "cache" | "disk" | "shared";
 	/** When the payload body was last obtained from the network. */
 	fetchedAt: number;
 	etag?: string;
@@ -98,6 +102,8 @@ export interface ModelsDevCatalogOptions {
 	now?: () => number;
 	fetchImpl?: typeof fetch;
 	random?: () => number;
+	/** Cache file for cross-process persistence. Null disables persistence. */
+	cacheFile?: string | null;
 }
 
 /**
@@ -119,6 +125,11 @@ export interface ModelsDevClientStats {
 	failures: number;
 	/** Results served from cache because a refresh failed. */
 	degradedServes: number;
+	cacheReads: number;
+	cacheReadFailures: number;
+	cacheWrites: number;
+	cacheWriteFailures: number;
+	diskSeeds: number;
 }
 
 interface CachedCatalog {
@@ -134,6 +145,8 @@ let cached: CachedCatalog | undefined;
 let inflight: Promise<ModelsDevCatalogResult> | undefined;
 /** Earliest time a network attempt is allowed. Set by a 429 or a failure. */
 let nextAttemptAt = 0;
+/** In-flight (or settled) first read of the persisted catalog. */
+let cacheLoad: Promise<boolean> | undefined;
 
 const stats: ModelsDevClientStats = {
 	networkFetches: 0,
@@ -143,6 +156,11 @@ const stats: ModelsDevClientStats = {
 	rateLimitDeferrals: 0,
 	failures: 0,
 	degradedServes: 0,
+	cacheReads: 0,
+	cacheReadFailures: 0,
+	cacheWrites: 0,
+	cacheWriteFailures: 0,
+	diskSeeds: 0,
 };
 
 export function modelsDevClientStats(): Readonly<ModelsDevClientStats> {
@@ -153,8 +171,88 @@ export function modelsDevClientStats(): Readonly<ModelsDevClientStats> {
 export function resetModelsDevClientState(): void {
 	cached = undefined;
 	inflight = undefined;
+	cacheLoad = undefined;
 	nextAttemptAt = 0;
 	for (const key of Object.keys(stats) as (keyof ModelsDevClientStats)[]) stats[key] = 0;
+}
+
+function getCacheFile(cacheFile: string | null | undefined): string | undefined {
+	if (cacheFile === null) return undefined;
+	if (cacheFile !== undefined) {
+		return cacheFile.startsWith("~") ? cacheFile.replace(/^~/, homedir()) : cacheFile;
+	}
+	// Mirrors the PI_CODING_AGENT_DIR handling in getAgentDir() in packages/coding-agent/src/config.ts.
+	const agentDir = process.env.PI_CODING_AGENT_DIR;
+	const expandedAgentDir = agentDir?.startsWith("~") ? agentDir.replace(/^~/, homedir()) : agentDir;
+	return join(expandedAgentDir ?? join(homedir(), ".pi", "agent"), "models-dev-cache.json");
+}
+
+/**
+ * Read the persisted catalog, once per process.
+ *
+ * Concurrent first callers share one read. A caller that skipped the seed because
+ * another was still awaiting it would fall through to the very network fetch the
+ * disk cache exists to avoid.
+ *
+ * A parseable but stale entry is still adopted, without counting as a seed: the
+ * freshness check below still forces a refresh, but a failed refresh can then
+ * degrade to the last known catalog instead of failing enrichment outright.
+ *
+ * Returns whether the entry was fresh enough to serve without a network attempt.
+ */
+function loadDiskCache(cacheFile: string | undefined, now: number): Promise<boolean> {
+	if (!cacheFile) return Promise.resolve(false);
+	cacheLoad ??= (async () => {
+		stats.cacheReads++;
+		try {
+			const raw: unknown = JSON.parse(await readFile(cacheFile, "utf8"));
+			if (
+				typeof raw !== "object" ||
+				raw === null ||
+				!("version" in raw) ||
+				raw.version !== 1 ||
+				!("fetchedAt" in raw) ||
+				typeof raw.fetchedAt !== "number" ||
+				!("expiresAt" in raw) ||
+				typeof raw.expiresAt !== "number" ||
+				!("catalog" in raw) ||
+				typeof raw.catalog !== "object" ||
+				raw.catalog === null ||
+				Array.isArray(raw.catalog)
+			) {
+				stats.cacheReadFailures++;
+				return false;
+			}
+			const fresh = now < raw.expiresAt;
+			cached = {
+				catalog: raw.catalog as ModelsDevCatalog,
+				fetchedAt: raw.fetchedAt,
+				expiresAt: raw.expiresAt,
+				etag: "etag" in raw && typeof raw.etag === "string" ? raw.etag : undefined,
+			};
+			if (fresh) stats.diskSeeds++;
+			return fresh;
+		} catch (error) {
+			// A missing file is the normal first-run case, not a cache failure.
+			if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+				stats.cacheReadFailures++;
+			}
+			return false;
+		}
+	})();
+	return cacheLoad;
+}
+
+async function persistCache(cacheFile: string | undefined): Promise<void> {
+	if (!cacheFile || !cached) return;
+	const persisted = { version: 1, ...cached };
+	try {
+		await writeFile(`${cacheFile}.tmp`, JSON.stringify(persisted), "utf8");
+		await rename(`${cacheFile}.tmp`, cacheFile);
+		stats.cacheWrites++;
+	} catch {
+		stats.cacheWriteFailures++;
+	}
 }
 
 function createAbortError(): Error {
@@ -266,6 +364,7 @@ async function fetchCatalog(now: number, options: ModelsDevCatalogOptions): Prom
 			cached.expiresAt = now + refreshWindowMs(random);
 			nextAttemptAt = 0;
 			stats.revalidations++;
+			await persistCache(getCacheFile(options.cacheFile));
 			return fromCache("revalidated");
 		}
 
@@ -301,6 +400,7 @@ async function fetchCatalog(now: number, options: ModelsDevCatalogOptions): Prom
 		};
 		nextAttemptAt = 0;
 		stats.networkFetches++;
+		await persistCache(getCacheFile(options.cacheFile));
 		return fromCache("network");
 	} finally {
 		clearTimeout(timeout);
@@ -336,6 +436,11 @@ function transportFailure(now: number, error: unknown, timedOut: boolean): Model
  */
 export async function getModelsDevCatalog(options: ModelsDevCatalogOptions = {}): Promise<ModelsDevCatalogResult> {
 	const now = options.now?.() ?? Date.now();
+	const cacheFile = getCacheFile(options.cacheFile);
+	const seededFresh = await loadDiskCache(cacheFile, now);
+	// `force` means "refresh now": it bypasses the persisted window exactly as it
+	// bypasses the in-memory one, so a forced refresh is never a silent no-op.
+	if (seededFresh && !options.force) return fromCache("disk");
 
 	if (!options.force && cached && now < cached.expiresAt) {
 		stats.cacheHits++;
