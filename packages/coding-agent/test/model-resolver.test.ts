@@ -11,6 +11,8 @@ import { AuthStorage } from "../src/core/auth-storage.ts";
 import {
 	defaultModelPerProvider,
 	findInitialModel,
+	getFallbackCounters,
+	getFallbackMetadata,
 	getStaleExactPatterns,
 	parseModelPattern,
 	pruneStaleEnabledModels,
@@ -743,6 +745,66 @@ describe("resolveCliModel", () => {
 			expect(result.model?.provider).toBe("neuralwatt");
 			expect(result.model?.id).toBe("zai-org/GLM-5.1-FP8");
 			expect(result.thinkingLevel).toBeUndefined();
+		});
+
+		test("discloses borrowed metadata and counts the occurrence when an id is not in the catalog", () => {
+			const registry = {
+				getModels: () => modelsWithNeuralwatt,
+			} as unknown as Parameters<typeof resolveCliModel>[0]["modelRuntime"];
+
+			const result = resolveCliModel({
+				cliModel: "neuralwatt/unreleased-model",
+				modelRuntime: registry,
+			});
+
+			expect(result.error).toBeUndefined();
+			expect(result.model?.id).toBe("unreleased-model");
+			// The model runs, but on another model's numbers: say so instead of implying the
+			// catalog knew the id. The literal "Using custom model id" is load-bearing --
+			// credential-print.ts filters on it.
+			expect(result.warning).toContain("Using custom model id");
+			expect(result.warning).toContain('borrowed from "some-base-model"');
+			expect(result.warning).toContain("$1/M in, $2/M out");
+			expect(result.warning).toContain("128000 token context window");
+			expect(result.model && getFallbackMetadata(result.model)).toMatchObject({
+				provider: "neuralwatt",
+				modelId: "unreleased-model",
+				borrowedFromId: "some-base-model",
+				borrowedContextWindow: 128000,
+			});
+			expect(getFallbackCounters().get("neuralwatt/unreleased-model<-some-base-model")).toBe(1);
+		});
+
+		test("counts one occurrence per fallback, not one per model clone", () => {
+			const registry = {
+				getModels: () => modelsWithNeuralwatt,
+			} as unknown as Parameters<typeof resolveCliModel>[0]["modelRuntime"];
+
+			// A thinking suffix makes the caller clone the synthesized model to set
+			// `reasoning`; that clone is not a second fallback occurrence.
+			const result = resolveCliModel({
+				cliModel: "neuralwatt/thinking-model:high",
+				modelRuntime: registry,
+			});
+
+			expect(result.model?.reasoning).toBe(true);
+			expect(result.model && getFallbackMetadata(result.model)?.borrowedFromId).toBe("some-base-model");
+			expect(getFallbackCounters().get("neuralwatt/thinking-model<-some-base-model")).toBe(1);
+		});
+
+		test("a catalog model carries no borrowed metadata", () => {
+			const registry = {
+				getModels: () => modelsWithNeuralwatt,
+			} as unknown as Parameters<typeof resolveCliModel>[0]["modelRuntime"];
+
+			const result = resolveCliModel({
+				cliModel: "neuralwatt/some-base-model",
+				modelRuntime: registry,
+			});
+
+			expect(result.model?.id).toBe("some-base-model");
+			expect(result.model && getFallbackMetadata(result.model)).toBeUndefined();
+			expect(result.warning).toBeUndefined();
 		});
 
 		test("all valid thinking levels work in fallback path", () => {

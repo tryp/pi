@@ -31,22 +31,53 @@ function parseCatalog(providerId: string, value: unknown): Model<Api>[] {
 		.map((model) => ({ ...model, provider: providerId }));
 }
 
-function remoteModels(
+/**
+ * Which remote models may be applied to a built-in provider.
+ *
+ * The freshness gate (54fad505b "prefer newer generated model catalogs") stops a stale
+ * remote catalog from overriding a newer generated one. That argument is about ids the
+ * two catalogs *share*, and it must not gate additive coverage: several built-in lists
+ * are deliberately curated subsets (openai-codex keeps "a small, explicit list to avoid
+ * aliases", see generate-models.ts), so `lastModified <= generatedAt` says nothing about
+ * whether the remote catalog covers models the built-in one has never had. Gating those
+ * hid gpt-6-luna, gpt-6-sol, gpt-6-astra and gpt-6.1-sol for a whole release cycle: the
+ * built-in list is regenerated at build time, so its `generatedAt` is always "now" and
+ * the gate was closed in the steady state.
+ *
+ * - shared id      -> applied only when the remote catalog is newer (54fad505b)
+ * - remote-only id -> applied when the provider opts into additive coverage
+ *
+ * The opt-in is per provider because a curated list can mean "these ids are aliases we
+ * do not want to surface" (openai-codex) or "these ids are not served by this endpoint"
+ * (minimax splices upstream ids out), and only the first is safe to extend remotely.
+ */
+function selectRemoteModels(
 	entry: ModelsStoreEntry | undefined,
 	localGeneratedAt: number | undefined,
+	baseline: readonly Model<Api>[],
+	additiveRemoteOnly: boolean,
 ): readonly Model<Api>[] {
 	if (!entry) return [];
-	if (localGeneratedAt !== undefined && (entry.lastModified === undefined || entry.lastModified <= localGeneratedAt)) {
-		return [];
-	}
-	return entry.models;
+	const remoteIsNewer =
+		localGeneratedAt === undefined || (entry.lastModified !== undefined && entry.lastModified > localGeneratedAt);
+	if (remoteIsNewer) return entry.models;
+	if (!additiveRemoteOnly) return [];
+	const baselineIds = new Set(baseline.map((model) => model.id));
+	return entry.models.filter((model) => !baselineIds.has(model.id));
 }
 
-/** Add a persisted pi.dev catalog overlay to a static built-in provider. */
+/**
+ * Add a persisted pi.dev catalog overlay to a static built-in provider.
+ *
+ * Set `additiveRemoteOnly` for providers whose built-in list is a curated subset: their
+ * remote-only ids are then applied even when the freshness gate keeps remote ids that
+ * the built-in catalog already has from overriding it.
+ */
 export function withRemoteCatalog(
 	provider: Provider,
 	catalogBaseUrl: string = DEFAULT_CATALOG_BASE_URL,
 	localGeneratedAt?: number,
+	additiveRemoteOnly = false,
 ): Provider {
 	let dynamicModels: readonly Model<Api>[] = [];
 
@@ -55,7 +86,9 @@ export function withRemoteCatalog(
 		getModels: () => mergeModels(provider.getModels(), dynamicModels),
 		refreshModels: async (context) => {
 			const stored = context.stored;
-			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);
+			const restored = selectRemoteModels(stored, localGeneratedAt, provider.getModels(), additiveRemoteOnly).filter(
+				(model) => model.provider === provider.id,
+			);
 			if (
 				!(await context.publish({
 					update: () => {
@@ -125,7 +158,7 @@ export function withRemoteCatalog(
 				lastModified: Number.isNaN(lastModified) ? 0 : lastModified,
 				etag: response.headers.get("etag") ?? undefined,
 			};
-			const published = remoteModels(entry, localGeneratedAt);
+			const published = selectRemoteModels(entry, localGeneratedAt, provider.getModels(), additiveRemoteOnly);
 			await context.publish({
 				persist: entry,
 				update: () => {

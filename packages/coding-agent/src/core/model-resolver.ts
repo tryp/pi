@@ -8,6 +8,7 @@ import {
 	type AuthOperationOptions,
 	type KnownProvider,
 	type Model,
+	type ModelCost,
 	modelsAreEqual,
 } from "@earendil-works/pi-ai";
 import chalk from "chalk";
@@ -171,19 +172,76 @@ export interface ParsedModelResult {
 	warning: string | undefined;
 }
 
-function buildFallbackModel(provider: string, modelId: string, availableModels: Model<Api>[]): Model<Api> | undefined {
+/**
+ * Metadata for a model synthesized by {@link buildFallbackModel}.
+ *
+ * The synthesized model carries another model's cost, context window and limits under a
+ * new id. That is a guess: pi cannot know the real numbers for an id the catalog has
+ * never seen, and it must not pretend otherwise.
+ */
+export interface FallbackMetadata {
+	provider: string;
+	modelId: string;
+	/** Catalog model whose metadata this id is running with. */
+	borrowedFromId: string;
+	borrowedCost: ModelCost;
+	borrowedContextWindow: number;
+}
+
+/** Synthesized fallback models -> borrowed metadata. A WeakMap, so it is invisible to JSON. */
+const synthesizedFallbacks = new WeakMap<Model<Api>, FallbackMetadata>();
+
+/**
+ * Occurrences keyed by `${provider}/${modelId}<-${borrowedFromId}`.
+ *
+ * This path used to be silent, so a release cycle of codex sessions ran on another
+ * model's pricing (20.6x over-recorded) with nothing to query afterwards. Every silent
+ * path needs a counter; this is it.
+ */
+const fallbackCounters = new Map<string, number>();
+
+/** Metadata for a model synthesized by the fallback path, or undefined for a catalog model. */
+export function getFallbackMetadata(model: Model<Api>): FallbackMetadata | undefined {
+	return synthesizedFallbacks.get(model);
+}
+
+/** Fallback occurrences since process start, keyed by `provider/modelId<-borrowedFromId`. */
+export function getFallbackCounters(): ReadonlyMap<string, number> {
+	return fallbackCounters;
+}
+
+function registerFallback<T extends Model<Api>>(model: T, metadata: FallbackMetadata): T {
+	synthesizedFallbacks.set(model, metadata);
+	return model;
+}
+
+function buildFallbackModel(
+	provider: string,
+	modelId: string,
+	availableModels: Model<Api>[],
+): { model: Model<Api>; metadata: FallbackMetadata } | undefined {
 	const providerModels = availableModels.filter((m) => m.provider === provider);
 	if (providerModels.length === 0) return undefined;
 
 	const defaultId = defaultModelPerProvider[provider as KnownProvider];
-	const baseModel = defaultId
-		? (providerModels.find((m) => m.id === defaultId) ?? providerModels[0])
-		: providerModels[0];
+	const baseModel = (defaultId ? providerModels.find((m) => m.id === defaultId) : undefined) ?? providerModels[0];
+	if (!baseModel) return undefined;
+
+	const metadata: FallbackMetadata = {
+		provider,
+		modelId,
+		borrowedFromId: baseModel.id,
+		borrowedCost: { ...baseModel.cost },
+		borrowedContextWindow: baseModel.contextWindow,
+	};
+	// Count the occurrence once, here: the caller may clone the model again to set
+	// `reasoning` for a thinking suffix, and that clone is not a second fallback.
+	const key = `${provider}/${modelId}<-${baseModel.id}`;
+	fallbackCounters.set(key, (fallbackCounters.get(key) ?? 0) + 1);
 
 	return {
-		...baseModel,
-		id: modelId,
-		name: modelId,
+		model: registerFallback({ ...baseModel, id: modelId, name: modelId }, metadata),
+		metadata,
 	};
 }
 
@@ -627,14 +685,19 @@ export function resolveCliModel(options: {
 			}
 		}
 
-		const fallbackModel = buildFallbackModel(provider, fallbackPattern, availableModels);
-		if (fallbackModel) {
+		const fallback = buildFallbackModel(provider, fallbackPattern, availableModels);
+		if (fallback) {
 			const requestedThinking = cliThinking ?? fallbackThinking;
 			const model =
-				requestedThinking && requestedThinking !== "off" ? { ...fallbackModel, reasoning: true } : fallbackModel;
-			const fallbackWarning = warning
-				? `${warning} Model "${fallbackPattern}" not found for provider "${provider}". Using custom model id.`
-				: `Model "${fallbackPattern}" not found for provider "${provider}". Using custom model id.`;
+				requestedThinking && requestedThinking !== "off"
+					? registerFallback({ ...fallback.model, reasoning: true }, fallback.metadata)
+					: fallback.model;
+			const { borrowedFromId, borrowedCost, borrowedContextWindow } = fallback.metadata;
+			const notice =
+				`Model "${fallbackPattern}" not found for provider "${provider}". Using custom model id: ` +
+				`cost ($${borrowedCost.input}/M in, $${borrowedCost.output}/M out) and a ${borrowedContextWindow} ` +
+				`token context window are borrowed from "${borrowedFromId}" and may be wrong.`;
+			const fallbackWarning = warning ? `${warning} ${notice}` : notice;
 			return { model, thinkingLevel: fallbackThinking, warning: fallbackWarning, error: undefined };
 		}
 	}

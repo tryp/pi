@@ -55,6 +55,19 @@ import {
 import { withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
 
+/**
+ * Providers whose built-in model list is a curated subset rather than a full catalog, so
+ * remote-only ids are additive coverage instead of stale entries. openai-codex ships "a
+ * small, explicit list to avoid aliases" (generate-models.ts) and therefore missed every
+ * model pi.dev published after the last build: its built-in list is regenerated at build
+ * time, so the overlay's freshness gate stayed closed and gpt-6-luna/gpt-6-sol/
+ * gpt-6-astra/gpt-6.1-sol were invisible while still being runnable by explicit id.
+ *
+ * minimax is deliberately absent: its curation removes ids the direct endpoint does not
+ * serve (minimaxDirectSupportedIds), so resurrecting remote-only ids there would be wrong.
+ */
+const ADDITIVE_REMOTE_ONLY_PROVIDERS = new Set(["openai-codex"]);
+
 interface ModelRuntimeSnapshot {
 	all: readonly Model<Api>[];
 	available: readonly Model<Api>[];
@@ -185,7 +198,12 @@ export class ModelRuntime implements Models {
 			.map((provider) =>
 				provider.id === "radius" || provider.id === "opencode" || provider.id === "opencode-go"
 					? provider
-					: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
+					: withRemoteCatalog(
+							provider,
+							options.catalogBaseUrl,
+							builtinModelDataGeneratedAt,
+							ADDITIVE_REMOTE_ONLY_PROVIDERS.has(provider.id),
+						),
 			);
 		const runtime = new ModelRuntime(
 			credentials,

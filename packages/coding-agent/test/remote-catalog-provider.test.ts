@@ -28,7 +28,7 @@ function model(id: string): Model<"openai-completions"> {
 	};
 }
 
-function testProvider(localGeneratedAt?: number) {
+function testProvider(localGeneratedAt?: number, additiveRemoteOnly = false) {
 	return withRemoteCatalog(
 		createProvider({
 			id: "test-provider",
@@ -45,6 +45,7 @@ function testProvider(localGeneratedAt?: number) {
 		}),
 		"https://pi.dev",
 		localGeneratedAt,
+		additiveRemoteOnly,
 	);
 }
 
@@ -115,6 +116,56 @@ describe("remote catalog provider", () => {
 		await refreshProvider(provider, store, { force: true });
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "newer"]);
 		expect(await store.read(provider.id)).toMatchObject({ lastModified: Date.parse(newerHeader) });
+	});
+
+	it("adds remote-only ids past a closed freshness gate for curated-subset providers", async () => {
+		const localGeneratedAt = Date.parse("2026-07-23T10:00:00.000Z");
+		const olderHeader = new Date(localGeneratedAt - 60_000).toUTCString();
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response(
+					JSON.stringify({
+						static: { ...model("static"), name: "remote-static" },
+						remoteOnly: model("remoteOnly"),
+					}),
+					{
+						headers: { "content-type": "application/json", "last-modified": olderHeader },
+					},
+				),
+		);
+		// The test above proves a closed gate drops an entire older catalog when the provider
+		// does not opt in; this is the same catalog with the opt-in.
+		const provider = testProvider(localGeneratedAt, true);
+		const store = new InMemoryModelsStore();
+
+		await refreshProvider(provider, store);
+
+		// "remoteOnly" exists only remotely, so it is additive coverage and is applied.
+		// "static" exists in both, so the newer built-in entry still wins (54fad505b).
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "remoteOnly"]);
+		expect(provider.getModels().find((entry) => entry.id === "static")?.name).toBe("static");
+	});
+
+	it("restores additive remote-only ids from the store on a later start with no network", async () => {
+		const localGeneratedAt = Date.parse("2026-07-23T10:00:00.000Z");
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response(JSON.stringify({ remoteOnly: model("remoteOnly") }), {
+					headers: {
+						"content-type": "application/json",
+						"last-modified": new Date(localGeneratedAt - 60_000).toUTCString(),
+					},
+				}),
+		);
+		const store = new InMemoryModelsStore();
+		await refreshProvider(testProvider(localGeneratedAt, true), store);
+
+		// A later process start: same store, no network. This is the path that decides
+		// whether a model published after the last build is visible on startup.
+		const restarted = testProvider(localGeneratedAt, true);
+		await refreshProvider(restarted, store, { allowNetwork: false });
+
+		expect(restarted.getModels().map((entry) => entry.id)).toEqual(["static", "remoteOnly"]);
 	});
 
 	it("revalidates a stored catalog with its etag and keeps the overlay on 304", async () => {
