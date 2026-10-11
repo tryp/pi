@@ -17,6 +17,7 @@
 #   make verify-production-cache-path # the default cache path works in ~/.pi/agent
 #   make measure-models-dev-latency # network fetch vs disk seed vs memory hit
 #   make compare-ai-failures        # is the ai suite's failure count mine?
+#   make mutcheck-deploy-gates      # revert the build gates; do they still fail?
 #
 # Deployment is staged: every package build, dependency install, and verification
 # runs before scripts/deploy-runtime.sh replaces RUNTIME_DIR. This keeps a failed
@@ -25,10 +26,15 @@
 #
 # Traps encoded here (do not "simplify" them away):
 #
-# 1. tsgo exits non-zero on pre-existing type errors even though it EMITS the
-#    dist. The npm build script chains chmod/copy-assets with &&, so those
-#    post-steps are silently skipped on any type error. We run them
-#    unconditionally.
+# 1. tsgo EMITS the dist even when it reports type errors, and the npm build
+#    script chains chmod/copy-assets with &&, so those post-steps are silently
+#    skipped on any type error. We run them unconditionally. The errors are not
+#    tolerated: every build step is a hard gate (measured 2026-10-11, all seven
+#    build configs exit 0). Tolerating them is what shipped a pi-ai whose catalog
+#    was missing a provider -- the TS2307 naming the deleted generated shard was
+#    in the build log and the exit code carrying it was discarded, so the deploy
+#    reported OK. `make mutcheck-deploy-gates` reverts that state and requires the
+#    build to stop.
 # 2. coding-agent dist MUST be deployed together with every local package it
 #    imports: agent, telemetry, ai, client, protocol, and tui. The runtime
 #    pins its own node_modules: a dist-only deploy leaves new agent APIs or
@@ -45,11 +51,11 @@ CORE_PKGS := telemetry agent coding-agent ai client protocol tui
 PI ?= pi
 SMOKE_TIMEOUT ?= 90
 
-# A dist that EXISTS is not a dist that was REBUILT. tsgo exits non-zero on
-# pre-existing type errors even though it emits (trap 1), so a failed compile is
-# tolerated by the `|| true` below; a missing or stale emit is not, and
-# `test -f` cannot tell the two apart. Compare mtimes against the sources
-# instead, so a build that silently stopped emitting cannot pass as success.
+# A dist that EXISTS is not a dist that was REBUILT. A compile can exit 0 and
+# still leave a stale entry point (an aborted emit, a config that stopped
+# including it), and `test -f` cannot tell the two apart. Compare mtimes against
+# the sources instead. This is a backstop behind the hard typecheck gates, not a
+# substitute for them: it cannot see a dist rebuilt from broken sources.
 # $1 = package directory, $2 = dist entry point relative to the package.
 define assert-dist-fresh
 	@if [ ! -e packages/$(1)/$(2) ]; then \
@@ -60,14 +66,14 @@ define assert-dist-fresh
 	fi
 endef
 
-.PHONY: deploy deploy-full verify smoke-test test-deploy-runtime deployed-commit build-telemetry build-agent build-ai build-client build-protocol build-tui build-coding-agent build-extra
+.PHONY: deploy deploy-full verify smoke-test test-deploy-runtime deployed-commit build-telemetry build-agent build-ai build-client build-protocol build-tui build-coding-agent build-extra mutcheck-deploy-gates
 
 build-telemetry:
-	cd packages/telemetry && npm run build || true
+	cd packages/telemetry && npm run build
 	$(call assert-dist-fresh,telemetry,dist/index.js)
 
 build-agent:
-	cd packages/agent && npm run build || true
+	cd packages/agent && npm run build
 	$(call assert-dist-fresh,agent,dist/agent.js)
 
 # The generated catalog is an INPUT, not an artifact to shrug off. This target
@@ -79,11 +85,17 @@ build-agent:
 # are now hard gates, tsgo keeps its emit tolerance, and the post-steps run
 # unconditionally (same reasoning as build-coding-agent below).
 #
+# Regeneration and data validation are hard gates, and so is the typecheck: a
+# regeneration that drops a provider deletes its generated shard and leaves the
+# importing module with a TS2307, which is the only signal left when the generated
+# output agrees with itself (check:model-data compares generated to generated, so
+# it cannot see it). See `make mutcheck-deploy-gates`.
+#
 # Keep the emit/copy steps in sync with `build:offline` in packages/ai/package.json.
 build-ai:
 	cd packages/ai && npm run generate-models
 	cd packages/ai && npm run check:model-data
-	cd packages/ai && npx tsgo -p tsconfig.build.json || true
+	cd packages/ai && npx tsgo -p tsconfig.build.json
 	rm -rf packages/ai/dist/providers/data
 	cp -r packages/ai/src/providers/data packages/ai/dist/providers/data
 	$(call assert-dist-fresh,ai,dist/index.js)
@@ -91,20 +103,20 @@ build-ai:
 		echo "FAIL: packages/ai/dist model data is stale (it does not match src/providers/data)" >&2; exit 1; }
 
 build-client:
-	cd packages/client && npm run build || true
+	cd packages/client && npm run build
 	$(call assert-dist-fresh,client,dist/index.js)
 
 build-protocol:
-	cd packages/protocol && npm run build || true
+	cd packages/protocol && npm run build
 	$(call assert-dist-fresh,protocol,dist/index.js)
 
 build-tui:
-	cd packages/tui && npm run build || true
+	cd packages/tui && npm run build
 	$(call assert-dist-fresh,tui,dist/index.js)
 
 build-coding-agent:
 	test -f scripts/build-coding-agent-bundle.mjs || { echo "FAIL: coding-agent bundle script missing; hydrate it with 'git sparse-checkout add scripts'" >&2; exit 1; }
-	cd packages/coding-agent && npm run build:unbundled || true
+	cd packages/coding-agent && npm run build:unbundled
 	$(call assert-dist-fresh,coding-agent,dist/cli.js)
 	test -f packages/coding-agent/dist/index.js || { echo "FAIL: packages/coding-agent index dist not emitted" >&2; exit 1; }
 	chmod +x packages/coding-agent/dist/cli.js packages/coding-agent/dist/rpc-entry.js
@@ -138,9 +150,9 @@ deploy: check-tree-clean build-telemetry build-agent build-extra build-coding-ag
 deploy-full: deploy  ## Compatibility alias for the complete local-package deployment
 
 # protocol before client: packages/client imports @earendil-works/pi-protocol's
-# emitted types, so building client first fails on a clean tree. Every step here
-# is `|| true`-tolerant (tsgo emits on type errors), which is exactly why the
-# order has to be right: the failure is swallowed and only a stale dist saves it.
+# emitted types. The order was load-bearing when a failed compile was swallowed
+# (only a stale dist saved it); it is still required, and now a wrong order fails
+# loudly instead.
 build-extra: build-ai build-protocol build-client build-tui
 
 verify:  ## Verify deployed dist matches this build (versions + content + exec bits)
@@ -205,6 +217,15 @@ verify-production-cache-path:  ## Real agent dir: the default cache path is writ
 
 measure-models-dev-latency:  ## Network fetch vs disk seed vs in-memory hit
 	node scripts/measure-models-dev-latency.ts
+
+# A gate that is never seen failing is indistinguishable from a gate that does
+# nothing, and this one was absent once: models.dev renamed a provider, the
+# generator dropped it silently, the deleted shard left a TS2307 in the importing
+# module, and the build's `|| true` discarded it -- so a pi-ai missing a provider
+# deployed with OK printed. The check reverts that state and requires
+# `make build-ai` to stop, then requires the healthy tree to still build.
+mutcheck-deploy-gates:  ## Revert the build gates and require the build to stop
+	bash scripts/mutcheck-deploy-gates.sh
 
 # Fails loudly if a change to the ai package moves the suite's failure count: a
 # broken instrument reads as "no effect", which is indistinguishable from a
