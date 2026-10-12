@@ -162,6 +162,21 @@ export function transformMessages<TApi extends Api>(
 		return msg;
 	});
 
+	// Only replay tool results whose calls survived context reconstruction. A compaction
+	// can retain a result while folding away its call, which Responses APIs reject.
+	const validToolCallIds = new Set(
+		transformed.flatMap((msg) =>
+			msg.role === "assistant" && msg.stopReason !== "error" && msg.stopReason !== "aborted"
+				? msg.content.filter((block): block is ToolCall => block.type === "toolCall").map((toolCall) => toolCall.id)
+				: [],
+		),
+	);
+	const droppedToolCallIds = new Set<string>();
+	const validatesToolCallPairing =
+		model.api === "openai-responses" ||
+		model.api === "azure-openai-responses" ||
+		model.api === "openai-codex-responses";
+
 	// Second pass: insert synthetic empty tool results for orphaned tool calls
 	// This preserves thinking signatures and satisfies API requirements
 	const result: Message[] = [];
@@ -200,6 +215,9 @@ export function transformMessages<TApi extends Api>(
 			// - The model should retry from the last valid state
 			const assistantMsg = msg as AssistantMessage;
 			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+				for (const block of assistantMsg.content) {
+					if (block.type === "toolCall") droppedToolCallIds.add(block.id);
+				}
 				continue;
 			}
 
@@ -212,6 +230,12 @@ export function transformMessages<TApi extends Api>(
 
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
+			if (
+				validatesToolCallPairing &&
+				(droppedToolCallIds.has(msg.toolCallId) || !validToolCallIds.has(msg.toolCallId))
+			) {
+				continue;
+			}
 			existingToolResultIds.add(msg.toolCallId);
 			result.push(msg);
 		} else if (msg.role === "user") {

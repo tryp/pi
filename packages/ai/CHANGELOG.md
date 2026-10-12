@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Dropped orphaned OpenAI Responses tool results after errors or context compaction to prevent unmatched function-call outputs.
 - Fixed OpenAI Codex cached WebSocket continuations to retry when function-call outputs report a missing tool call.
 - Fixed OpenAI-compatible Chat Completions ignoring an explicitly requested `toolChoice` when no tools are defined.
 - Fixed thinking signature serialization to run once after the signature is complete ([#8671](https://github.com/earendil-works/pi/pull/8671)).
