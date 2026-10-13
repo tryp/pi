@@ -349,8 +349,8 @@ describe("AgentSession retry", () => {
 		);
 	});
 
-	it("allows requests under the configured absolute context limit", async () => {
-		const created = await createSession({ maxContextTokens: 1000 });
+	it("allows requests under the configured absolute context limit including session overhead", async () => {
+		const created = await createSession({ maxContextTokens: 10_000 });
 
 		expect(() =>
 			created.session.guardContextForRequest([

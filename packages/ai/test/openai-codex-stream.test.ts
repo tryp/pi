@@ -2105,7 +2105,6 @@ describe("openai-codex streaming", () => {
 					isError: false,
 					timestamp: 2,
 				},
-				{ role: "user", content: "Now finish", timestamp: 3 },
 			],
 		};
 		await streamOpenAICodexResponses(model, secondContext, {
@@ -2122,21 +2121,271 @@ describe("openai-codex streaming", () => {
 		expect(firstBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Use the tool" }] }]);
 		expect(secondBody.store).toBe(false);
 		expect(secondBody.previous_response_id).toBe("resp_1");
-		expect(secondBody.input).toEqual([
+		expect(secondBody.input).toEqual([{ type: "custom_tool_call_output", call_id: "call_1", output: "real result" }]);
+		const rewrittenToolContext: Context = {
+			...firstContext,
+			messages: [
+				{ role: "user", content: "Compacted summary", timestamp: 4 },
+				first,
+				{
+					role: "toolResult",
+					toolCallId: "call_1|ctc_1",
+					toolName: "sample_tool",
+					content: [{ type: "text", text: "real result" }],
+					isError: false,
+					timestamp: 5,
+				},
+				{ role: "user", content: "Continue after compaction", timestamp: 6 },
+			],
+		};
+		await streamOpenAICodexResponses(model, rewrittenToolContext, {
+			apiKey: token,
+			sessionId: "session-1",
+			transport: "websocket-cached",
+		}).result();
+
+		expect(sentBodies).toHaveLength(3);
+		const rewrittenBody = sentBodies[2] as { input: unknown[]; previous_response_id?: string };
+		expect(rewrittenBody.previous_response_id).toBeUndefined();
+		expect(rewrittenBody.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "Compacted summary" }] },
+			{ type: "custom_tool_call", id: "ctc_1", call_id: "call_1", name: "sample_tool", input: "abc" },
 			{ type: "custom_tool_call_output", call_id: "call_1", output: "real result" },
-			{ role: "user", content: [{ type: "input_text", text: "Now finish" }] },
+			{ role: "user", content: [{ type: "input_text", text: "Continue after compaction" }] },
 		]);
+		const rebasedContext: Context = {
+			...rewrittenToolContext,
+			messages: [...rewrittenToolContext.messages, { role: "user", content: "After rewrite", timestamp: 7 }],
+		};
+		await streamOpenAICodexResponses(model, rebasedContext, {
+			apiKey: token,
+			sessionId: "session-1",
+			transport: "websocket-cached",
+		}).result();
+		const rebasedBody = sentBodies[3] as { input: unknown[]; previous_response_id?: string };
+		expect(rebasedBody.previous_response_id).toBe("resp_3");
+		expect(rebasedBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "After rewrite" }] }]);
 		expect(getOpenAICodexWebSocketDebugStats("session-1")).toMatchObject({
-			requests: 2,
+			requests: 4,
 			connectionsCreated: 1,
-			connectionsReused: 1,
-			cachedContextRequests: 2,
+			connectionsReused: 3,
+			cachedContextRequests: 4,
 			storeTrueRequests: 0,
-			fullContextRequests: 1,
-			deltaRequests: 1,
-			lastDeltaInputItems: 2,
-			lastPreviousResponseId: "resp_1",
+			fullContextRequests: 2,
+			deltaRequests: 2,
+			lastDeltaInputItems: 1,
+			lastPreviousResponseId: "resp_3",
 		});
+	});
+
+	it("sends full history after compaction rewrites and non-input option changes", async () => {
+		const sentBodies: Array<Record<string, unknown>> = [];
+		let connections = 0;
+		class MockWebSocket {
+			static OPEN = 1;
+			readyState = MockWebSocket.OPEN;
+			private listeners = new Map<string, Set<(event: unknown) => void>>();
+			constructor() {
+				connections++;
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+			addEventListener(type: string, listener: (event: unknown) => void): void {
+				const listeners = this.listeners.get(type) ?? new Set();
+				listeners.add(listener);
+				this.listeners.set(type, listeners);
+			}
+			removeEventListener(type: string, listener: (event: unknown) => void): void {
+				this.listeners.get(type)?.delete(listener);
+			}
+			send(data: string): void {
+				sentBodies.push(JSON.parse(data) as Record<string, unknown>);
+				const responseId = `boundary_${sentBodies.length}`;
+				queueMicrotask(() => {
+					this.dispatch("message", {
+						data: JSON.stringify({ type: "response.created", response: { id: responseId } }),
+					});
+					this.dispatch("message", {
+						data: JSON.stringify({
+							type: "response.completed",
+							response: {
+								id: responseId,
+								status: "completed",
+								usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+							},
+						}),
+					});
+				});
+			}
+			close(): void {
+				this.readyState = 3;
+			}
+			private dispatch(type: string, event: unknown): void {
+				for (const listener of this.listeners.get(type) ?? []) listener(event);
+			}
+		}
+		vi.stubGlobal("WebSocket", MockWebSocket);
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const sessionId = "compaction-boundaries";
+		const call = async (messages: Context["messages"], systemPrompt = "Stable instructions.") => {
+			await streamOpenAICodexResponses(
+				model,
+				{ systemPrompt, messages },
+				{
+					apiKey: mockToken(),
+					sessionId,
+					transport: "websocket-cached",
+				},
+			).result();
+		};
+		const user = (content: string, timestamp: number) => ({ role: "user" as const, content, timestamp });
+		const input = (...texts: string[]) =>
+			texts.map((text) => ({ role: "user", content: [{ type: "input_text", text }] }));
+
+		await call([user("A", 1), user("B", 2), user("C", 3)]);
+		await call([user("A", 1), user("B", 2), user("C", 3), user("D", 4)]);
+		const compatible = sentBodies[1];
+		expect(compatible.previous_response_id).toBe("boundary_1");
+		expect(compatible.input).toEqual(input("D"));
+
+		const rewriteCases = [
+			{
+				messages: [user("Summary", 5), user("C", 3), user("D", 4), user("E", 6)],
+				expected: input("Summary", "C", "D", "E"),
+			},
+			{ messages: [user("Summary", 5), user("C", 3)], expected: input("Summary", "C") },
+			{
+				messages: [user("Summary", 5), user("rewritten retained tail", 7)],
+				expected: input("Summary", "rewritten retained tail"),
+			},
+			{
+				messages: [user("Summary", 5), user("inserted inside", 8), user("rewritten retained tail", 7)],
+				expected: input("Summary", "inserted inside", "rewritten retained tail"),
+			},
+		];
+		for (const { messages, expected } of rewriteCases) {
+			await call(messages);
+			const body = sentBodies.at(-1)!;
+			expect(body.previous_response_id).toBeUndefined();
+			expect(body.input).toEqual(expected);
+		}
+		const unchangedMessages = [user("Summary", 5), user("inserted inside", 8), user("rewritten retained tail", 7)];
+		await call(unchangedMessages, "Changed instructions.");
+		const changedOption = sentBodies.at(-1)!;
+		expect(changedOption.previous_response_id).toBeUndefined();
+		expect(changedOption.input).toEqual(input("Summary", "inserted inside", "rewritten retained tail"));
+
+		expect(connections).toBe(1);
+		expect(getOpenAICodexWebSocketDebugStats(sessionId)).toMatchObject({
+			requests: 7,
+			connectionsCreated: 1,
+			connectionsReused: 6,
+		});
+	});
+
+	it("invalidates cached continuation after a failed websocket request", async () => {
+		const sentBodies: Array<Record<string, unknown>> = [];
+		let connections = 0;
+		let failNext = false;
+		class MockWebSocket {
+			static OPEN = 1;
+			readyState = MockWebSocket.OPEN;
+			private listeners = new Map<string, Set<(event: unknown) => void>>();
+			constructor() {
+				connections++;
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+			addEventListener(type: string, listener: (event: unknown) => void): void {
+				const listeners = this.listeners.get(type) ?? new Set();
+				listeners.add(listener);
+				this.listeners.set(type, listeners);
+			}
+			removeEventListener(type: string, listener: (event: unknown) => void): void {
+				this.listeners.get(type)?.delete(listener);
+			}
+			send(data: string): void {
+				sentBodies.push(JSON.parse(data) as Record<string, unknown>);
+				const fail = failNext;
+				failNext = false;
+				const responseId = `failure_${sentBodies.length}`;
+				queueMicrotask(() => {
+					this.dispatch("message", {
+						data: JSON.stringify({ type: "response.created", response: { id: responseId } }),
+					});
+					if (fail) {
+						this.dispatch("message", {
+							data: JSON.stringify({ type: "error", status: 400, error: { message: "mock failure" } }),
+						});
+					} else {
+						this.dispatch("message", {
+							data: JSON.stringify({
+								type: "response.completed",
+								response: {
+									id: responseId,
+									status: "completed",
+									usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+								},
+							}),
+						});
+					}
+				});
+			}
+			close(): void {
+				this.readyState = 3;
+			}
+			private dispatch(type: string, event: unknown): void {
+				for (const listener of this.listeners.get(type) ?? []) listener(event);
+			}
+		}
+		vi.stubGlobal("WebSocket", MockWebSocket);
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const sessionId = "failed-continuation";
+		const call = async (messages: Context["messages"]) =>
+			streamOpenAICodexResponses(
+				model,
+				{ systemPrompt: "Stable instructions.", messages },
+				{
+					apiKey: mockToken(),
+					sessionId,
+					transport: "websocket-cached",
+				},
+			).result();
+		const user = (content: string, timestamp: number) => ({ role: "user" as const, content, timestamp });
+		const firstHistory = [user("A", 1)];
+		await call(firstHistory);
+		const failedHistory = [...firstHistory, user("B", 2)];
+		failNext = true;
+		const failed = await call(failedHistory);
+		expect(failed.errorMessage).toContain("mock failure");
+		expect(sentBodies[1]).toMatchObject({ previous_response_id: "failure_1" });
+		await call(failedHistory);
+		expect(sentBodies[2].previous_response_id).toBeUndefined();
+		expect(sentBodies[2].input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "A" }] },
+			{ role: "user", content: [{ type: "input_text", text: "B" }] },
+		]);
+		expect(connections).toBe(2);
 	});
 
 	it.each(["websocket", "sse"] as const)(

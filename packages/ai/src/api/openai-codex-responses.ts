@@ -5,7 +5,12 @@ import type {
 	ResponseInput,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
-
+import {
+	classifyCacheTelemetryRawField,
+	getCacheTelemetryDataProperty,
+	observeCacheOutcomeSafely,
+	observeCacheRequestSafely,
+} from "../cache-telemetry.ts";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -232,6 +237,34 @@ function compressRequestBodyZstd(bodyJson: string): Uint8Array | null {
 // Main Stream Function
 // ============================================================================
 
+function getRawUsageProvenance(rawUsage: unknown) {
+	const source = typeof rawUsage === "object" && rawUsage !== null ? rawUsage : undefined;
+	const read = (object: object | undefined, key: string): { present: boolean; value: unknown } => {
+		if (!object) return { present: false, value: undefined };
+		const descriptor = Object.getOwnPropertyDescriptor(object, key);
+		return descriptor && "value" in descriptor
+			? { present: true, value: descriptor.value }
+			: { present: false, value: undefined };
+	};
+	const input = read(source, "input_tokens");
+	const output = read(source, "output_tokens");
+	const details = read(source, "input_tokens_details");
+	const cached = read(
+		typeof details.value === "object" && details.value !== null ? details.value : undefined,
+		"cached_tokens",
+	);
+	return {
+		present: rawUsage !== undefined,
+		fields: {
+			input: classifyCacheTelemetryRawField(input.value, input.present),
+			output: classifyCacheTelemetryRawField(output.value, output.present),
+			cacheRead: classifyCacheTelemetryRawField(cached.value, cached.present),
+			cacheWrite: classifyCacheTelemetryRawField(undefined, false),
+			cacheWrite1h: classifyCacheTelemetryRawField(undefined, false),
+		},
+	};
+}
+
 export const stream: StreamFunction<"openai-codex-responses", OpenAICodexResponsesOptions> = (
 	model: Model<"openai-codex-responses">,
 	context: Context,
@@ -262,6 +295,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 		let activePhase: "before_headers" | "streaming" = "before_headers";
 		let ssePhase: "before_headers" | "streaming" = "before_headers";
 		let requestBytes = 0;
+		let telemetryIds: { requestId: string; attemptId: string } | undefined;
+		let logicalRequestId: string | undefined;
+		let rawUsage: unknown;
 
 		try {
 			const apiKey = options?.apiKey;
@@ -278,7 +314,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
 			let body = buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties);
 			const nextBody = await options?.onPayload?.(body, model);
-			if (nextBody !== undefined) {
+			if (typeof nextBody === "object" && nextBody !== null) {
 				body = nextBody as RequestBody;
 			}
 			const websocketRequestId = codexSessionId || uuidv7();
@@ -309,6 +345,24 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				while (true) {
 					websocketStarted = false;
 					try {
+						telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+							requestId: logicalRequestId,
+							provider: model.provider,
+							model: model.id,
+							phase: "canonical_body",
+							transport: "websocket",
+							payloadMode: "full",
+							cacheRetention: options?.cacheRetention ?? "short",
+							cacheKeyPresent: getCacheTelemetryDataProperty(body, "prompt_cache_key") !== undefined,
+							sessionHeaderPresent: true,
+							cacheIdentityMatch:
+								getCacheTelemetryDataProperty(body, "prompt_cache_key") === undefined
+									? null
+									: getCacheTelemetryDataProperty(body, "prompt_cache_key") === websocketRequestId,
+							payload: body,
+							wirePayload: bodyJson,
+						});
+						logicalRequestId = telemetryIds?.requestId ?? logicalRequestId;
 						await processWebSocketStream(
 							resolveCodexWebSocketUrl(model.baseUrl),
 							body,
@@ -330,12 +384,23 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							accountId,
 							grammarToolInputProperties,
 							options,
+							telemetryIds,
+							(usage) => {
+								rawUsage = usage;
+							},
 						);
 
 						if (options?.signal?.aborted) {
 							throw new Error("Request was aborted");
 						}
 						assertSuccessfulOutput(output);
+						if (telemetryIds)
+							observeCacheOutcomeSafely(options?.cacheTelemetry, {
+								...telemetryIds,
+								outcome: "success",
+								normalizedUsage: output.usage,
+								rawUsage: getRawUsageProvenance(rawUsage),
+							});
 						stream.push({
 							type: "done",
 							reason: output.stopReason,
@@ -348,14 +413,23 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						const connectionLimitBeforeStart = !websocketStarted && isWebSocketConnectionLimitReachedError(error);
 						const missingWebSocketContinuation = isMissingWebSocketContinuationError(error);
 						if (!aborted && missingWebSocketContinuation && !retriedMissingWebSocketContinuation) {
+							if (telemetryIds)
+								observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
 							retriedMissingWebSocketContinuation = true;
 							continue;
 						}
 						if (!aborted && connectionLimitBeforeStart && !retriedWebSocketConnectionLimit) {
+							if (telemetryIds)
+								observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
 							retriedWebSocketConnectionLimit = true;
 							continue;
 						}
 						if (aborted || (isCodexNonTransportError(error) && !connectionLimitBeforeStart)) {
+							if (telemetryIds)
+								observeCacheOutcomeSafely(options?.cacheTelemetry, {
+									...telemetryIds,
+									outcome: aborted ? "aborted" : "failed",
+								});
 							throw error;
 						}
 						appendAssistantMessageDiagnostic(
@@ -369,6 +443,11 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							}),
 						);
 						recordWebSocketFailure(cacheSessionId, error);
+						if (telemetryIds)
+							observeCacheOutcomeSafely(options?.cacheTelemetry, {
+								...telemetryIds,
+								outcome: aborted ? "aborted" : "failed",
+							});
 						if (websocketStarted) {
 							throw error;
 						}
@@ -398,6 +477,45 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
 
 			for (let attempt = 0; attempt <= maxRetries; attempt++) {
+				telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+					requestId: logicalRequestId,
+					provider: model.provider,
+					model: model.id,
+					phase: "canonical_body",
+					transport: "sse",
+					payloadMode: "full",
+					cacheRetention: options?.cacheRetention ?? "short",
+					cacheKeyPresent: getCacheTelemetryDataProperty(body, "prompt_cache_key") !== undefined,
+					sessionHeaderPresent: sseHeaders.has("session_id"),
+					cacheIdentityMatch:
+						typeof getCacheTelemetryDataProperty(body, "prompt_cache_key") === "string" &&
+						sseHeaders.has("session_id")
+							? getCacheTelemetryDataProperty(body, "prompt_cache_key") === sseHeaders.get("session_id")
+							: null,
+					payload: body,
+					wirePayload: bodyJson,
+				});
+				logicalRequestId = telemetryIds?.requestId ?? logicalRequestId;
+				if (telemetryIds)
+					observeCacheRequestSafely(options?.cacheTelemetry, {
+						...telemetryIds,
+						provider: model.provider,
+						model: model.id,
+						phase: "final_wire_body",
+						transport: "sse",
+						payloadMode: "full",
+						cacheRetention: options?.cacheRetention ?? "short",
+						cacheKeyPresent: getCacheTelemetryDataProperty(body, "prompt_cache_key") !== undefined,
+						sessionHeaderPresent: sseHeaders.has("session_id"),
+						cacheIdentityMatch:
+							typeof getCacheTelemetryDataProperty(body, "prompt_cache_key") === "string" &&
+							sseHeaders.has("session_id")
+								? getCacheTelemetryDataProperty(body, "prompt_cache_key") === sseHeaders.get("session_id")
+								: null,
+						payload: body,
+						// Fingerprint the exact provider JSON before lossless zstd encoding.
+						wirePayload: bodyJson,
+					});
 				if (options?.signal?.aborted) {
 					throw new Error("Request was aborted");
 				}
@@ -410,7 +528,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						response = await (options?.fetch ?? globalThis.fetch)(resolveCodexUrl(model.baseUrl), {
 							method: "POST",
 							headers: sseHeaders,
-							body: sseBody,
+							// Node zstd produces a Fetch-compatible byte view; do not copy it.
+							body: sseBody as NonNullable<Parameters<typeof globalThis.fetch>[1]>["body"],
 							signal: combinedSignal.signal,
 						});
 					} catch (error) {
@@ -432,6 +551,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 
 					const errorText = await response.text();
 					if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
+						if (telemetryIds)
+							observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
 						const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
 						const delayMs =
 							retryAfterDelayMs === undefined
@@ -458,6 +579,11 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						throw error;
 					}
 					lastError = error instanceof Error ? error : new Error(String(error));
+					if (telemetryIds)
+						observeCacheOutcomeSafely(options?.cacheTelemetry, {
+							...telemetryIds,
+							outcome: options?.signal?.aborted ? "aborted" : "failed",
+						});
 					// Network errors are retryable
 					if (
 						attempt < maxRetries &&
@@ -486,13 +612,22 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				startEmitted = true;
 				stream.push({ type: "start", partial: output });
 			}
-			await processStream(response, output, stream, model, grammarToolInputProperties, options);
+			await processStream(response, output, stream, model, grammarToolInputProperties, options, (usage) => {
+				rawUsage = usage;
+			});
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
 
 			assertSuccessfulOutput(output);
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: "success",
+					normalizedUsage: output.usage,
+					rawUsage: getRawUsageProvenance(rawUsage),
+				});
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
@@ -502,6 +637,11 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: output.stopReason === "aborted" ? "aborted" : "failed",
+				});
 			const normalized = normalizeProviderError(error);
 			const formattedError = formatProviderError(normalized);
 			if (options?.signal?.aborted) {
@@ -704,12 +844,14 @@ async function processStream(
 	model: Model<"openai-codex-responses">,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 	options?: OpenAICodexResponsesOptions,
+	onRawUsage?: (usage: unknown) => void,
 ): Promise<void> {
 	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal), output), output, stream, model, {
 		serviceTier: options?.serviceTier,
 		grammarToolInputProperties,
 		resolveServiceTier: resolveCodexServiceTier,
 		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+		onRawUsage,
 	});
 }
 
@@ -903,6 +1045,7 @@ interface CachedWebSocketConnection {
 	createdAt: number;
 	idleTimer?: ReturnType<typeof setTimeout>;
 	continuation?: CachedWebSocketContinuationState;
+	continuationUnavailable?: boolean;
 }
 
 export interface OpenAICodexWebSocketDebugStats {
@@ -1519,6 +1662,8 @@ async function processWebSocketStream(
 	accountId: string,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 	options?: OpenAICodexResponsesOptions,
+	telemetryIds?: { requestId: string; attemptId: string },
+	onRawUsage?: (usage: unknown) => void,
 ): Promise<void> {
 	const { socket, entry, reused, release } = await acquireWebSocket(
 		url,
@@ -1534,7 +1679,17 @@ async function processWebSocketStream(
 	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
 	// WebSocket continuation still works via connection-scoped previous_response_id state.
 	const fullBody = body;
+	const continuationWasUnavailable = Boolean(entry?.continuationUnavailable);
+	const hadContinuation = Boolean(entry?.continuation || continuationWasUnavailable);
+	if (entry) entry.continuationUnavailable = false;
 	const requestBody = useCachedContext && entry ? buildCachedWebSocketRequestBody(entry, fullBody) : fullBody;
+	const fallbackReason = requestBody.previous_response_id
+		? "none"
+		: continuationWasUnavailable
+			? "continuation_unavailable"
+			: hadContinuation
+				? "prefix_or_options_mismatch"
+				: "no_continuation";
 	const stats = cacheSessionId ? getOrCreateWebSocketDebugStats(cacheSessionId) : undefined;
 	if (stats) {
 		stats.requests++;
@@ -1554,7 +1709,34 @@ async function processWebSocketStream(
 		}
 	}
 	try {
-		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
+		const wirePayload = JSON.stringify({ type: "response.create", ...requestBody });
+		if (telemetryIds)
+			observeCacheRequestSafely(options?.cacheTelemetry, {
+				...telemetryIds,
+				provider: model.provider,
+				model: model.id,
+				phase: "final_wire_body",
+				transport: "websocket",
+				payloadMode: requestBody.previous_response_id ? "delta" : "full",
+				cacheRetention: options?.cacheRetention ?? "short",
+				cacheKeyPresent: getCacheTelemetryDataProperty(requestBody, "prompt_cache_key") !== undefined,
+				sessionHeaderPresent: headers.has("session-id"),
+				cacheIdentityMatch:
+					typeof getCacheTelemetryDataProperty(requestBody, "prompt_cache_key") === "string" &&
+					headers.has("session-id")
+						? getCacheTelemetryDataProperty(requestBody, "prompt_cache_key") === headers.get("session-id")
+						: null,
+				payload: requestBody,
+				wirePayload,
+				continuationPresent: hadContinuation,
+				deltaGenerated: Boolean(requestBody.previous_response_id),
+				deltaEmpty: Boolean(requestBody.previous_response_id) && (requestBody.input?.length ?? 0) === 0,
+				deltaEmptyReason:
+					requestBody.previous_response_id && (requestBody.input?.length ?? 0) === 0 ? "no_new_input" : undefined,
+				fellBackToFull: hadContinuation && !requestBody.previous_response_id,
+				fallbackReason,
+			});
+		socket.send(wirePayload);
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
 				mapCodexEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs), output),
@@ -1568,6 +1750,7 @@ async function processWebSocketStream(
 				grammarToolInputProperties,
 				resolveServiceTier: resolveCodexServiceTier,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+				onRawUsage,
 			},
 		);
 		if (options?.signal?.aborted) {
@@ -1582,6 +1765,10 @@ async function processWebSocketStream(
 				lastResponseId: output.responseId,
 				lastResponseItems: responseItems,
 			};
+			entry.continuationUnavailable = false;
+		} else if (useCachedContext && entry) {
+			entry.continuation = undefined;
+			entry.continuationUnavailable = true;
 		}
 	} catch (error) {
 		if (entry) {

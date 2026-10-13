@@ -240,7 +240,7 @@ describe("Coding Agent Tools", () => {
 			// The head of the line is returned, numbered, with a notice that says
 			// what was cut. The tool owns this window now, so it must never
 			// endorse the shell idiom the agent used to reach for.
-			expect(output).toContain("     1\t" + "z".repeat(1024));
+			expect(output).toContain(`     1\t${"z".repeat(1024)}`);
 			expect(output).toContain("Line 1 is 120.0KB; showing its first 50.0KB of it");
 			expect(output).not.toContain("sed");
 			expect(output).not.toContain("head -c");

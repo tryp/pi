@@ -24,6 +24,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
+import type { CacheTelemetryObserver } from "@earendil-works/pi-ai";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
@@ -52,7 +53,6 @@ import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
-import { estimateToolSchemaTokens } from "./compaction/compaction.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -60,6 +60,7 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateProviderContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -225,6 +226,12 @@ export interface AgentSessionConfig {
 	baseToolsOverride?: Record<string, AgentTool>;
 	/** Mutable ref used by Agent to access the current ExtensionRunner */
 	extensionRunnerRef?: { current?: ExtensionRunner };
+	/** Optional per-session cache telemetry observer. */
+	cacheTelemetry?: CacheTelemetryObserver;
+	/** Drain and close the SDK-owned telemetry writer on disposal. */
+	disposeCacheTelemetry?: () => Promise<void>;
+	/** Private tool-result annotations are buffered until the next logical request is joined. */
+	onCacheOperationAnnotation?: (annotation: unknown, handlerIndex: number, durationMs: number) => void;
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
 }
@@ -351,6 +358,14 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
+	readonly cacheTelemetry?: CacheTelemetryObserver;
+	private readonly _disposeCacheTelemetry?: () => Promise<void>;
+	private _disposePromise?: Promise<void>;
+	private readonly _onCacheOperationAnnotation?: (
+		annotation: unknown,
+		handlerIndex: number,
+		durationMs: number,
+	) => void;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -385,8 +400,10 @@ export class AgentSession {
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
+	private _manualCompactionPending = false;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _overflowRecoveryOutcome: "none" | "attempting" | "compacted" | "no-op" | "cancelled" | "failed" = "none";
 	/**
 	 * Message count at the last pre-send compaction, so a request that already
 	 * compacted does not compact again until new messages arrive.
@@ -450,6 +467,9 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
+		this.cacheTelemetry = config.cacheTelemetry;
+		this._disposeCacheTelemetry = config.disposeCacheTelemetry;
+		this._onCacheOperationAnnotation = config.onCacheOperationAnnotation;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -573,16 +593,19 @@ export class AgentSession {
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
 			const runner = this._extensionRunner;
 			const hookResult = runner.hasHandlers("tool_result")
-				? await runner.emitToolResult({
-						type: "tool_result",
-						toolName: toolCall.name,
-						toolCallId: toolCall.id,
-						input: args as Record<string, unknown>,
-						content: result.content,
-						details: result.details,
-						isError,
-						usage: result.usage,
-					})
+				? await runner.emitToolResult(
+						{
+							type: "tool_result",
+							toolName: toolCall.name,
+							toolCallId: toolCall.id,
+							input: args as Record<string, unknown>,
+							content: result.content,
+							details: result.details,
+							isError,
+							usage: result.usage,
+						},
+						this._onCacheOperationAnnotation,
+					)
 				: undefined;
 
 			const content = hookResult?.content ?? result.content ?? [];
@@ -860,6 +883,7 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
+			this._overflowRecoveryOutcome = "none";
 			this._lastPreSendCompactionLength = -1;
 			const messageText = contentText(event.message.content, "");
 			if (messageText) {
@@ -949,6 +973,7 @@ export class AgentSession {
 				}
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {
 					this._overflowRecoveryAttempted = false;
+					this._overflowRecoveryOutcome = "none";
 				}
 
 				// Reset retry counter immediately on successful assistant response
@@ -1185,9 +1210,11 @@ export class AgentSession {
 
 	/**
 	 * Remove all listeners and disconnect from agent.
-	 * Call this when completely done with the session.
+	 * Await this when completely done with the session to drain private telemetry.
+	 * Listener removal remains synchronous; repeated calls share the completion barrier.
 	 */
-	dispose(): void {
+	dispose(): Promise<void> {
+		if (this._disposePromise) return this._disposePromise;
 		this._disposed = true;
 		this._cancelQueuedMessageWake();
 		// Disposal never resumes queued work. Clear both the agent queues and their
@@ -1211,6 +1238,14 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		this._eventListeners = [];
 		cleanupSessionResources(this.sessionId);
+		this._disposePromise = this._disposeCacheTelemetry
+			? this.agent
+					.waitForIdle()
+					.catch(() => undefined)
+					.then(this._disposeCacheTelemetry)
+					.catch(() => undefined)
+			: Promise.resolve();
+		return this._disposePromise;
 	}
 
 	// =========================================================================
@@ -1310,17 +1345,27 @@ export class AgentSession {
 	}
 
 	guardContextForRequest(
-		contextOrMessages: AgentMessage[] | { messages: AgentMessage[]; tools?: readonly unknown[] },
+		contextOrMessages:
+			| AgentMessage[]
+			| { messages: AgentMessage[]; systemPrompt?: string; tools?: readonly unknown[] },
 	): void {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled || settings.maxContextTokens == null || this.isCompacting) return;
 		// The array form remains accepted for direct session callers that do not
-		// have the provider Context object; the SDK passes the full context so
-		// tool schemas are included when available.
+		// have the provider Context object; use session overhead in that case. The
+		// SDK passes the full, possibly extension-transformed request context.
 		const context = Array.isArray(contextOrMessages)
-			? { messages: contextOrMessages, tools: undefined }
+			? {
+					messages: contextOrMessages,
+					systemPrompt: this.agent?.state.systemPrompt,
+					tools: this.agent?.state.tools,
+				}
 			: contextOrMessages;
-		const estimatedTokens = estimateContextTokens(context.messages).tokens + estimateToolSchemaTokens(context.tools);
+		const estimatedTokens = estimateProviderContextTokens(
+			context.messages,
+			context.systemPrompt,
+			context.tools,
+		).tokens;
 		if (estimatedTokens > settings.maxContextTokens) {
 			throw new ContextGuardError(estimatedTokens, settings.maxContextTokens);
 		}
@@ -1331,10 +1376,9 @@ export class AgentSession {
 	 * to the hard limit, so the request is submitted from compacted state instead
 	 * of being refused by {@link guardContextForRequest} or trimmed.
 	 *
-	 * Measured with the same estimate as the guard (messages plus tool schemas),
-	 * so the two gates cannot disagree about where the limit is. The system prompt
-	 * is not counted here; the headroom below {@link CONTEXT_BORDERLINE_FRACTION}
-	 * covers it for the configured reserve.
+	 * Uses the guard's provider-context estimate: usage already includes request
+	 * overhead; without usage, system prompt and tool schemas are estimated once.
+	 * Extensions can still change the final request context after this gate.
 	 *
 	 * Best effort by construction: this calls the same `prepareCompaction` the
 	 * manual path uses, and that returns `undefined` when the branch ends inside an
@@ -1358,7 +1402,11 @@ export class AgentSession {
 		const messages = this.agent.state.messages;
 		if (messages.length === this._lastPreSendCompactionLength) return undefined;
 
-		const estimatedTokens = estimateContextTokens(messages).tokens + estimateToolSchemaTokens(this.agent.state.tools);
+		const estimatedTokens = estimateProviderContextTokens(
+			messages,
+			this.agent.state.systemPrompt,
+			this.agent.state.tools,
+		).tokens;
 		if (estimatedTokens < CONTEXT_BORDERLINE_FRACTION * settings.maxContextTokens) return undefined;
 
 		// `_runAutoCompaction` rewrites agent state from the new session context, so a
@@ -1387,8 +1435,11 @@ export class AgentSession {
 	private _transportAbortRetryAllowed(): boolean {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled || settings.maxContextTokens == null) return false;
-		const estimatedTokens =
-			estimateContextTokens(this.agent.state.messages).tokens + estimateToolSchemaTokens(this.agent.state.tools);
+		const estimatedTokens = estimateProviderContextTokens(
+			this.agent.state.messages,
+			this.agent.state.systemPrompt,
+			this.agent.state.tools,
+		).tokens;
 		return estimatedTokens < CONTEXT_BORDERLINE_FRACTION * settings.maxContextTokens;
 	}
 
@@ -2417,7 +2468,15 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
-		await this.abort();
+		if (this._manualCompactionPending || this.isCompacting) throw new Error("Compaction already in progress");
+		// Reserve before abort's first await without marking the session busy:
+		// abort waits for idle, so reserving the controller here would deadlock.
+		this._manualCompactionPending = true;
+		try {
+			await this.abort();
+		} finally {
+			this._manualCompactionPending = false;
+		}
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
@@ -2505,8 +2564,11 @@ export class AgentSession {
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			const estimatedTokensAfter =
-				estimateContextTokens(sessionContext.messages).tokens + estimateToolSchemaTokens(this.agent.state.tools);
+			const estimatedTokensAfter = estimateProviderContextTokens(
+				sessionContext.messages,
+				this.agent.state.systemPrompt,
+				this.agent.state.tools,
+			).tokens;
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -2704,41 +2766,55 @@ export class AgentSession {
 					return false;
 				}
 			}
-			// A guard refusal must satisfy this threshold, and the guard counts tool
-			// schemas, so a refusal has to be measured the same way. Otherwise a refusal
-			// that crosses the limit only once the schemas are added leaves `shouldCompact`
-			// false, the recovery never runs, and the turn dies on a refusal whose message
-			// says it is compacting. Scoped to refusals deliberately: for a
-			// provider-reported error or a zero-usage response the message-only estimate is
-			// the established threshold (issue #8328), and widening it would make a session
-			// with a small window compact on every error.
+			// Guard refusals use the request-budget estimate. Preserve the established
+			// message-only threshold for ordinary provider errors (issue #8328).
 			contextTokens = guardRefusal
-				? estimate.tokens + estimateToolSchemaTokens(this.agent.state.tools)
+				? estimateProviderContextTokens(messages, this.agent.state.systemPrompt, this.agent.state.tools).tokens
 				: estimate.tokens;
 		} else {
 			contextTokens = directContextTokens;
 		}
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		if ((guardRefusal && settings.enabled) || shouldCompact(contextTokens, contextWindow, settings)) {
+			// A recognized pre-send context guard is authoritative: extension-transformed
+			// system prompts/tools may differ from the agent state re-estimate below.
 			// A pre-send context guard deliberately fails the request so compaction can
 			// replace the oversized context before the interrupted turn continues. That
 			// continuation is the entire point of the guard: without it the turn dies on
 			// a request that was never sent.
 			if (guardRefusal && this._overflowRecoveryAttempted) {
-				// Already compacted once for this refusal. Surfacing the failure beats
-				// compacting again, which cannot help if the kept messages are themselves
-				// over the limit.
+				const outcome = this._overflowRecoveryOutcome;
+				const detail =
+					outcome === "no-op"
+						? "No conversation history could be reduced."
+						: outcome === "cancelled"
+							? "The recovery compaction was canceled."
+							: outcome === "failed"
+								? "The recovery compaction failed."
+								: outcome === "compacted"
+									? "The context remained over the limit after compaction and retry."
+									: "The prior recovery attempt did not record a completed compaction.";
+				const errorMessage = `Context guard recovery failed after one recovery attempt. ${detail} Try reducing context or switching to a larger-context model.`;
 				this._emit({
 					type: "compaction_end",
 					reason: "threshold",
 					result: undefined,
 					aborted: false,
 					willRetry: false,
-					errorMessage:
-						"Context guard recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+					errorMessage,
+				});
+				await this._emitSessionCompactFailed({
+					reason: "threshold",
+					errorMessage,
+					aborted: false,
+					willRetry: false,
+					fromExtension: false,
 				});
 				return false;
 			}
-			if (guardRefusal) this._overflowRecoveryAttempted = true;
+			if (guardRefusal) {
+				this._overflowRecoveryAttempted = true;
+				this._overflowRecoveryOutcome = "attempting";
+			}
 			return await this._runAutoCompaction("threshold", guardRefusal);
 		}
 		return false;
@@ -2756,11 +2832,32 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
+		const isGuardRecovery = reason === "threshold" && willRetry;
 		let started = false;
 		let fromExtension = false;
 
 		try {
 			if (!this.model) {
+				if (isGuardRecovery) {
+					const errorMessage = "Context guard recovery could not run because no model is selected.";
+					this._overflowRecoveryOutcome = "failed";
+					this._appendDiagnostic({ kind: "context_guard_recovery", outcome: "failed", reason, errorMessage });
+					this._emit({
+						type: "compaction_end",
+						reason,
+						result: undefined,
+						aborted: false,
+						willRetry: false,
+						errorMessage,
+					});
+					await this._emitSessionCompactFailed({
+						reason,
+						errorMessage,
+						aborted: false,
+						willRetry: false,
+						fromExtension: false,
+					});
+				}
 				return false;
 			}
 
@@ -2768,8 +2865,33 @@ export class AgentSession {
 
 			const pathEntries = this.sessionManager.getBranch();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			// Guard accounting includes transformed request context, while the normal
+			// keep target is based only on message content. Use an aggressive cut for this
+			// one bounded recovery attempt so short histories can still be summarized.
+			const preparationSettings = isGuardRecovery ? { ...settings, keepRecentTokens: 0 } : settings;
+			const preparation = prepareCompaction(pathEntries, preparationSettings);
 			if (!preparation) {
+				if (isGuardRecovery) {
+					const errorMessage =
+						"Context guard recovery could not compact: no conversation history can be reduced. A single oversized prompt or fixed context cannot be recovered by compaction.";
+					this._overflowRecoveryOutcome = "no-op";
+					this._appendDiagnostic({ kind: "context_guard_recovery", outcome: "no-op", reason, errorMessage });
+					this._emit({
+						type: "compaction_end",
+						reason,
+						result: undefined,
+						aborted: false,
+						willRetry: false,
+						errorMessage,
+					});
+					await this._emitSessionCompactFailed({
+						reason,
+						errorMessage,
+						aborted: false,
+						willRetry: false,
+						fromExtension: false,
+					});
+				}
 				return false;
 			}
 
@@ -2791,6 +2913,10 @@ export class AgentSession {
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (extensionResult?.cancel) {
+					if (isGuardRecovery) {
+						this._overflowRecoveryOutcome = "cancelled";
+						this._appendDiagnostic({ kind: "context_guard_recovery", outcome: "cancelled", reason });
+					}
 					this._emit({
 						type: "compaction_end",
 						reason,
@@ -2846,6 +2972,10 @@ export class AgentSession {
 			}
 
 			if (this._autoCompactionAbortController.signal.aborted) {
+				if (isGuardRecovery) {
+					this._overflowRecoveryOutcome = "cancelled";
+					this._appendDiagnostic({ kind: "context_guard_recovery", outcome: "cancelled", reason });
+				}
 				this._emit({
 					type: "compaction_end",
 					reason,
@@ -2866,8 +2996,11 @@ export class AgentSession {
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			const estimatedTokensAfter =
-				estimateContextTokens(sessionContext.messages).tokens + estimateToolSchemaTokens(this.agent.state.tools);
+			const estimatedTokensAfter = estimateProviderContextTokens(
+				sessionContext.messages,
+				this.agent.state.systemPrompt,
+				this.agent.state.tools,
+			).tokens;
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -2893,6 +3026,10 @@ export class AgentSession {
 				details,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			if (isGuardRecovery) {
+				this._overflowRecoveryOutcome = "compacted";
+				this._appendDiagnostic({ kind: "context_guard_recovery", outcome: "compacted", reason, tokensBefore });
+			}
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -2918,11 +3055,21 @@ export class AgentSession {
 			return false;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
-			if (started) {
-				const formattedErrorMessage =
-					reason === "overflow"
+			if (started || isGuardRecovery) {
+				const formattedErrorMessage = isGuardRecovery
+					? `Context guard recovery failed: ${errorMessage}`
+					: reason === "overflow"
 						? `Context overflow recovery failed: ${errorMessage}`
 						: `Auto-compaction failed: ${errorMessage}`;
+				if (isGuardRecovery) {
+					this._overflowRecoveryOutcome = "failed";
+					this._appendDiagnostic({
+						kind: "context_guard_recovery",
+						outcome: "failed",
+						reason,
+						errorMessage: formattedErrorMessage,
+					});
+				}
 				this._emit({
 					type: "compaction_end",
 					reason,

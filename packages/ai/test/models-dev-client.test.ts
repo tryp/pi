@@ -141,6 +141,27 @@ describe("models.dev client disk cache", () => {
 		expect(modelsDevClientStats()).toMatchObject({ cacheReads: 0, cacheWrites: 0 });
 	});
 
+	it("serves memory and fetches without process", async () => {
+		vi.stubGlobal("process", undefined);
+		try {
+			const fetchImpl = vi.fn(async () => ok(CATALOG_A));
+			const first = await getModelsDevCatalog({ now: () => START, fetchImpl });
+			const second = await getModelsDevCatalog({ now: () => START, fetchImpl });
+
+			expect(first).toMatchObject({ source: "network", catalog: CATALOG_A });
+			expect(second).toMatchObject({ source: "cache", catalog: CATALOG_A });
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+			expect(modelsDevClientStats()).toMatchObject({
+				networkFetches: 1,
+				cacheHits: 1,
+				cacheReads: 0,
+				cacheWrites: 0,
+			});
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
 	it("persists the refreshed timestamps after a 304", async () => {
 		await withTempCache(async (cacheFile) => {
 			const clock = createClock();

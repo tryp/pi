@@ -6,6 +6,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model, Provider, ProviderHeaders } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
+import { cloneMessagesForObservation } from "../cache-operations.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
@@ -937,18 +938,33 @@ export class ExtensionRunner {
 		return modified ? currentMessage : undefined;
 	}
 
-	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
+	async emitToolResult(
+		event: ToolResultEvent,
+		onOperation?: (annotation: unknown, handlerIndex: number, durationMs: number) => void,
+	): Promise<ToolResultEventResult | undefined> {
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = { ...event };
 		let modified = false;
+		let handlerIndex = 0;
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("tool_result");
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				const startedAt = onOperation ? performance.now() : 0;
+				let annotation: unknown;
 				try {
 					const handlerResult = (await handler(currentEvent, ctx)) as ToolResultEventResult | undefined;
+					if (handlerResult && typeof handlerResult === "object") {
+						try {
+							const descriptor = Object.getOwnPropertyDescriptor(handlerResult, "cacheOperation");
+							if (descriptor && "value" in descriptor) annotation = descriptor.value;
+							else if (descriptor) annotation = null;
+						} catch {
+							annotation = null;
+						}
+					}
 					if (!handlerResult) continue;
 
 					if (handlerResult.content !== undefined) {
@@ -970,12 +986,16 @@ export class ExtensionRunner {
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
-					this.emitError({
-						extensionPath: ext.path,
-						event: "tool_result",
-						error: message,
-						stack,
-					});
+					this.emitError({ extensionPath: ext.path, event: "tool_result", error: message, stack });
+				} finally {
+					if (onOperation) {
+						try {
+							onOperation(annotation, handlerIndex, performance.now() - startedAt);
+						} catch {
+							/* instrumentation is fail-open */
+						}
+					}
+					handlerIndex++;
 				}
 			}
 		}
@@ -1044,15 +1064,30 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
-	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+	async emitContext(
+		messages: AgentMessage[],
+		onOperation?: (
+			before: AgentMessage[] | undefined,
+			after: AgentMessage[],
+			handlerIndex: number,
+			durationMs: number,
+			failed: boolean,
+			annotation?: unknown,
+		) => void,
+	): Promise<AgentMessage[]> {
 		const ctx = this.createContext();
 		let currentMessages = structuredClone(messages);
+		let handlerIndex = 0;
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("context");
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				const before = onOperation ? cloneMessagesForObservation(currentMessages) : currentMessages;
+				const startedAt = onOperation ? performance.now() : 0;
+				let failed = false;
+				let annotation: unknown;
 				try {
 					const event: ContextEvent = { type: "context", messages: currentMessages };
 					const handlerResult = await handler(event, ctx);
@@ -1060,7 +1095,18 @@ export class ExtensionRunner {
 					if (handlerResult && (handlerResult as ContextEventResult).messages) {
 						currentMessages = (handlerResult as ContextEventResult).messages!;
 					}
+					if (handlerResult && typeof handlerResult === "object") {
+						try {
+							const annotationDescriptor = Object.getOwnPropertyDescriptor(handlerResult, "cacheOperation");
+							if (annotationDescriptor && "value" in annotationDescriptor)
+								annotation = annotationDescriptor.value;
+							else if (annotationDescriptor) annotation = null;
+						} catch {
+							annotation = null;
+						}
+					}
 				} catch (err) {
+					failed = true;
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1069,6 +1115,22 @@ export class ExtensionRunner {
 						error: message,
 						stack,
 					});
+				} finally {
+					if (onOperation) {
+						try {
+							onOperation(
+								before,
+								currentMessages,
+								handlerIndex,
+								performance.now() - startedAt,
+								failed,
+								annotation,
+							);
+						} catch {
+							// Instrumentation must not affect context handler execution.
+						}
+					}
+					handlerIndex++;
 				}
 			}
 		}

@@ -1118,8 +1118,25 @@ export type ExtensionEvent =
 // Event Results
 // ============================================================================
 
+export interface CacheOperationAnnotation {
+	reason: "sidecar_gate" | "plan_marker_filter" | "auto_continue_filter";
+	counters?: {
+		considered?: number;
+		changed?: number;
+		skippedCurrent?: number;
+		skippedRole?: number;
+		skippedThreshold?: number;
+		skippedReceipt?: number;
+		skippedTool?: number;
+		skippedDisabled?: number;
+		storageUnavailable?: number;
+		errors?: number;
+	};
+}
+
 export interface ContextEventResult {
 	messages?: AgentMessage[];
+	cacheOperation?: CacheOperationAnnotation;
 }
 
 export type BeforeProviderRequestEventResult = unknown;
@@ -1144,6 +1161,7 @@ export interface UserBashEventResult {
 }
 
 export interface ToolResultEventResult {
+	cacheOperation?: CacheOperationAnnotation;
 	content?: (TextContent | ImageContent)[];
 	details?: unknown;
 	isError?: boolean;

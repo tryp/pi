@@ -22,6 +22,7 @@ import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionContext,
 	type CompactionEntry,
+	INVALIDATED_CONTEXT_USAGE_ANCHOR,
 	type SessionEntry,
 	sessionEntryToContextMessages,
 } from "../session-manager.ts";
@@ -163,7 +164,11 @@ export function calculateContextTokens(usage: Usage): number {
  * Skips aborted, error, and all-zero usage messages as they don't have valid usage data.
  */
 function getAssistantUsage(msg: AgentMessage): Usage | undefined {
-	if (msg.role === "assistant" && "usage" in msg) {
+	if (
+		msg.role === "assistant" &&
+		"usage" in msg &&
+		!(msg as unknown as Record<symbol, unknown>)[INVALIDATED_CONTEXT_USAGE_ANCHOR]
+	) {
 		const assistantMsg = msg as AssistantMessage;
 		if (
 			assistantMsg.stopReason !== "aborted" &&
@@ -196,6 +201,11 @@ export interface ContextUsageEstimate {
 	usageTokens: number;
 	trailingTokens: number;
 	lastUsageIndex: number | null;
+}
+
+export interface ProviderContextEstimate extends ContextUsageEstimate {
+	systemPromptTokens: number;
+	schemaTokens: number;
 }
 
 const CHARS_PER_TOKEN = 4;
@@ -250,6 +260,29 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 export function estimateToolSchemaTokens(tools: readonly unknown[] | undefined): number {
 	if (tools === undefined || tools.length === 0) return 0;
 	return Math.ceil(JSON.stringify(tools).length / CHARS_PER_TOKEN);
+}
+
+/**
+ * Estimate a provider request without counting prompt overhead twice.
+ * Usage includes the system prompt and tool schemas from the previous request;
+ * absent a valid usage anchor, estimate both from the current request instead.
+ * Retained pre-compaction usage is invalidated by buildSessionContext().
+ * Changes to request overhead since the usage anchor are not measured.
+ */
+export function estimateProviderContextTokens(
+	messages: AgentMessage[],
+	systemPrompt = "",
+	tools?: readonly unknown[],
+): ProviderContextEstimate {
+	const estimate = estimateContextTokens(messages);
+	const systemPromptTokens = estimate.lastUsageIndex === null ? Math.ceil(systemPrompt.length / CHARS_PER_TOKEN) : 0;
+	const schemaTokens = estimate.lastUsageIndex === null ? estimateToolSchemaTokens(tools) : 0;
+	return {
+		...estimate,
+		tokens: estimate.tokens + systemPromptTokens + schemaTokens,
+		systemPromptTokens,
+		schemaTokens,
+	};
 }
 
 /**

@@ -11,6 +11,12 @@ import type {
 	ChatCompletionSystemMessageParam,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
+import {
+	classifyCacheTelemetryRawField,
+	getCacheTelemetryDataProperty,
+	observeCacheOutcomeSafely,
+	observeCacheRequestSafely,
+} from "../cache-telemetry.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	AssistantMessage,
@@ -339,6 +345,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 		let streamedReasoningDetails: OpenAIReasoningDetail[] | undefined;
 		let params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming | undefined;
 		let phase: "before_headers" | "streaming" = "before_headers";
+		let telemetryIds: { requestId: string; attemptId: string } | undefined;
+		let rawUsage: unknown;
 		const applyStreamedReasoningDetails = (block: ThinkingContent): void => {
 			if (streamedReasoningDetails !== undefined) {
 				block.thinkingSignature = JSON.stringify(streamedReasoningDetails);
@@ -366,7 +374,33 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				maxRetries: 0,
 			};
 			const { data: openaiStream, response } = await retryProviderRequest(
-				() => client.chat.completions.create(params!, requestOptions).withResponse(),
+				() => {
+					telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+						requestId: telemetryIds?.requestId,
+						provider: model.provider,
+						model: model.id,
+						phase: "final_wire_body",
+						transport: "sse",
+						payloadMode: "full",
+						cacheRetention,
+						cacheKeyPresent: getCacheTelemetryDataProperty(params, "prompt_cache_key") !== undefined,
+						sessionHeaderPresent: Boolean(cacheSessionId),
+						cacheIdentityMatch: null,
+						payload: params!,
+					});
+					const ids = telemetryIds;
+					return client.chat.completions
+						.create(params!, requestOptions)
+						.withResponse()
+						.catch((error: unknown) => {
+							if (ids)
+								observeCacheOutcomeSafely(options?.cacheTelemetry, {
+									...ids,
+									outcome: options?.signal?.aborted ? "aborted" : "failed",
+								});
+							throw error;
+						});
+				},
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
@@ -562,6 +596,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					output.responseModel ||= chunk.model;
 				}
 				if (chunk.usage) {
+					rawUsage = chunk.usage;
 					output.usage = parseChunkUsage(chunk.usage, model);
 				}
 
@@ -571,6 +606,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				// Fallback: some providers (e.g., Moonshot) return usage
 				// in choice.usage instead of the standard chunk.usage
 				if (!chunk.usage && (choice as any).usage) {
+					rawUsage = (choice as any).usage;
 					output.usage = parseChunkUsage((choice as any).usage, model);
 				}
 
@@ -698,6 +734,46 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				throw new Error("Stream ended without finish_reason");
 			}
 
+			if (telemetryIds) {
+				const raw =
+					typeof rawUsage === "object" && rawUsage !== null ? (rawUsage as Record<string, unknown>) : undefined;
+				const promptDetails =
+					typeof raw?.prompt_tokens_details === "object" && raw.prompt_tokens_details !== null
+						? (raw.prompt_tokens_details as Record<string, unknown>)
+						: undefined;
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: "success",
+					normalizedUsage: output.usage,
+					rawUsage: {
+						present: rawUsage !== undefined,
+						fields: {
+							input: classifyCacheTelemetryRawField(
+								raw?.prompt_tokens,
+								Boolean(raw && Object.hasOwn(raw, "prompt_tokens")),
+							),
+							output: classifyCacheTelemetryRawField(
+								raw?.completion_tokens,
+								Boolean(raw && Object.hasOwn(raw, "completion_tokens")),
+							),
+							cacheRead: classifyCacheTelemetryRawField(
+								promptDetails?.cached_tokens ?? raw?.prompt_cache_hit_tokens ?? raw?.cached_tokens,
+								Boolean(
+									(promptDetails && Object.hasOwn(promptDetails, "cached_tokens")) ||
+										(raw &&
+											(Object.hasOwn(raw, "prompt_cache_hit_tokens") ||
+												Object.hasOwn(raw, "cached_tokens"))),
+								),
+							),
+							cacheWrite: classifyCacheTelemetryRawField(
+								promptDetails?.cache_write_tokens,
+								Boolean(promptDetails && Object.hasOwn(promptDetails, "cache_write_tokens")),
+							),
+							cacheWrite1h: classifyCacheTelemetryRawField(undefined, false),
+						},
+					},
+				});
+			}
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
@@ -712,6 +788,11 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: output.stopReason === "aborted" ? "aborted" : "failed",
+				});
 			const normalized = normalizeProviderError(error);
 			const formattedError = formatProviderError(normalized);
 			const requestJson = params === undefined ? undefined : JSON.stringify(params);

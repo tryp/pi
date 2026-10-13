@@ -137,12 +137,12 @@ describe("AgentSession compaction characterization", () => {
 
 		const result = await harness.session.compact();
 		const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
-		// The reported value is usage-backed and includes the tool schemas sent with
-		// the request, so it is deliberately not the legacy message-only chars/4 sum
-		// (which is single digits for this tiny fixture).
+		// Compaction invalidates retained provider usage. The fresh content estimate
+		// includes system prompt and tool schemas, not just message content.
 		const legacyMessageOnly = harness.session.messages.reduce((sum, message) => sum + estimateTokens(message), 0);
 		const expectedEstimatedTokensAfter =
 			estimateContextTokens(harness.session.messages).tokens +
+			Math.ceil(harness.session.agent.state.systemPrompt.length / 4) +
 			estimateToolSchemaTokens(harness.session.agent.state.tools);
 
 		expect(result.summary).toBe("summary from extension");

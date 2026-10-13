@@ -9,6 +9,7 @@ import type { OpenAICodexResponsesOptions } from "./api/openai-codex-responses.t
 import type { OpenAICompletionsOptions } from "./api/openai-completions.ts";
 import type { OpenAIResponsesOptions } from "./api/openai-responses.ts";
 import type { PiMessagesOptions } from "./api/pi-messages.ts";
+import type { CacheTelemetryObserver } from "./cache-telemetry.ts";
 import type { AssistantMessageDiagnostic } from "./utils/diagnostics.ts";
 import type { AssistantMessageEventStream } from "./utils/event-stream.ts";
 
@@ -125,6 +126,8 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	signal?: AbortSignal;
 	/** Explicit parent context for telemetry produced by this logical request. */
 	telemetryContext?: TelemetryContext;
+	/** Internal opt-in observer for local prompt-cache diagnostics. */
+	cacheTelemetry?: CacheTelemetryObserver;
 	apiKey?: string;
 	/**
 	 * Optional fetch implementation for provider HTTP requests.

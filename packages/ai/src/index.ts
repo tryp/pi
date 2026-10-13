@@ -1,6 +1,5 @@
 export type { Static, TSchema } from "typebox";
 export { Type } from "typebox";
-
 // Core only, side-effect free: no generated catalogs, no provider factories,
 // no api-registry, no OAuth implementations, no compat. Provider factories
 // live under "@earendil-works/pi-ai/providers/*", API implementations under
@@ -22,6 +21,7 @@ export * from "./auth/context.ts";
 export * from "./auth/credential-store.ts";
 export * from "./auth/helpers.ts";
 export * from "./auth/types.ts";
+export * from "./cache-telemetry.ts";
 export type {
 	OAuthAuthInfo,
 	OAuthDeviceCodeInfo,

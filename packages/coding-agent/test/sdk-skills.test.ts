@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -35,6 +35,22 @@ This is a test skill.
 	afterEach(() => {
 		if (tempDir) {
 			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps cache telemetry disabled when its opt-in environment variable is unset", async () => {
+		const previous = process.env.PI_CACHE_TELEMETRY;
+		delete process.env.PI_CACHE_TELEMETRY;
+		try {
+			await createAgentSession({
+				cwd: tempDir,
+				agentDir: tempDir,
+				sessionManager: SessionManager.inMemory(),
+			});
+			expect(existsSync(join(tempDir, "cache-telemetry"))).toBe(false);
+		} finally {
+			if (previous === undefined) delete process.env.PI_CACHE_TELEMETRY;
+			else process.env.PI_CACHE_TELEMETRY = previous;
 		}
 	});
 

@@ -1,14 +1,28 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	type CacheTelemetryObserver,
+	type CacheTelemetryRecord,
+	createCacheTelemetrySession,
+} from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
+import { AgentSession, ContextGuardError } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
-import { estimateContextTokens, estimateTokens, estimateToolSchemaTokens } from "./compaction/compaction.ts";
+import {
+	type CacheOperationContextSnapshot,
+	type CacheOperationObservation,
+	cloneMessagesForObservation,
+	cloneToolsForObservation,
+	createCacheOperationInstrumentation,
+	createCacheOperationRecord,
+} from "./cache-operations.ts";
+import { createLocalCacheTelemetryWriter } from "./cache-telemetry.ts";
+import { estimateProviderContextTokens } from "./compaction/compaction.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
-import { convertToLlm } from "./messages.ts";
+import { convertToLlm, isProviderUserInputMessage } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
@@ -177,13 +191,9 @@ function getDefaultAgentDir(): string {
  * Compaction normally keeps context under budget, but extension-injected
  * messages (custom_message, before_agent_start messages) or estimation drift
  * can push a single request over the limit before compaction notices. This
- * trims whole turns from the oldest end until the estimated system prompt +
- * messages fit the budget. Guarantees:
- * - the final message is never dropped;
- * - a toolCall is never stranded without its toolResult;
- * - the trimmed list never starts with an assistant toolCall (providers
- *   reject requests whose first message is not a user message);
- * - a non-positive budget (tiny context window) disables trimming.
+ * trims only to a later provider-user boundary that preserves every complete
+ * tool-call/result span and fits the budget. If no such suffix fits, refuse the
+ * request rather than sending an oversized or malformed suffix.
  */
 export function enforceRequestContextBudget(
 	messages: AgentMessage[],
@@ -200,52 +210,112 @@ export function enforceRequestContextBudget(
 		budget = model.contextWindow - reserveTokens;
 	}
 	if (budget == null || budget <= 0 || messages.length === 0) return messages;
+	const estimate = (suffix: AgentMessage[]) => estimateProviderContextTokens(suffix, systemPrompt, tools).tokens;
+	const fullEstimate = estimate(messages);
+	if (fullEstimate <= budget) return messages;
 
-	const systemPromptTokens = estimateTokens({ role: "user", content: systemPrompt } as AgentMessage);
-	const toolSchemaTokens = estimateToolSchemaTokens(tools);
-	const estimateTotal = (remainingMessages: AgentMessage[]) =>
-		systemPromptTokens + estimateContextTokens(remainingMessages).tokens + toolSchemaTokens;
-	let total = estimateTotal(messages);
-	if (total <= budget) return messages;
-
-	// Trim whole turns from the oldest end. A turn ends at a user message
-	// boundary, so the trimmed list always starts with a user message and
-	// toolCall/toolResult pairs are dropped together.
-	let dropCount = 0;
-	while (dropCount < messages.length - 1 && total > budget) {
-		const frontier = messages[dropCount];
-		if (frontier?.role === "user") {
-			dropCount++;
-		} else {
-			// Frontier is an assistant toolCall or a toolResult: advance past the
-			// whole turn up to the next user message (never past the final one).
-			let next = dropCount;
-			while (next < messages.length && messages[next]!.role !== "user") {
-				if (next >= messages.length - 1) break;
-				next++;
+	const pendingCalls = new Set<string>();
+	for (let boundary = 0; boundary < messages.length; boundary++) {
+		const message = messages[boundary]!;
+		if (boundary > 0 && pendingCalls.size === 0 && isProviderUserInputMessage(message)) {
+			const suffix = messages.slice(boundary);
+			const suffixCalls = new Set<string>();
+			const suffixCallIds = new Set<string>();
+			let validPairs = true;
+			for (const item of suffix) {
+				if (item.role === "assistant" && Array.isArray(item.content)) {
+					for (const block of item.content) {
+						if (block.type === "toolCall") {
+							if (suffixCallIds.has(block.id)) validPairs = false;
+							suffixCallIds.add(block.id);
+							suffixCalls.add(block.id);
+						}
+					}
+				} else if (item.role === "toolResult") {
+					if (!suffixCalls.delete(item.toolCallId)) validPairs = false;
+				}
 			}
-			if (next === dropCount) break;
-			dropCount = next;
+			if (validPairs && suffixCalls.size === 0 && estimate(suffix) <= budget) return suffix;
 		}
-		// Usage describes a prefix, so removing a turn can also remove the latest
-		// usage source. Re-estimate the retained suffix instead of subtracting
-		// per-message chars/4 from a usage-backed total.
-		total = estimateTotal(messages.slice(dropCount));
-	}
-	// Safety pass: even when the budget is already met, never leave a
-	// leading assistant toolCall (provider 400) or orphaned toolResult as
-	// the first remaining message.
-	if (dropCount > 0) {
-		while (dropCount < messages.length - 1 && messages[dropCount]!.role !== "user") {
-			dropCount++;
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (block.type === "toolCall") pendingCalls.add(block.id);
+			}
+		} else if (message.role === "toolResult") {
+			pendingCalls.delete(message.toolCallId);
 		}
 	}
-	return dropCount > 0 ? messages.slice(dropCount) : messages;
+	throw new ContextGuardError(fullEstimate, budget);
 }
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
+	let cacheTelemetry: CacheTelemetryObserver | undefined;
+	let disposeCacheTelemetry: (() => Promise<void>) | undefined;
+	let cacheOperationInstrumentation: ReturnType<typeof createCacheOperationInstrumentation> | undefined;
+	let pendingCacheOperations: CacheOperationObservation[] = [];
+	let pendingCacheOperationsDropped = false;
+	let postContextSnapshot: CacheOperationContextSnapshot | undefined;
+	let operationModel: string | undefined;
+	if (process.env.PI_CACHE_TELEMETRY === "1") {
+		try {
+			const writer = await createLocalCacheTelemetryWriter(agentDir);
+			const observer = createCacheTelemetrySession(
+				(record: CacheTelemetryRecord) => writer.append(record),
+				(records: Parameters<typeof writer.appendBatch>[0]) => writer.appendBatch(records),
+			);
+			disposeCacheTelemetry = async () => {
+				try {
+					await observer.flush();
+				} finally {
+					await writer.flush();
+				}
+			};
+			cacheOperationInstrumentation = createCacheOperationInstrumentation((observation) => {
+				if (pendingCacheOperations.length < 64) pendingCacheOperations.push(observation);
+				else pendingCacheOperationsDropped = true;
+			});
+			cacheTelemetry = {
+				observeRequest(input: Parameters<CacheTelemetryObserver["observeRequest"]>[0]) {
+					const ids = observer.observeRequest(input);
+					const pending = pendingCacheOperations;
+					if (pendingCacheOperationsDropped)
+						pending.push({
+							surface: "messages",
+							operation: "final_context",
+							reason: "unavailable",
+							durationMs: 0,
+							beforeCount: null,
+							afterCount: null,
+						});
+					pendingCacheOperations = [];
+					pendingCacheOperationsDropped = false;
+					const sequence = cacheOperationInstrumentation?.nextSequence() ?? 0;
+					for (const observation of pending) {
+						writer.appendOperation(
+							createCacheOperationRecord(
+								observation,
+								cacheOperationInstrumentation?.epoch ?? "00000000000000000000000000000000",
+								sequence,
+								ids.requestId,
+								ids.attemptId,
+							),
+						);
+					}
+					return ids;
+				},
+				observeOutcome: (input: Parameters<CacheTelemetryObserver["observeOutcome"]>[0]) => {
+					if (input.outcome !== "success") cacheOperationInstrumentation?.resetFinal();
+					observer.observeOutcome(input);
+				},
+				flush: () => observer.flush(),
+				getStats: () => observer.getStats(),
+			};
+		} catch {
+			/* local telemetry storage failure must not affect session creation */
+		}
+	}
 	let resourceLoader = options.resourceLoader;
 
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
@@ -385,16 +455,55 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			tools: [],
 		},
 		convertToLlm: convertToLlmWithBlockImages,
+		cacheTelemetry,
 		streamFn: async (model, context, options) => {
-			// The guard evaluates the session's own message list, not the request's
-			// transformed one: an over-limit context is compacted and the turn continued,
-			// never silently trimmed down to fit. The request built from that list is
-			// still budget-trimmed as a backstop when compaction is unavailable.
+			// Check the actual converted/transformed request, not only session history.
+			// Safe suffix trimming has already run in transformContext; if conversion
+			// or later transformations exceed the budget, existing recovery must handle
+			// the refusal rather than submitting an oversized request.
 			const session = sessionRef.current;
-			session?.guardContextForRequest({
-				messages: session.agent.state.messages,
+			const requestContext = {
+				messages: context.messages,
+				systemPrompt: context.systemPrompt,
 				tools: context.tools,
-			});
+			};
+			session?.guardContextForRequest(requestContext);
+			const configuredBudget = settingsManager.getCompactionMaxContextTokens();
+			const requestBudget =
+				configuredBudget ??
+				(model.contextWindow > 0 ? model.contextWindow - settingsManager.getCompactionReserveTokens() : undefined);
+			if (requestBudget != null && requestBudget > 0) {
+				const estimate = estimateProviderContextTokens(
+					requestContext.messages,
+					requestContext.systemPrompt,
+					requestContext.tools,
+				).tokens;
+				if (estimate > requestBudget) throw new ContextGuardError(estimate, requestBudget);
+			}
+			const instrumentation = cacheOperationInstrumentation;
+			if (instrumentation) {
+				const currentModel = `${model.provider}:${model.id}:${model.api}`;
+				if (operationModel !== currentModel) instrumentation.resetFinal();
+				operationModel = currentModel;
+				const finalContext = {
+					messages: context.messages,
+					systemPrompt: context.systemPrompt ?? "",
+					tools: context.tools ?? [],
+				};
+				try {
+					instrumentation.observeFinal(
+						postContextSnapshot ?? finalContext,
+						finalContext,
+						0,
+						"stream_input",
+						"agent_main",
+					);
+				} catch {
+					instrumentation.resetFinal();
+					pendingCacheOperationsDropped = true;
+				}
+				postContextSnapshot = undefined;
+			}
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
 			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 			// SDKs treat timeout=0 as 0ms (immediate timeout), not "no timeout".
@@ -450,8 +559,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const compacted = await sessionRef.current?.compactBeforeSubmit();
 			const source = compacted ?? messages;
 			const runner = extensionRunnerRef.current;
-			const transformed = runner ? await runner.emitContext(source) : source;
-			return enforceRequestContextBudget(
+			const instrumentation = cacheOperationInstrumentation;
+			if (compacted) instrumentation?.resetFinal();
+			const startedAt = instrumentation ? performance.now() : 0;
+			const beforeContext = instrumentation
+				? {
+						messages: cloneMessagesForObservation(source),
+						systemPrompt: agent.state.systemPrompt ?? "",
+						tools: cloneToolsForObservation(agent.state.tools),
+					}
+				: undefined;
+			const transformed = runner
+				? await runner.emitContext(
+						source,
+						instrumentation
+							? (before, after, index, duration, failed) =>
+									instrumentation.observeHandler(before, after, index, duration, failed)
+							: undefined,
+					)
+				: source;
+			const finalized = enforceRequestContextBudget(
 				transformed,
 				agent.state.systemPrompt ?? "",
 				agent.state.model,
@@ -459,6 +586,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				settingsManager.getCompactionReserveTokens(),
 				agent.state.tools,
 			);
+			if (instrumentation && beforeContext) {
+				try {
+					instrumentation.observeFinal(
+						beforeContext,
+						{
+							messages: finalized,
+							systemPrompt: agent.state.systemPrompt ?? "",
+							tools: agent.state.tools,
+						},
+						performance.now() - startedAt,
+						"post_context",
+						"agent_main",
+					);
+					postContextSnapshot = {
+						messages: cloneMessagesForObservation(finalized),
+						systemPrompt: agent.state.systemPrompt ?? "",
+						tools: cloneToolsForObservation(agent.state.tools),
+					};
+				} catch {
+					postContextSnapshot = undefined;
+					instrumentation.resetFinal();
+					pendingCacheOperationsDropped = true;
+				}
+			}
+			return finalized;
 		},
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
@@ -496,6 +648,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		cacheTelemetry,
+		disposeCacheTelemetry,
+		onCacheOperationAnnotation: cacheOperationInstrumentation
+			? (annotation, handlerIndex, durationMs) =>
+					cacheOperationInstrumentation?.observeAnnotation("tool_result", annotation, handlerIndex, durationMs)
+			: undefined,
 	});
 	sessionRef.current = session;
 	const extensionsResult = resourceLoader.getExtensions();

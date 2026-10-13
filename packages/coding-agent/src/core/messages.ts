@@ -137,11 +137,29 @@ export function createCustomMessage(
 	};
 }
 
+/** Whether this session message becomes a provider user input in convertToLlm. */
+export function isProviderUserInputMessage(message: AgentMessage): boolean {
+	switch (message.role) {
+		case "user":
+		case "custom":
+		case "branchSummary":
+		case "compactionSummary":
+			return true;
+		case "bashExecution":
+			return !message.excludeFromContext;
+		case "assistant":
+		case "toolResult":
+			return false;
+		default:
+			return false;
+	}
+}
+
 /**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
  * This is used by:
- * - Agent's transormToLlm option (for prompt calls and queued messages)
+ * - Agent's convertToLlm option (for prompt calls and queued messages)
  * - Compaction's generateSummary (for summarization)
  * - Custom extensions and tools
  */

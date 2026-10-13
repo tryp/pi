@@ -7,6 +7,12 @@ import type {
 	RawMessageStreamEvent,
 	RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/messages.js";
+import type { CacheTelemetryRawField } from "../cache-telemetry.ts";
+import {
+	classifyCacheTelemetryRawField,
+	observeCacheOutcomeSafely,
+	observeCacheRequestSafely,
+} from "../cache-telemetry.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	AnthropicMessagesCompat,
@@ -524,6 +530,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			timestamp: Date.now(),
 		};
 
+		let telemetryIds: { requestId: string; attemptId: string } | undefined;
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
@@ -564,7 +571,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			}
 			let params = buildParams(model, context, isOAuth, options);
 			const nextParams = await options?.onPayload?.(params, model);
-			if (nextParams !== undefined) {
+			if (typeof nextParams === "object" && nextParams !== null) {
 				params = nextParams as MessageCreateParamsStreaming;
 			}
 			const requestOptions = {
@@ -573,7 +580,30 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				maxRetries: 0,
 			};
 			const response = await retryProviderRequest(
-				() => client.messages.create({ ...params, stream: true }, requestOptions).asResponse(),
+				async () => {
+					telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+						requestId: telemetryIds?.requestId,
+						provider: model.provider,
+						model: model.id,
+						phase: "final_wire_body",
+						transport: "sse",
+						payloadMode: "full",
+						cacheRetention: resolveCacheRetention(options?.cacheRetention, options?.env),
+						cacheKeyPresent: false,
+						sessionHeaderPresent: Boolean(options?.sessionId),
+						payload: params,
+					});
+					try {
+						return await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
+					} catch (error) {
+						if (telemetryIds)
+							observeCacheOutcomeSafely(options?.cacheTelemetry, {
+								...telemetryIds,
+								outcome: options?.signal?.aborted ? "aborted" : "failed",
+							});
+						throw error;
+					}
+				},
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
@@ -585,9 +615,46 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
+			const rawUsageFields: Record<string, CacheTelemetryRawField> = {
+				input: classifyCacheTelemetryRawField(undefined, false),
+				output: classifyCacheTelemetryRawField(undefined, false),
+				cacheRead: classifyCacheTelemetryRawField(undefined, false),
+				cacheWrite: classifyCacheTelemetryRawField(undefined, false),
+				cacheWrite1h: classifyCacheTelemetryRawField(undefined, false),
+			};
+			let rawUsagePresent = false;
+			const updateRawUsage = (usage: object | undefined): void => {
+				if (!usage) return;
+				rawUsagePresent = true;
+				const mappings = [
+					["input", "input_tokens"],
+					["output", "output_tokens"],
+					["cacheRead", "cache_read_input_tokens"],
+					["cacheWrite", "cache_creation_input_tokens"],
+				] as const;
+				for (const [field, key] of mappings) {
+					const descriptor = Object.getOwnPropertyDescriptor(usage, key);
+					if (descriptor && "value" in descriptor)
+						rawUsageFields[field] = classifyCacheTelemetryRawField(descriptor.value, true);
+					else if (rawUsageFields[field]!.state !== "absent")
+						rawUsageFields[field] = { ...rawUsageFields[field]!, supplied: false, retained: true };
+				}
+				const creation = Object.getOwnPropertyDescriptor(usage, "cache_creation");
+				const creationObject =
+					creation && "value" in creation && typeof creation.value === "object" && creation.value !== null
+						? creation.value
+						: undefined;
+				const oneHour =
+					creationObject && Object.getOwnPropertyDescriptor(creationObject, "ephemeral_1h_input_tokens");
+				if (oneHour && "value" in oneHour)
+					rawUsageFields.cacheWrite1h = classifyCacheTelemetryRawField(oneHour.value, true);
+				else if (rawUsageFields.cacheWrite1h!.state !== "absent")
+					rawUsageFields.cacheWrite1h = { ...rawUsageFields.cacheWrite1h!, supplied: false, retained: true };
+			};
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				if (event.type === "message_start") {
+					updateRawUsage(event.message.usage);
 					output.responseId = event.message.id;
 					output.model = event.message.model;
 					const fallbackCost =
@@ -740,6 +807,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					// Only update usage fields if present (not null).
 					// Preserves input_tokens from message_start when proxies omit it in message_delta.
 					if (event.usage) {
+						updateRawUsage(event.usage);
 						if (event.usage.input_tokens != null) {
 							output.usage.input = event.usage.input_tokens;
 						}
@@ -779,6 +847,13 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				throw new Error(output.errorMessage || "An unknown error occurred");
 			}
 
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: "success",
+					normalizedUsage: output.usage,
+					rawUsage: { present: rawUsagePresent, fields: rawUsageFields as never },
+				});
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
@@ -788,6 +863,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: output.stopReason === "aborted" ? "aborted" : "failed",
+				});
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();

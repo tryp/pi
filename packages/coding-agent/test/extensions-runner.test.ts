@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { createCacheOperationInstrumentation } from "../src/core/cache-operations.ts";
 import { createExtensionRuntime, discoverAndLoadExtensions, loadExtensions } from "../src/core/extensions/loader.ts";
 import { ExtensionRunner, emitProjectTrustEvent } from "../src/core/extensions/runner.ts";
 import type {
@@ -588,6 +589,74 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("error handling", () => {
+		it("observes each context handler, including in-place no-op, restore, and failure", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "a-mutate.ts"),
+				`export default (pi) => pi.on("context", (event) => { event.messages[0].content[0].text = "changed"; });`,
+			);
+			fs.writeFileSync(
+				path.join(extensionsDir, "b-noop.ts"),
+				`export default (pi) => pi.on("context", () => undefined);`,
+			);
+			fs.writeFileSync(
+				path.join(extensionsDir, "c-restore.ts"),
+				`export default (pi) => pi.on("context", (event) => { event.messages[0].content[0].text = "seed"; });`,
+			);
+			fs.writeFileSync(
+				path.join(extensionsDir, "d-throw.ts"),
+				`export default (pi) => pi.on("context", () => { throw new Error("offline failure"); });`,
+			);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const observed: Array<{ reason: string; handlerIndex?: number }> = [];
+			const instrumentation = createCacheOperationInstrumentation((record) => observed.push(record));
+			const source = [{ role: "user", content: [{ type: "text", text: "seed" }] }] as Parameters<
+				typeof runner.emitContext
+			>[0];
+			const transformed = await runner.emitContext(source, (before, after, index, durationMs, failed) => {
+				instrumentation.observeHandler(before, after, index, durationMs, failed);
+			});
+			expect(observed.map(({ reason }) => reason)).toEqual([
+				"history_rewrite",
+				"unchanged",
+				"history_rewrite",
+				"failed",
+			]);
+			expect(observed.map(({ handlerIndex }) => handlerIndex)).toEqual([0, 1, 2, 3]);
+			const finalMessage = transformed[0];
+			expect(finalMessage?.role).toBe("user");
+			if (finalMessage?.role === "user") expect(finalMessage.content[0]).toMatchObject({ text: "seed" });
+		});
+
+		it("reports approved tool-result annotations without changing handler behavior", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "annotate.ts"),
+				`export default (pi) => pi.on("tool_result", () => ({ cacheOperation: { reason: "sidecar_gate", counters: { considered: 1 } } }));`,
+			);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const observations: Array<{ annotation: unknown; index: number }> = [];
+			const event = {
+				type: "tool_result",
+				toolName: "example",
+				toolCallId: "opaque-call-id",
+				input: {},
+				content: [{ type: "text", text: "private result" }],
+				isError: false,
+			} as Parameters<typeof runner.emitToolResult>[0];
+			const modified = await runner.emitToolResult(event, (annotation, index) =>
+				observations.push({ annotation, index }),
+			);
+			expect(modified).toBeUndefined();
+			expect(observations).toEqual([
+				{
+					annotation: { reason: "sidecar_gate", counters: { considered: 1 } },
+					index: 0,
+				},
+			]);
+			expect(event.content[0]).toMatchObject({ text: "private result" });
+		});
+
 		it("calls error listeners when handler throws", async () => {
 			const extCode = `
 				export default function(pi) {

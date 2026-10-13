@@ -34,6 +34,7 @@ export function buildBaseOptions(
 		maxTokens: clampMaxTokensToContext(model, context, options?.maxTokens ?? model.maxTokens),
 		signal: options?.signal,
 		telemetryContext: options?.telemetryContext,
+		cacheTelemetry: options?.cacheTelemetry,
 		apiKey: apiKey || options?.apiKey,
 		fetch: options?.fetch,
 		transport: options?.transport,

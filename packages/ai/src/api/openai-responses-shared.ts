@@ -114,6 +114,7 @@ export interface OpenAIResponsesStreamOptions {
 		usage: Usage,
 		serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
 	) => void;
+	onRawUsage?: (usage: unknown) => void;
 }
 
 export interface ConvertResponsesMessagesOptions {
@@ -557,6 +558,7 @@ export async function processResponsesStream<TApi extends Api>(
 			output.responseId = response.id;
 		}
 		if (response?.usage) {
+			options?.onRawUsage?.(response.usage);
 			const inputDetails = response.usage.input_tokens_details as
 				| { cached_tokens?: number; cache_write_tokens?: number }
 				| undefined;

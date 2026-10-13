@@ -29,10 +29,6 @@
  *   `degraded: true` and a reason, and counts it in {@link modelsDevClientStats}.
  */
 
-import { readFile, rename, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
-
 /** The models.dev catalog payload. */
 export type ModelsDevCatalog = Record<string, ModelsDevProviderEntry>;
 
@@ -148,6 +144,23 @@ let nextAttemptAt = 0;
 /** In-flight (or settled) first read of the persisted catalog. */
 let cacheLoad: Promise<boolean> | undefined;
 
+type NodeDiskCache = {
+	readFile: (path: string, encoding: "utf8") => Promise<string>;
+	writeFile: (path: string, data: string, encoding: "utf8") => Promise<void>;
+	rename: (oldPath: string, newPath: string) => Promise<void>;
+	homedir: () => string;
+	join: (...paths: string[]) => string;
+};
+
+function getNodeDiskCache(): NodeDiskCache | undefined {
+	if (typeof process === "undefined" || typeof process.getBuiltinModule !== "function") return undefined;
+	return {
+		...(process.getBuiltinModule("node:fs/promises") as Pick<NodeDiskCache, "readFile" | "writeFile" | "rename">),
+		homedir: (process.getBuiltinModule("node:os") as Pick<NodeDiskCache, "homedir">).homedir,
+		join: (process.getBuiltinModule("node:path") as Pick<NodeDiskCache, "join">).join,
+	};
+}
+
 const stats: ModelsDevClientStats = {
 	networkFetches: 0,
 	revalidations: 0,
@@ -178,13 +191,18 @@ export function resetModelsDevClientState(): void {
 
 function getCacheFile(cacheFile: string | null | undefined): string | undefined {
 	if (cacheFile === null) return undefined;
+	const diskCache = getNodeDiskCache();
+	if (!diskCache) return undefined;
 	if (cacheFile !== undefined) {
-		return cacheFile.startsWith("~") ? cacheFile.replace(/^~/, homedir()) : cacheFile;
+		return cacheFile.startsWith("~") ? cacheFile.replace(/^~/, diskCache.homedir()) : cacheFile;
 	}
 	// Mirrors the PI_CODING_AGENT_DIR handling in getAgentDir() in packages/coding-agent/src/config.ts.
 	const agentDir = process.env.PI_CODING_AGENT_DIR;
-	const expandedAgentDir = agentDir?.startsWith("~") ? agentDir.replace(/^~/, homedir()) : agentDir;
-	return join(expandedAgentDir ?? join(homedir(), ".pi", "agent"), "models-dev-cache.json");
+	const expandedAgentDir = agentDir?.startsWith("~") ? agentDir.replace(/^~/, diskCache.homedir()) : agentDir;
+	return diskCache.join(
+		expandedAgentDir ?? diskCache.join(diskCache.homedir(), ".pi", "agent"),
+		"models-dev-cache.json",
+	);
 }
 
 /**
@@ -201,11 +219,12 @@ function getCacheFile(cacheFile: string | null | undefined): string | undefined 
  * Returns whether the entry was fresh enough to serve without a network attempt.
  */
 function loadDiskCache(cacheFile: string | undefined, now: number): Promise<boolean> {
-	if (!cacheFile) return Promise.resolve(false);
+	const diskCache = getNodeDiskCache();
+	if (!cacheFile || !diskCache) return Promise.resolve(false);
 	cacheLoad ??= (async () => {
 		stats.cacheReads++;
 		try {
-			const raw: unknown = JSON.parse(await readFile(cacheFile, "utf8"));
+			const raw: unknown = JSON.parse(await diskCache.readFile(cacheFile, "utf8"));
 			if (
 				typeof raw !== "object" ||
 				raw === null ||
@@ -244,11 +263,12 @@ function loadDiskCache(cacheFile: string | undefined, now: number): Promise<bool
 }
 
 async function persistCache(cacheFile: string | undefined): Promise<void> {
-	if (!cacheFile || !cached) return;
+	const diskCache = getNodeDiskCache();
+	if (!cacheFile || !cached || !diskCache) return;
 	const persisted = { version: 1, ...cached };
 	try {
-		await writeFile(`${cacheFile}.tmp`, JSON.stringify(persisted), "utf8");
-		await rename(`${cacheFile}.tmp`, cacheFile);
+		await diskCache.writeFile(`${cacheFile}.tmp`, JSON.stringify(persisted), "utf8");
+		await diskCache.rename(`${cacheFile}.tmp`, cacheFile);
 		stats.cacheWrites++;
 	} catch {
 		stats.cacheWriteFailures++;

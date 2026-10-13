@@ -30,6 +30,9 @@ import {
 
 export const CURRENT_SESSION_VERSION = 3;
 
+/** Marks usage metadata on rebuilt context messages that predates compaction. */
+export const INVALIDATED_CONTEXT_USAGE_ANCHOR = Symbol("invalidatedContextUsageAnchor");
+
 export interface SessionHeader {
 	type: "session";
 	version?: number; // v1 sessions don't have this
@@ -487,7 +490,33 @@ export function buildSessionContext(
 ): SessionContext {
 	const path = buildSessionPath(entries, leafId, byId);
 	const { thinkingLevel, model } = getSessionContextSettings(path);
-	const messages = buildContextEntries(entries, leafId, byId).flatMap(sessionEntryToContextMessages);
+	let compactionIndex = -1;
+	for (let i = path.length - 1; i >= 0; i--) {
+		if (path[i]!.type === "compaction") {
+			compactionIndex = i;
+			break;
+		}
+	}
+	const staleUsageEntryIds = new Set<string>();
+	if (compactionIndex >= 0) {
+		const compaction = path[compactionIndex] as CompactionEntry;
+		const firstKeptIndex = path.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
+		if (firstKeptIndex >= 0 && firstKeptIndex < compactionIndex) {
+			for (const entry of path.slice(firstKeptIndex, compactionIndex)) {
+				staleUsageEntryIds.add(entry.id);
+			}
+		}
+	}
+	const messages = buildContextEntries(entries, leafId, byId).flatMap((entry) => {
+		const contextMessages = sessionEntryToContextMessages(entry);
+		if (!staleUsageEntryIds.has(entry.id)) return contextMessages;
+		return contextMessages.map((message) => {
+			if (message.role !== "assistant" || !("usage" in message)) return message;
+			const rebuiltMessage = { ...message };
+			Object.defineProperty(rebuiltMessage, INVALIDATED_CONTEXT_USAGE_ANCHOR, { value: true, enumerable: true });
+			return rebuiltMessage;
+		});
+	});
 	return { messages, thinkingLevel, model };
 }
 

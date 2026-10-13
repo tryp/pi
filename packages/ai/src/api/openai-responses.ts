@@ -1,5 +1,11 @@
 import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import {
+	classifyCacheTelemetryRawField,
+	getCacheTelemetryDataProperty,
+	observeCacheOutcomeSafely,
+	observeCacheRequestSafely,
+} from "../cache-telemetry.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -127,6 +133,8 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			timestamp: Date.now(),
 		};
 
+		let telemetryIds: { requestId: string; attemptId: string } | undefined;
+		let rawUsage: unknown;
 		try {
 			// Create OpenAI client
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
@@ -140,7 +148,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			const client = createClient(model, context, apiKey, options?.headers, options?.fetch, cacheSessionId);
 			let params = buildParams(model, context, options, compat, grammarToolInputProperties);
 			const nextParams = await options?.onPayload?.(params, model);
-			if (nextParams !== undefined) {
+			if (typeof nextParams === "object" && nextParams !== null) {
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
 			const requestOptions = {
@@ -149,7 +157,34 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				maxRetries: 0,
 			};
 			const { data: openaiStream, response } = await retryProviderRequest(
-				() => client.responses.create(params, requestOptions).withResponse(),
+				async () => {
+					telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+						requestId: telemetryIds?.requestId,
+						provider: model.provider,
+						model: model.id,
+						phase: "final_wire_body",
+						transport: options?.transport === "websocket" ? "websocket" : "sse",
+						payloadMode: "full",
+						cacheRetention,
+						cacheKeyPresent: getCacheTelemetryDataProperty(params, "prompt_cache_key") !== undefined,
+						sessionHeaderPresent: Boolean(cacheSessionId),
+						cacheIdentityMatch:
+							getCacheTelemetryDataProperty(params, "prompt_cache_key") === undefined || !cacheSessionId
+								? null
+								: getCacheTelemetryDataProperty(params, "prompt_cache_key") === cacheSessionId,
+						payload: params,
+					});
+					try {
+						return await client.responses.create(params, requestOptions).withResponse();
+					} catch (error) {
+						if (telemetryIds)
+							observeCacheOutcomeSafely(options?.cacheTelemetry, {
+								...telemetryIds,
+								outcome: options?.signal?.aborted ? "aborted" : "failed",
+							});
+						throw error;
+					}
+				},
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
@@ -163,6 +198,9 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+				onRawUsage: (usage) => {
+					rawUsage = usage;
+				},
 			});
 
 			if (options?.signal?.aborted) {
@@ -176,6 +214,38 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				throw new Error(output.errorMessage || "An unknown error occurred");
 			}
 
+			if (telemetryIds) {
+				const raw =
+					typeof rawUsage === "object" && rawUsage !== null ? (rawUsage as Record<string, unknown>) : undefined;
+				const details =
+					typeof raw?.input_tokens_details === "object" && raw.input_tokens_details !== null
+						? (raw.input_tokens_details as Record<string, unknown>)
+						: undefined;
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: "success",
+					normalizedUsage: output.usage,
+					rawUsage: {
+						present: rawUsage !== undefined,
+						fields: {
+							input: classifyCacheTelemetryRawField(
+								raw?.input_tokens,
+								Boolean(raw && Object.hasOwn(raw, "input_tokens")),
+							),
+							output: classifyCacheTelemetryRawField(
+								raw?.output_tokens,
+								Boolean(raw && Object.hasOwn(raw, "output_tokens")),
+							),
+							cacheRead: classifyCacheTelemetryRawField(
+								details?.cached_tokens,
+								Boolean(details && Object.hasOwn(details, "cached_tokens")),
+							),
+							cacheWrite: classifyCacheTelemetryRawField(undefined, false),
+							cacheWrite1h: classifyCacheTelemetryRawField(undefined, false),
+						},
+					},
+				});
+			}
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
@@ -186,6 +256,11 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: output.stopReason === "aborted" ? "aborted" : "failed",
+				});
 			output.errorMessage = formatOpenAIResponsesError(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();

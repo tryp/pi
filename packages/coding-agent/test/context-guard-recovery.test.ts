@@ -3,16 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { type Api, type AssistantMessage, createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
+import type { Message } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	AgentSession,
+	type AgentSessionEvent,
 	CONTEXT_BORDERLINE_FRACTION,
 	CONTEXT_GUARD_ERROR_MESSAGE,
 	isContextGuardRefusal,
 } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { estimateContextTokens, estimateToolSchemaTokens } from "../src/core/compaction/compaction.ts";
+import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -55,6 +58,7 @@ function estimate(messages: AgentMessage[], tools: readonly unknown[] = []): num
  */
 type SessionInternals = {
 	_checkCompaction(message: AssistantMessage, skipAbortedCheck?: boolean): Promise<boolean>;
+	_runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean>;
 	_isRetryableError(message: AssistantMessage): boolean;
 	_transportAbortRetryAllowed(): boolean;
 	compactBeforeSubmit(): Promise<AgentMessage[] | undefined>;
@@ -91,6 +95,7 @@ function fakeSession(options: {
 		_emit: (event: Record<string, unknown>) => {
 			emitted.push(event);
 		},
+		_emitSessionCompactFailed: async () => {},
 		_overflowRecoveryAttempted: options.overflowRecoveryAttempted ?? false,
 		_lastPreSendCompactionLength: -1,
 		_runAutoCompaction: async (reason: string, willRetry: boolean) => {
@@ -154,7 +159,7 @@ describe("guard refusal recovery", () => {
 		expect(calls).toEqual([]);
 		expect(shouldContinue).toBe(false);
 		expect(emitted).toHaveLength(1);
-		expect(emitted[0]?.errorMessage).toContain("Context guard recovery failed after one compact-and-retry attempt");
+		expect(emitted[0]?.errorMessage).toContain("Context guard recovery failed after one recovery attempt");
 	});
 
 	it("leaves ordinary threshold compaction non-retrying", async () => {
@@ -345,7 +350,345 @@ describe("pre-send gate end to end", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	async function createRecoverySession(options: { beforeCompact?: "cancel" | "non-reducing" } = {}) {
+		const api: Api = "openai-completions";
+		const model: Model<Api> = {
+			id: "capture-model",
+			name: "Capture Model",
+			api,
+			provider: "capture-provider",
+			baseUrl: "https://capture.invalid/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+		};
+		const settingsManager = SettingsManager.inMemory({
+			compaction: { enabled: true, maxContextTokens: 20_000, keepRecentTokens: 20_000 },
+		});
+		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
+		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
+		const modelRegistry = await createModelRegistry(authStorage, join(agentDir, "models.json"));
+		const hookCalls: number[] = [];
+		const failedEvents: Array<{ reason: string; aborted?: boolean; willRetry: boolean; errorMessage?: string }> = [];
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			extensionFactories: [
+				(pi) => {
+					if (options.beforeCompact) {
+						pi.on("session_before_compact", async (event) => {
+							hookCalls.push(1);
+							if (options.beforeCompact === "cancel") return { cancel: true };
+							const firstKeptEntryId =
+								options.beforeCompact === "non-reducing"
+									? (event.branchEntries.find((entry) => entry.type === "message")?.id ??
+										event.preparation.firstKeptEntryId)
+									: event.preparation.firstKeptEntryId;
+							return {
+								compaction: {
+									summary: "test recovery summary",
+									firstKeptEntryId,
+									tokensBefore: event.preparation.tokensBefore,
+								},
+							};
+						});
+					}
+					pi.on("session_compact_failed", async (event) => {
+						failedEvents.push({
+							reason: event.reason,
+							aborted: event.aborted,
+							willRetry: event.willRetry,
+							errorMessage: event.errorMessage,
+						});
+					});
+				},
+			],
+		});
+		await resourceLoader.reload();
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			model,
+			modelRuntime: getModelRuntime(modelRegistry),
+			settingsManager,
+			resourceLoader,
+			sessionManager: SessionManager.inMemory(cwd),
+		});
+		const compactionEndEvents: Extract<AgentSessionEvent, { type: "compaction_end" }>[] = [];
+		session.subscribe((event) => {
+			if (event.type === "compaction_end") compactionEndEvents.push(event);
+		});
+		return { session, modelRegistry, model, hookCalls, failedEvents, compactionEndEvents };
+	}
+
+	function appendHistory(session: AgentSession, model: Model<Api>): string {
+		const firstMessageId = session.sessionManager.appendMessage(userMessage("history to summarize") as Message);
+		session.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "prior answer" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+			stopReason: "stop",
+			timestamp: now,
+		} as Message);
+		return firstMessageId;
+	}
+
+	function recoveryDiagnostics(session: AgentSession): Array<{ kind?: string; outcome?: string }> {
+		return session.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic")
+			.map((entry) => (entry as { data: { kind?: string; outcome?: string } }).data);
+	}
+
+	it("reports a single oversized current prompt as a bounded no-op, not a completed retry", async () => {
+		const { session, modelRegistry, compactionEndEvents, failedEvents } = await createRecoverySession();
+		const currentPrompt = userMessage("x".repeat(800_000));
+		session.sessionManager.appendMessage(currentPrompt as Message);
+		session.agent.state.messages = [currentPrompt];
+		try {
+			const shouldContinue = await internals._checkCompaction.call(
+				session as unknown as SessionInternals,
+				guardRefusalMessage(200_000, 20_000),
+			);
+			expect(shouldContinue).toBe(false);
+			expect(recoveryDiagnostics(session)).toContainEqual(
+				expect.objectContaining({ kind: "context_guard_recovery", outcome: "no-op" }),
+			);
+			const terminalEvent = compactionEndEvents.at(-1);
+			expect(terminalEvent?.errorMessage).toContain("no conversation history can be reduced");
+			expect(terminalEvent?.errorMessage).toContain("single oversized prompt or fixed context");
+			expect(failedEvents).toEqual([
+				expect.objectContaining({
+					reason: "threshold",
+					aborted: false,
+					willRetry: false,
+					errorMessage: terminalEvent?.errorMessage,
+				}),
+			]);
+			expect(
+				await internals._checkCompaction.call(
+					session as unknown as SessionInternals,
+					guardRefusalMessage(200_001, 20_000),
+				),
+			).toBe(false);
+			expect(compactionEndEvents.at(-1)?.errorMessage).toContain("No conversation history could be reduced");
+			expect(compactionEndEvents.at(-1)?.errorMessage).not.toContain("after compaction and retry");
+			expect(recoveryDiagnostics(session)).toHaveLength(1);
+			expect(session.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+			expect(session.agent.state.messages).toEqual([currentPrompt]);
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider("capture-provider");
+		}
+	});
+
+	it("records cancellation and reports it without continuing", async () => {
+		const { session, modelRegistry, model, hookCalls, compactionEndEvents, failedEvents } =
+			await createRecoverySession({
+				beforeCompact: "cancel",
+			});
+		appendHistory(session, model);
+		try {
+			const shouldContinue = await internals._runAutoCompaction.call(
+				session as unknown as SessionInternals,
+				"threshold",
+				true,
+			);
+			expect(shouldContinue).toBe(false);
+			expect(hookCalls).toHaveLength(1);
+			expect(recoveryDiagnostics(session)).toContainEqual(
+				expect.objectContaining({ kind: "context_guard_recovery", outcome: "cancelled" }),
+			);
+			expect(compactionEndEvents.at(-1)).toMatchObject({ aborted: true, willRetry: false });
+			expect(failedEvents).toEqual([
+				expect.objectContaining({ reason: "threshold", aborted: true, willRetry: false }),
+			]);
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider("capture-provider");
+		}
+	});
+
+	it("records a pre-start auth failure with matching terminal event and failure hook", async () => {
+		const { session, modelRegistry, model, compactionEndEvents, failedEvents } = await createRecoverySession();
+		vi.spyOn(
+			session as unknown as {
+				_getSummarizationRequestAuth(model: Model<Api>): Promise<{ model: Model<Api> }>;
+			},
+			"_getSummarizationRequestAuth",
+		).mockRejectedValue(new Error("auth unavailable in test"));
+		appendHistory(session, model);
+		try {
+			const shouldContinue = await internals._runAutoCompaction.call(
+				session as unknown as SessionInternals,
+				"threshold",
+				true,
+			);
+			expect(shouldContinue).toBe(false);
+			const diagnostic = recoveryDiagnostics(session).find(
+				(entry) => entry.kind === "context_guard_recovery" && entry.outcome === "failed",
+			);
+			expect(diagnostic).toBeDefined();
+			const terminalEvent = compactionEndEvents.at(-1);
+			expect(terminalEvent?.errorMessage).toContain("Context guard recovery failed");
+			expect(failedEvents).toEqual([
+				expect.objectContaining({
+					reason: "threshold",
+					aborted: false,
+					willRetry: false,
+					errorMessage: terminalEvent?.errorMessage,
+				}),
+			]);
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider("capture-provider");
+		}
+	});
+
+	it("bounds a non-reducing extension compaction and repeated guard notifications", async () => {
+		const { session, modelRegistry, model, hookCalls, compactionEndEvents, failedEvents } =
+			await createRecoverySession({
+				beforeCompact: "non-reducing",
+			});
+		const firstMessageId = appendHistory(session, model);
+		session.agent.state.messages = [userMessage("short local history")];
+		try {
+			const shouldContinue = await internals._checkCompaction.call(session as unknown as SessionInternals, {
+				...guardRefusalMessage(200_000, 20_000),
+				timestamp: Date.now() + 3_600_000,
+			});
+			const repeatedNotification = await internals._checkCompaction.call(session as unknown as SessionInternals, {
+				...guardRefusalMessage(200_000, 20_000),
+				timestamp: Date.now() + 3_600_000,
+			});
+			const anotherNotification = await internals._checkCompaction.call(session as unknown as SessionInternals, {
+				...guardRefusalMessage(200_000, 20_000),
+				timestamp: Date.now() + 3_600_000,
+			});
+			expect(shouldContinue).toBe(true);
+			expect(repeatedNotification).toBe(false);
+			expect(anotherNotification).toBe(false);
+			expect(hookCalls).toHaveLength(1);
+			const compactionEntry = session.sessionManager.getEntries().find((entry) => entry.type === "compaction");
+			expect(compactionEntry).toMatchObject({ firstKeptEntryId: firstMessageId });
+			expect(recoveryDiagnostics(session).filter((entry) => entry.kind === "context_guard_recovery")).toHaveLength(
+				1,
+			);
+			expect(recoveryDiagnostics(session)).toContainEqual(
+				expect.objectContaining({ kind: "context_guard_recovery", outcome: "compacted" }),
+			);
+			expect(compactionEndEvents.filter((event) => event.result !== undefined && event.willRetry)).toHaveLength(1);
+			expect(compactionEndEvents.at(-1)?.errorMessage).toContain("context remained over the limit");
+			expect(failedEvents).toHaveLength(2);
+			expect(failedEvents.at(-1)?.errorMessage).toBe(compactionEndEvents.at(-1)?.errorMessage);
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider("capture-provider");
+		}
+	});
+
+	it("forces a real cut below keepRecentTokens when guard recovery has short history", async () => {
+		const api: Api = "openai-completions";
+		const model: Model<Api> = {
+			id: "capture-model",
+			name: "Capture Model",
+			api,
+			provider: "capture-provider",
+			baseUrl: "https://capture.invalid/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4_096,
+		};
+		const settingsManager = SettingsManager.inMemory({
+			compaction: { enabled: true, maxContextTokens: 20_000, keepRecentTokens: 20_000 },
+		});
+		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
+		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
+		const modelRegistry = await createModelRegistry(authStorage, join(agentDir, "models.json"));
+		let actualRequestSystemPrompt: string | undefined;
+		modelRegistry.registerProvider(model.provider, {
+			api,
+			streamSimple: (_requestModel, context) => {
+				actualRequestSystemPrompt = context.systemPrompt;
+				const stream = createAssistantMessageEventStream();
+				stream.end({
+					role: "assistant",
+					content: [{ type: "text", text: "ok" }],
+					api,
+					provider: model.provider,
+					model: model.id,
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+					stopReason: "stop",
+					timestamp: Date.now(),
+				} as AssistantMessage);
+				return stream;
+			},
+		});
+		let preparationTokens: number | undefined;
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						preparationTokens = event.preparation.tokensBefore;
+						return {
+							compaction: {
+								summary: "short-history recovery",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+							},
+						};
+					});
+				},
+			],
+		});
+		await resourceLoader.reload();
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			model,
+			modelRuntime: getModelRuntime(modelRegistry),
+			settingsManager,
+			resourceLoader,
+			sessionManager: SessionManager.inMemory(cwd),
+		});
+		const guardSpy = vi.spyOn(session, "guardContextForRequest");
+
+		try {
+			await session.prompt("x".repeat(12_000));
+			expect(actualRequestSystemPrompt).toEqual(expect.any(String));
+			expect(actualRequestSystemPrompt).not.toBe("");
+			expect(guardSpy.mock.calls[0]?.[0]).toMatchObject({ systemPrompt: actualRequestSystemPrompt });
+			const historyTokens = estimateContextTokens(session.agent.state.messages).tokens;
+			expect(historyTokens).toBeLessThan(20_000);
+			expect(historyTokens).toBeGreaterThan(1_000);
+
+			const handled = await internals._checkCompaction.call(
+				session as unknown as SessionInternals,
+				guardRefusalMessage(200_000, 20_000),
+			);
+
+			expect(handled).toBe(true);
+			expect(preparationTokens).toBeGreaterThan(0);
+			expect(session.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider(model.provider);
+		}
 	});
 
 	it("compacts mid-turn, so the follow-up request is built from compacted state", async () => {
@@ -418,12 +761,24 @@ describe("pre-send gate end to end", () => {
 			execute: async () => ({ content: [{ type: "text", text: "r".repeat(40_000) }], details: {} }),
 		};
 
+		// Keep the budget independent of installed prompts, context files, and extensions.
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			noExtensions: true,
+			noSkills: true,
+			noContextFiles: true,
+			systemPrompt: "Offline mid-turn compaction regression.",
+		});
+		await resourceLoader.reload();
 		const { session } = await createAgentSession({
 			cwd,
 			agentDir,
 			model,
 			modelRuntime: getModelRuntime(modelRegistry),
 			settingsManager,
+			resourceLoader,
 			sessionManager: SessionManager.inMemory(cwd),
 		});
 
@@ -438,10 +793,11 @@ describe("pre-send gate end to end", () => {
 			// compacted here. The requests are: the tool-call round, the compaction's own
 			// summarization call, then the follow-up - which must be built from compacted
 			// state rather than re-sending the 40k-char tool result.
+			expect(requestSizes[0]).toBeLessThan(2_000);
 			expect(requestSizes.length).toBeGreaterThan(1);
 			expect(requestSizes[requestSizes.length - 1]).toBeLessThan(2_000);
 		} finally {
-			session.dispose();
+			await session.dispose();
 			modelRegistry.unregisterProvider(model.provider);
 		}
 	});
