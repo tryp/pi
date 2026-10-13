@@ -136,6 +136,51 @@ export interface ConvertResponsesToolsOptions {
 // Message conversion
 // =============================================================================
 
+/**
+ * A Responses request was built with no replayable input items.
+ *
+ * Every Responses-family API (openai-responses, azure-openai-responses,
+ * openai-codex-responses) requires one of `input`, `previous_response_id`,
+ * `prompt` or `conversation`. Sending `input: []` violates that contract and the
+ * provider rejects it with an opaque wording that carries no cause:
+ *
+ *     One of "input" or "previous_response_id" or 'prompt' or 'conversation'
+ *     must be provided.
+ *
+ * That wording reads as a transient server error, so the retry layer re-sends a
+ * byte-identical malformed request up to three times. Failing here instead makes
+ * the cause explicit and terminal: the same body cannot succeed on a retry.
+ *
+ * Reachable when every message in the context is dropped during conversion --
+ * an orphaned tool result whose assistant call was folded away, or a user
+ * message with empty content.
+ */
+export class EmptyRequestInputError extends Error {
+	constructor(detail: string) {
+		super(
+			`Refusing to send a Responses request with an empty input: ${detail}. ` +
+				"This is a local context-construction fault, not a provider failure; retrying the same request cannot succeed.",
+		);
+		this.name = "EmptyRequestInputError";
+	}
+}
+
+/**
+ * Guard for the request-building path only.
+ *
+ * `convertResponsesMessages` is also used to derive continuation-cache items
+ * from a single assistant message, where an empty result is legitimate, so the
+ * requirement is enforced by the providers that actually put `input` on the
+ * wire rather than inside the converter.
+ */
+export function assertNonEmptyResponsesInput(input: ResponseInput, context: Context): void {
+	if (input.length === 0) {
+		throw new EmptyRequestInputError(
+			`all ${context.messages.length} message(s) in the context produced no input items`,
+		);
+	}
+}
+
 export function convertResponsesMessages<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,

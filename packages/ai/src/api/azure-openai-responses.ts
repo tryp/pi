@@ -18,7 +18,7 @@ import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import { convertResponsesMessages, convertResponsesTools, processResponsesStream, assertNonEmptyResponsesInput } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 const DEFAULT_AZURE_API_VERSION = "v1";
@@ -285,6 +285,7 @@ function buildParams(
 	const messages = convertResponsesMessages(model, context, AZURE_TOOL_CALL_PROVIDERS, {
 		grammarToolInputProperties,
 	});
+	assertNonEmptyResponsesInput(messages, context);
 
 	const params: ResponseCreateParamsStreaming = {
 		model: deploymentName,

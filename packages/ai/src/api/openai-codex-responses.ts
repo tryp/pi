@@ -45,7 +45,7 @@ import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import { convertResponsesMessages, convertResponsesTools, processResponsesStream, assertNonEmptyResponsesInput } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 // ============================================================================
@@ -733,6 +733,7 @@ function buildRequestBody(
 			supportsOpenAIGrammarTools,
 		},
 	});
+	assertNonEmptyResponsesInput(messages, context);
 
 	const body: RequestBody = {
 		model: model.id,

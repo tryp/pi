@@ -41,6 +41,8 @@ export type RequestFailureCode =
 	| "http_status"
 	/** The stream violated the protocol (ended early, missing terminal event). */
 	| "protocol"
+	/** The request was never valid: it was built client-side without a required field. */
+	| "request_construction"
 	| "unknown";
 
 /** How far the request got before it failed. */
@@ -195,6 +197,17 @@ function isProtocolFailure(error: unknown): boolean {
 	return name?.endsWith("ProtocolError") === true;
 }
 
+/**
+ * A request that was malformed before it left the process. Recognised by class
+ * name rather than by `instanceof` so this module keeps no dependency on the
+ * provider modules that raise it, matching how protocol failures are matched.
+ */
+function isRequestConstructionFailure(error: unknown): boolean {
+	const candidate = asAbortCandidate(error);
+	const name = candidate === undefined ? undefined : pickName(candidate);
+	return name === "EmptyRequestInputError";
+}
+
 export function classifyRequestFailure(input: RequestFailureInput): RequestFailureOrigin {
 	const signal = describeAbortSignal(input.signal);
 	const abortLike = findAbortLikeError(input.error);
@@ -209,6 +222,8 @@ export function classifyRequestFailure(input: RequestFailureInput): RequestFailu
 		failureCode = "abort_transport";
 	} else if (isProtocolFailure(input.error)) {
 		failureCode = "protocol";
+	} else if (isRequestConstructionFailure(input.error)) {
+		failureCode = "request_construction";
 	}
 
 	// A transport abort with the local signal untouched is the recoverable class.
@@ -222,6 +237,10 @@ export function classifyRequestFailure(input: RequestFailureInput): RequestFailu
 		retryVerdict = "retry";
 	} else if (failureCode === "abort_signal") {
 		retryVerdict = signal.timeout || isTimeoutAbort(abortLike) ? "retry" : "do_not_retry";
+	} else if (failureCode === "request_construction") {
+		// The bytes on the wire are already wrong; re-sending them reproduces the
+		// same rejection, so this is terminal by construction rather than by wording.
+		retryVerdict = "do_not_retry";
 	}
 
 	return {

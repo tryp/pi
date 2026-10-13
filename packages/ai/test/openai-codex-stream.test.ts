@@ -1413,7 +1413,9 @@ describe("openai-codex streaming", () => {
 			contextWindow: 400000,
 			maxTokens: 128000,
 		};
-		const context: Context = { systemPrompt: "", messages: [] };
+		// A Responses request needs at least one input item, so use a minimal
+		// real message rather than an empty context (see EmptyRequestInputError).
+		const context: Context = { systemPrompt: "", messages: [{ role: "user", content: "ping", timestamp: 0 }] };
 		const options = { sessionId: "shared-session", transport: "websocket-cached" as const };
 
 		await streamOpenAICodexResponses(model, context, { ...options, apiKey: mockToken("account-a") }).result();
@@ -1664,7 +1666,7 @@ describe("openai-codex streaming", () => {
 
 		const result = await streamOpenAICodexResponses(
 			model,
-			{ systemPrompt: "", messages: [] },
+			{ systemPrompt: "", messages: [{ role: "user", content: "ping", timestamp: 0 }] },
 			{
 				apiKey: token,
 			},

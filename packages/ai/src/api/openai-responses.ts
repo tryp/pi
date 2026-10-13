@@ -31,7 +31,7 @@ import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import { convertResponsesMessages, convertResponsesTools, processResponsesStream, assertNonEmptyResponsesInput } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -359,6 +359,7 @@ function buildParams(
 			supportsOpenAIGrammarTools: compat.supportsOpenAIGrammarTools,
 		},
 	});
+	assertNonEmptyResponsesInput(messages, context);
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	const disableImplicitPromptCache = cacheRetention === "none" && compat.supportsExplicitPromptCacheMode;
