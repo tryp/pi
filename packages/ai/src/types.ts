@@ -5,7 +5,7 @@ import type { BedrockOptions } from "./api/bedrock-converse-stream.ts";
 import type { GoogleOptions } from "./api/google-generative-ai.ts";
 import type { GoogleVertexOptions } from "./api/google-vertex.ts";
 import type { MistralOptions } from "./api/mistral-conversations.ts";
-import type { OpenAICodexResponsesOptions } from "./api/openai-codex-responses.ts";
+import type { OpenAICodexResponsesOptions, ReasoningRejection } from "./api/openai-codex-responses.ts";
 import type { OpenAICompletionsOptions } from "./api/openai-completions.ts";
 import type { OpenAIResponsesOptions } from "./api/openai-responses.ts";
 import type { PiMessagesOptions } from "./api/pi-messages.ts";
@@ -322,6 +322,19 @@ export interface SimpleStreamOptions extends StreamOptions {
 	deferred?: boolean | { window?: "15m" | "1h" | "24h" };
 	/** Custom token budgets for thinking levels (token-based providers only) */
 	thinkingBudgets?: ThinkingBudgets;
+	/**
+	 * Called when a request succeeded only after replayed encrypted reasoning was
+	 * suppressed (Codex opaque `server_error`). `reasoningItemIds` is the whole
+	 * suppressed set: the provider signals that the set contains at least one
+	 * item it cannot verify, never which one. Callers that want to stop paying
+	 * the failed attempt on every later request persist the set and filter those
+	 * items out of subsequent contexts.
+	 *
+	 * Optional, and honoured only by providers that implement it. Reporting must
+	 * never turn a recovered request into a failed one, so implementations wrap
+	 * the call in a try/catch.
+	 */
+	onReasoningRejected?: (info: ReasoningRejection) => void | Promise<void>;
 }
 
 // Generic StreamFunction with typed options.

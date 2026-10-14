@@ -524,6 +524,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				websocketConnectTimeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+				// Persist reasoning the provider refused, so those items stop being
+				// resubmitted. Without this the request recovers but every later
+				// request pays the same failed attempt first.
+				onReasoningRejected: (info) => {
+					sessionRef.current?.appendReasoningRejection(info);
+				},
 				transformHeaders: async (requestHeaders) => {
 					const headers = mergeProviderAttributionHeaders(
 						model,

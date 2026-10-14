@@ -86,6 +86,26 @@ export interface OpenAICodexResponsesOptions extends StreamOptions {
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	textVerbosity?: "low" | "medium" | "high";
 	toolChoice?: "auto" | "none" | "required";
+	/**
+	 * Called when a request succeeded only after replayed encrypted reasoning was
+	 * suppressed. The provider never says which item it rejected, only that the
+	 * set contains at least one bad item, so `reasoningItemIds` is the whole
+	 * quarantined set. Callers are expected to persist it so those items stop
+	 * being resubmitted -- otherwise the same failure recurs on every request.
+	 */
+	onReasoningRejected?: (info: ReasoningRejection) => void | Promise<void>;
+}
+
+export interface ReasoningRejection {
+	/** Ids of the reasoning items that were suppressed and are now suspect. */
+	reasoningItemIds: string[];
+	/** The provider error code that triggered the recovery (`server_error`). */
+	code: string;
+	provider: string;
+	model: string;
+	transport: string;
+	/** Wall-clock ms when the rejection was observed. */
+	at: number;
 }
 
 type CodexResponseStatus = "completed" | "incomplete" | "failed" | "cancelled" | "queued" | "in_progress";
@@ -299,6 +319,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 		let telemetryIds: { requestId: string; attemptId: string } | undefined;
 		let logicalRequestId: string | undefined;
 		let rawUsage: unknown;
+		/** Set when a reasoning-suppressed retry is issued; cleared once it succeeds. */
+		let pendingReasoningRejection: ReasoningRejection | undefined;
 
 		try {
 			const apiKey = options?.apiKey;
@@ -403,6 +425,18 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 								normalizedUsage: output.usage,
 								rawUsage: getRawUsageProvenance(rawUsage),
 							});
+						// The request only succeeded with reasoning suppressed, so at least one of
+						// the suppressed items is rejected by the provider. Report the set so the
+						// caller can quarantine it instead of re-sending it on every request.
+						if (pendingReasoningRejection && pendingReasoningRejection.reasoningItemIds.length > 0) {
+							try {
+								await options?.onReasoningRejected?.(pendingReasoningRejection);
+							} catch {
+								// Reporting must never turn a recovered request into a failed one.
+							}
+							pendingReasoningRejection = undefined;
+						}
+
 						stream.push({
 							type: "done",
 							reason: output.stopReason,
@@ -434,6 +468,16 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							if (telemetryIds)
 								observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
 							retriedWithoutReasoningItems = true;
+							const quarantined = collectReasoningItemIds(body.input);
+							pendingReasoningRejection = {
+								reasoningItemIds: quarantined,
+								code: OPAQUE_SERVER_ERROR_CODE,
+								provider: model.provider,
+								model: model.id,
+								transport: "websocket",
+								at: Date.now(),
+							};
+
 							let retryBody = buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties, {
 								suppressReasoningItems: true,
 							});
@@ -656,6 +700,18 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 									normalizedUsage: output.usage,
 									rawUsage: getRawUsageProvenance(rawUsage),
 								});
+							// The request only succeeded with reasoning suppressed, so at least one of
+							// the suppressed items is rejected by the provider. Report the set so the
+							// caller can quarantine it instead of re-sending it on every request.
+							if (pendingReasoningRejection && pendingReasoningRejection.reasoningItemIds.length > 0) {
+								try {
+									await options?.onReasoningRejected?.(pendingReasoningRejection);
+								} catch {
+									// Reporting must never turn a recovered request into a failed one.
+								}
+								pendingReasoningRejection = undefined;
+							}
+
 							stream.push({ type: "done", reason: output.stopReason, message: output });
 							stream.end();
 							break;
@@ -664,6 +720,16 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					if (ssePass === 0 && !options?.signal?.aborted && isOpaqueCodexServerError(error)) {
 						if (telemetryIds)
 							observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
+						const quarantined = collectReasoningItemIds(body.input);
+						pendingReasoningRejection = {
+							reasoningItemIds: quarantined,
+							code: OPAQUE_SERVER_ERROR_CODE,
+							provider: model.provider,
+							model: model.id,
+							transport: "sse",
+							at: Date.now(),
+						};
+
 						let retryBody = buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties, {
 							suppressReasoningItems: true,
 						});
@@ -972,6 +1038,15 @@ function isMissingWebSocketContinuationError(error: unknown): boolean {
  * Deliberately narrow. Retrying a transient failure with a degraded body would
  * double the request count for no gain, so only this code qualifies.
  */
+function collectReasoningItemIds(
+	input: readonly { type?: string | null; id?: string | null }[] | undefined,
+): string[] {
+	return (input ?? [])
+		.filter((item) => item.type === "reasoning")
+		.map((item) => item.id)
+		.filter((id): id is string => Boolean(id));
+}
+
 function isOpaqueCodexServerError(error: unknown): boolean {
 	return error instanceof CodexApiError && error.code === OPAQUE_SERVER_ERROR_CODE;
 }

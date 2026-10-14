@@ -103,7 +103,7 @@ import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { getLatestCompactionEntry } from "./session-manager.ts";
+import { getLatestCompactionEntry, REASONING_REJECTED_ENTRY } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -1342,6 +1342,31 @@ export class AgentSession {
 			this._compactionAbortController !== undefined ||
 			this._branchSummaryAbortController !== undefined
 		);
+	}
+
+	/**
+	 * Record reasoning items the provider refused to verify.
+	 *
+	 * The set is persisted rather than dropped from the session so the item stays
+	 * inspectable, while `buildSessionContext` stops resubmitting it.
+	 */
+	appendReasoningRejection(info: {
+		reasoningItemIds: string[];
+		code: string;
+		provider: string;
+		model: string;
+		transport: string;
+		at: number;
+	}): void {
+		if (!Array.isArray(info?.reasoningItemIds) || info.reasoningItemIds.length === 0) return;
+		this.sessionManager.appendCustomEntry(REASONING_REJECTED_ENTRY, {
+			reasoningItemIds: info.reasoningItemIds,
+			code: info.code,
+			provider: info.provider,
+			model: info.model,
+			transport: info.transport,
+			at: info.at,
+		});
 	}
 
 	guardContextForRequest(

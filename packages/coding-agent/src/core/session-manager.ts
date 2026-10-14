@@ -483,6 +483,54 @@ export function buildContextEntries(
  * If leafId is provided, walks from that entry to root.
  * Handles compaction and branch summaries along the path.
  */
+/** Custom entry recording reasoning items the provider refused to verify. */
+export const REASONING_REJECTED_ENTRY = "pi-reasoning-rejected";
+
+/**
+ * Collect the reasoning item ids quarantined by earlier requests on this path.
+ *
+ * A replayed encrypted-reasoning item the provider cannot accept poisons every
+ * request carrying it. pi-ai suppresses reasoning once, reports the set, and we
+ * persist it here; filtering it out of later contexts stops the resubmission
+ * loop while leaving the item in the history file for forensics.
+ */
+function collectQuarantinedReasoningIds(path: SessionEntry[]): Set<string> {
+	const ids = new Set<string>();
+	for (const entry of path) {
+		if (entry.type !== "custom" || entry.customType !== REASONING_REJECTED_ENTRY) continue;
+		const data = entry.data as { reasoningItemIds?: unknown } | undefined;
+		if (!data || !Array.isArray(data.reasoningItemIds)) continue;
+		for (const id of data.reasoningItemIds) if (typeof id === "string") ids.add(id);
+	}
+	return ids;
+}
+
+/**
+ * Drop `thinkingSignature` for quarantined reasoning items.
+ *
+ * The thinking block itself is kept -- it carries the readable reasoning and is
+ * what a human inspects afterwards -- but without a signature the Responses
+ * converter emits no reasoning item, so nothing is resubmitted.
+ */
+function stripQuarantinedReasoning(message: AgentMessage, quarantined: Set<string>): AgentMessage {
+	if (quarantined.size === 0 || message.role !== "assistant" || !Array.isArray(message.content)) return message;
+	let changed = false;
+	const content = message.content.map((block) => {
+		if (block.type !== "thinking" || !block.thinkingSignature) return block;
+		let id: string | undefined;
+		try {
+			id = (JSON.parse(block.thinkingSignature) as { id?: string }).id;
+		} catch {
+			return block;
+		}
+		if (!id || !quarantined.has(id)) return block;
+		changed = true;
+		const { thinkingSignature: _dropped, ...rest } = block;
+		return rest;
+	});
+	return changed ? ({ ...message, content } as AgentMessage) : message;
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -507,8 +555,11 @@ export function buildSessionContext(
 			}
 		}
 	}
+	const quarantined = collectQuarantinedReasoningIds(path);
 	const messages = buildContextEntries(entries, leafId, byId).flatMap((entry) => {
-		const contextMessages = sessionEntryToContextMessages(entry);
+		const contextMessages = sessionEntryToContextMessages(entry).map((m) =>
+			stripQuarantinedReasoning(m, quarantined),
+		);
 		if (!staleUsageEntryIds.has(entry.id)) return contextMessages;
 		return contextMessages.map((message) => {
 			if (message.role !== "assistant" || !("usage" in message)) return message;

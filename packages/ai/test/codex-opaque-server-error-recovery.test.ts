@@ -315,3 +315,86 @@ describe("codex opaque server_error recovery over SSE", () => {
 		expect(payloads.length).toBe(1);
 	});
 });
+
+/**
+ * The quarantined set has to leave the provider module, or the caller cannot
+ * persist it and every later request pays the same failed attempt.
+ */
+describe("reasoning rejection reporting", () => {
+	it("reports the suppressed set when the retry succeeds", async () => {
+		const payloads: Record<string, unknown>[] = [];
+		installFakeWebSocket(payloads, (p) => (hasReasoning(p) ? { kind: "fail", code: "server_error" } : { kind: "complete" }));
+		const seen: { reasoningItemIds: string[]; transport: string }[] = [];
+
+		const result = await streamCodex(model, { messages: conversationWithReasoning(), tools: [] }, {
+			apiKey: mockToken(),
+			transport: "websocket",
+			sessionId: "report-ok",
+			onReasoningRejected: (info) => {
+				seen.push({ reasoningItemIds: info.reasoningItemIds, transport: info.transport });
+			},
+		}).result();
+		vi.unstubAllGlobals();
+
+		expect(result.stopReason).toBe("stop");
+		expect(seen.length).toBe(1);
+		expect(seen[0]?.transport).toBe("websocket");
+		// Both replayed items are quarantined: the provider never says which one.
+		expect(seen[0]?.reasoningItemIds.sort()).toEqual(["rs_first", "rs_second"]);
+	});
+
+	it("does not report when the retry also fails", async () => {
+		const payloads: Record<string, unknown>[] = [];
+		installFakeWebSocket(payloads, () => ({ kind: "fail", code: "server_error" }));
+		let calls = 0;
+
+		await streamCodex(model, { messages: conversationWithReasoning(), tools: [] }, {
+			apiKey: mockToken(),
+			transport: "websocket",
+			sessionId: "report-fail",
+			onReasoningRejected: () => {
+				calls++;
+			},
+		}).result();
+		vi.unstubAllGlobals();
+
+		// Nothing was learned, so nothing should be persisted.
+		expect(calls).toBe(0);
+	});
+
+	it("does not report on an ordinary success", async () => {
+		const payloads: Record<string, unknown>[] = [];
+		installFakeWebSocket(payloads, () => ({ kind: "complete" }));
+		let calls = 0;
+
+		await streamCodex(model, { messages: conversationWithReasoning(), tools: [] }, {
+			apiKey: mockToken(),
+			transport: "websocket",
+			sessionId: "report-none",
+			onReasoningRejected: () => {
+				calls++;
+			},
+		}).result();
+		vi.unstubAllGlobals();
+
+		expect(calls).toBe(0);
+	});
+
+	it("survives a throwing reporter", async () => {
+		const payloads: Record<string, unknown>[] = [];
+		installFakeWebSocket(payloads, (p) => (hasReasoning(p) ? { kind: "fail", code: "server_error" } : { kind: "complete" }));
+
+		const result = await streamCodex(model, { messages: conversationWithReasoning(), tools: [] }, {
+			apiKey: mockToken(),
+			transport: "websocket",
+			sessionId: "report-throws",
+			onReasoningRejected: () => {
+				throw new Error("persistence exploded");
+			},
+		}).result();
+		vi.unstubAllGlobals();
+
+		// A recovered request must not become a failed one because reporting threw.
+		expect(result.stopReason).toBe("stop");
+	});
+});
