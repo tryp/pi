@@ -65,6 +65,7 @@ const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
+const OPAQUE_SERVER_ERROR_CODE = "server_error";
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
@@ -326,7 +327,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				apiKey,
 				websocketRequestId,
 			);
-			const bodyJson = JSON.stringify(body);
+			let bodyJson = JSON.stringify(body);
 			requestBytes = new TextEncoder().encode(bodyJson).byteLength;
 			const httpTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 			const websocketConnectTimeoutMs = normalizeTimeoutMs(options?.websocketConnectTimeoutMs);
@@ -342,6 +343,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				let websocketStarted = false;
 				let retriedWebSocketConnectionLimit = false;
 				let retriedMissingWebSocketContinuation = false;
+				let retriedWithoutReasoningItems = false;
 				while (true) {
 					websocketStarted = false;
 					try {
@@ -424,7 +426,27 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							retriedWebSocketConnectionLimit = true;
 							continue;
 						}
-						if (aborted || (isCodexNonTransportError(error) && !connectionLimitBeforeStart)) {
+						// Opaque provider rejection: replay the request once without the
+						// replayed encrypted reasoning. A single unverifiable reasoning item
+						// otherwise poisons every subsequent request on the session, because
+						// the offending item is re-sent each time and re-sending cannot fix it.
+						if (!aborted && !retriedWithoutReasoningItems && isOpaqueCodexServerError(error)) {
+							if (telemetryIds)
+								observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
+							retriedWithoutReasoningItems = true;
+							let retryBody = buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties, {
+								suppressReasoningItems: true,
+							});
+							const retryNextBody = await options?.onPayload?.(retryBody, model);
+							if (typeof retryNextBody === "object" && retryNextBody !== null) {
+								retryBody = retryNextBody as RequestBody;
+							}
+							body = retryBody;
+							bodyJson = JSON.stringify(body);
+							requestBytes = new TextEncoder().encode(bodyJson).byteLength;
+							continue;
+						}
+					if (aborted || (isCodexNonTransportError(error) && !connectionLimitBeforeStart)) {
 							if (telemetryIds)
 								observeCacheOutcomeSafely(options?.cacheTelemetry, {
 									...telemetryIds,
@@ -459,177 +481,205 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				}
 			}
 
-			activeTransport = "sse";
-			activePhase = "before_headers";
-			// Compress the request body once for the SSE path. The Codex backend
-			// decodes Content-Encoding: zstd; the WebSocket transport above sends the
-			// uncompressed JSON frame, matching the official Codex client.
-			const compressedBody = compressRequestBodyZstd(bodyJson);
-			if (compressedBody) {
-				sseHeaders.set("content-encoding", "zstd");
-			}
-			const sseBody: Uint8Array | string = compressedBody ?? bodyJson;
-			requestBytes = typeof sseBody === "string" ? new TextEncoder().encode(sseBody).byteLength : sseBody.byteLength;
-
-			// Fetch with retry logic for rate limits and transient errors
-			let response: Response | undefined;
-			let lastError: Error | undefined;
-			const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
-
-			for (let attempt = 0; attempt <= maxRetries; attempt++) {
-				telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
-					requestId: logicalRequestId,
-					provider: model.provider,
-					model: model.id,
-					phase: "canonical_body",
-					transport: "sse",
-					payloadMode: "full",
-					cacheRetention: options?.cacheRetention ?? "short",
-					cacheKeyPresent: getCacheTelemetryDataProperty(body, "prompt_cache_key") !== undefined,
-					sessionHeaderPresent: sseHeaders.has("session_id"),
-					cacheIdentityMatch:
-						typeof getCacheTelemetryDataProperty(body, "prompt_cache_key") === "string" &&
-						sseHeaders.has("session_id")
-							? getCacheTelemetryDataProperty(body, "prompt_cache_key") === sseHeaders.get("session_id")
-							: null,
-					payload: body,
-					wirePayload: bodyJson,
-				});
-				logicalRequestId = telemetryIds?.requestId ?? logicalRequestId;
-				if (telemetryIds)
-					observeCacheRequestSafely(options?.cacheTelemetry, {
-						...telemetryIds,
-						provider: model.provider,
-						model: model.id,
-						phase: "final_wire_body",
-						transport: "sse",
-						payloadMode: "full",
-						cacheRetention: options?.cacheRetention ?? "short",
-						cacheKeyPresent: getCacheTelemetryDataProperty(body, "prompt_cache_key") !== undefined,
-						sessionHeaderPresent: sseHeaders.has("session_id"),
-						cacheIdentityMatch:
-							typeof getCacheTelemetryDataProperty(body, "prompt_cache_key") === "string" &&
-							sseHeaders.has("session_id")
-								? getCacheTelemetryDataProperty(body, "prompt_cache_key") === sseHeaders.get("session_id")
-								: null,
-						payload: body,
-						// Fingerprint the exact provider JSON before lossless zstd encoding.
-						wirePayload: bodyJson,
-					});
-				if (options?.signal?.aborted) {
-					throw new Error("Request was aborted");
-				}
-
+			// The SSE path gets the same one-shot recovery as the websocket loop above:
+			// an opaque server_error can poison the request through a replayed reasoning
+			// item, and re-sending that body unchanged cannot fix it.
+			for (let ssePass = 0; ; ssePass++) {
+				let streamError: unknown;
 				try {
-					const headerTimeoutSignal =
-						httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
-					const combinedSignal = combineAbortSignals([options?.signal, headerTimeoutSignal]);
-					try {
-						response = await (options?.fetch ?? globalThis.fetch)(resolveCodexUrl(model.baseUrl), {
-							method: "POST",
-							headers: sseHeaders,
-							// Node zstd produces a Fetch-compatible byte view; do not copy it.
-							body: sseBody as NonNullable<Parameters<typeof globalThis.fetch>[1]>["body"],
-							signal: combinedSignal.signal,
-						});
-					} catch (error) {
-						if (headerTimeoutSignal?.aborted && !options?.signal?.aborted) {
-							throw new Error(`Codex SSE response headers timed out after ${httpTimeoutMs}ms`);
-						}
-						throw error;
-					} finally {
-						combinedSignal.cleanup();
-					}
-					await options?.onResponse?.(
-						{ status: response.status, headers: headersToRecord(response.headers) },
-						model,
-					);
+							activeTransport = "sse";
+							activePhase = "before_headers";
+							// Compress the request body once for the SSE path. The Codex backend
+							// decodes Content-Encoding: zstd; the WebSocket transport above sends the
+							// uncompressed JSON frame, matching the official Codex client.
+							const compressedBody = compressRequestBodyZstd(bodyJson);
+							if (compressedBody) {
+								sseHeaders.set("content-encoding", "zstd");
+							}
+							const sseBody: Uint8Array | string = compressedBody ?? bodyJson;
+							requestBytes = typeof sseBody === "string" ? new TextEncoder().encode(sseBody).byteLength : sseBody.byteLength;
 
-					if (response.ok) {
-						break;
-					}
+							// Fetch with retry logic for rate limits and transient errors
+							let response: Response | undefined;
+							let lastError: Error | undefined;
+							const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
 
-					const errorText = await response.text();
-					if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
+							for (let attempt = 0; attempt <= maxRetries; attempt++) {
+								telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+									requestId: logicalRequestId,
+									provider: model.provider,
+									model: model.id,
+									phase: "canonical_body",
+									transport: "sse",
+									payloadMode: "full",
+									cacheRetention: options?.cacheRetention ?? "short",
+									cacheKeyPresent: getCacheTelemetryDataProperty(body, "prompt_cache_key") !== undefined,
+									sessionHeaderPresent: sseHeaders.has("session_id"),
+									cacheIdentityMatch:
+										typeof getCacheTelemetryDataProperty(body, "prompt_cache_key") === "string" &&
+										sseHeaders.has("session_id")
+											? getCacheTelemetryDataProperty(body, "prompt_cache_key") === sseHeaders.get("session_id")
+											: null,
+									payload: body,
+									wirePayload: bodyJson,
+								});
+								logicalRequestId = telemetryIds?.requestId ?? logicalRequestId;
+								if (telemetryIds)
+									observeCacheRequestSafely(options?.cacheTelemetry, {
+										...telemetryIds,
+										provider: model.provider,
+										model: model.id,
+										phase: "final_wire_body",
+										transport: "sse",
+										payloadMode: "full",
+										cacheRetention: options?.cacheRetention ?? "short",
+										cacheKeyPresent: getCacheTelemetryDataProperty(body, "prompt_cache_key") !== undefined,
+										sessionHeaderPresent: sseHeaders.has("session_id"),
+										cacheIdentityMatch:
+											typeof getCacheTelemetryDataProperty(body, "prompt_cache_key") === "string" &&
+											sseHeaders.has("session_id")
+												? getCacheTelemetryDataProperty(body, "prompt_cache_key") === sseHeaders.get("session_id")
+												: null,
+										payload: body,
+										// Fingerprint the exact provider JSON before lossless zstd encoding.
+										wirePayload: bodyJson,
+									});
+								if (options?.signal?.aborted) {
+									throw new Error("Request was aborted");
+								}
+
+								try {
+									const headerTimeoutSignal =
+										httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
+									const combinedSignal = combineAbortSignals([options?.signal, headerTimeoutSignal]);
+									try {
+										response = await (options?.fetch ?? globalThis.fetch)(resolveCodexUrl(model.baseUrl), {
+											method: "POST",
+											headers: sseHeaders,
+											// Node zstd produces a Fetch-compatible byte view; do not copy it.
+											body: sseBody as NonNullable<Parameters<typeof globalThis.fetch>[1]>["body"],
+											signal: combinedSignal.signal,
+										});
+									} catch (error) {
+										if (headerTimeoutSignal?.aborted && !options?.signal?.aborted) {
+											throw new Error(`Codex SSE response headers timed out after ${httpTimeoutMs}ms`);
+										}
+										throw error;
+									} finally {
+										combinedSignal.cleanup();
+									}
+									await options?.onResponse?.(
+										{ status: response.status, headers: headersToRecord(response.headers) },
+										model,
+									);
+
+									if (response.ok) {
+										break;
+									}
+
+									const errorText = await response.text();
+									if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
+										if (telemetryIds)
+											observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
+										const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
+										const delayMs =
+											retryAfterDelayMs === undefined
+												? BASE_DELAY_MS * 2 ** attempt
+												: validateRetryDelayMs(retryAfterDelayMs, options);
+
+										await sleep(delayMs, options?.signal);
+										continue;
+									}
+
+									// Parse error for friendly message on final attempt or non-retryable error
+									const fakeResponse = new Response(errorText, {
+										status: response.status,
+										statusText: response.statusText,
+									});
+									const info = await parseErrorResponse(fakeResponse);
+									throw Object.assign(new Error(info.friendlyMessage || info.message), { status: response.status });
+								} catch (error) {
+									if (error instanceof Error && (error.name === "AbortError" || error.message === "Request was aborted")) {
+										// Keep the historical cancellation wording, but preserve a transport
+										// AbortError when our own signal is still untouched. Re-throwing still
+										// exits this retry loop immediately; the outer catch records its origin.
+										if (options?.signal?.aborted) throw new Error("Request was aborted");
+										throw error;
+									}
+									lastError = error instanceof Error ? error : new Error(String(error));
+									if (telemetryIds)
+										observeCacheOutcomeSafely(options?.cacheTelemetry, {
+											...telemetryIds,
+											outcome: options?.signal?.aborted ? "aborted" : "failed",
+										});
+									// Network errors are retryable
+									if (
+										attempt < maxRetries &&
+										!(lastError instanceof RetryDelayExceededError) &&
+										!lastError.message.includes("usage limit")
+									) {
+										const delayMs = BASE_DELAY_MS * 2 ** attempt;
+										await sleep(delayMs, options?.signal);
+										continue;
+									}
+									throw lastError;
+								}
+							}
+
+							if (!response?.ok) {
+								throw lastError ?? new Error("Failed after retries");
+							}
+
+							if (!response.body) {
+								throw new Error("No response body");
+							}
+							ssePhase = "streaming";
+							activePhase = ssePhase;
+
+							if (!startEmitted) {
+								startEmitted = true;
+								stream.push({ type: "start", partial: output });
+							}
+							await processStream(response, output, stream, model, grammarToolInputProperties, options, (usage) => {
+								rawUsage = usage;
+							});
+
+							if (options?.signal?.aborted) {
+								throw new Error("Request was aborted");
+							}
+
+							assertSuccessfulOutput(output);
+							if (telemetryIds)
+								observeCacheOutcomeSafely(options?.cacheTelemetry, {
+									...telemetryIds,
+									outcome: "success",
+									normalizedUsage: output.usage,
+									rawUsage: getRawUsageProvenance(rawUsage),
+								});
+							stream.push({ type: "done", reason: output.stopReason, message: output });
+							stream.end();
+							break;
+				} catch (error) {
+					streamError = error;
+					if (ssePass === 0 && !options?.signal?.aborted && isOpaqueCodexServerError(error)) {
 						if (telemetryIds)
 							observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
-						const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
-						const delayMs =
-							retryAfterDelayMs === undefined
-								? BASE_DELAY_MS * 2 ** attempt
-								: validateRetryDelayMs(retryAfterDelayMs, options);
-
-						await sleep(delayMs, options?.signal);
-						continue;
-					}
-
-					// Parse error for friendly message on final attempt or non-retryable error
-					const fakeResponse = new Response(errorText, {
-						status: response.status,
-						statusText: response.statusText,
-					});
-					const info = await parseErrorResponse(fakeResponse);
-					throw Object.assign(new Error(info.friendlyMessage || info.message), { status: response.status });
-				} catch (error) {
-					if (error instanceof Error && (error.name === "AbortError" || error.message === "Request was aborted")) {
-						// Keep the historical cancellation wording, but preserve a transport
-						// AbortError when our own signal is still untouched. Re-throwing still
-						// exits this retry loop immediately; the outer catch records its origin.
-						if (options?.signal?.aborted) throw new Error("Request was aborted");
-						throw error;
-					}
-					lastError = error instanceof Error ? error : new Error(String(error));
-					if (telemetryIds)
-						observeCacheOutcomeSafely(options?.cacheTelemetry, {
-							...telemetryIds,
-							outcome: options?.signal?.aborted ? "aborted" : "failed",
+						let retryBody = buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties, {
+							suppressReasoningItems: true,
 						});
-					// Network errors are retryable
-					if (
-						attempt < maxRetries &&
-						!(lastError instanceof RetryDelayExceededError) &&
-						!lastError.message.includes("usage limit")
-					) {
-						const delayMs = BASE_DELAY_MS * 2 ** attempt;
-						await sleep(delayMs, options?.signal);
+						const retryNextBody = await options?.onPayload?.(retryBody, model);
+						if (typeof retryNextBody === "object" && retryNextBody !== null) {
+							retryBody = retryNextBody as RequestBody;
+						}
+						body = retryBody;
+						bodyJson = JSON.stringify(body);
+						output.content = [];
+						startEmitted = false;
 						continue;
 					}
-					throw lastError;
+					throw streamError;
 				}
 			}
-
-			if (!response?.ok) {
-				throw lastError ?? new Error("Failed after retries");
-			}
-
-			if (!response.body) {
-				throw new Error("No response body");
-			}
-			ssePhase = "streaming";
-			activePhase = ssePhase;
-
-			if (!startEmitted) {
-				startEmitted = true;
-				stream.push({ type: "start", partial: output });
-			}
-			await processStream(response, output, stream, model, grammarToolInputProperties, options, (usage) => {
-				rawUsage = usage;
-			});
-
-			if (options?.signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
-
-			assertSuccessfulOutput(output);
-			if (telemetryIds)
-				observeCacheOutcomeSafely(options?.cacheTelemetry, {
-					...telemetryIds,
-					outcome: "success",
-					normalizedUsage: output.usage,
-					rawUsage: getRawUsageProvenance(rawUsage),
-				});
-			stream.push({ type: "done", reason: output.stopReason, message: output });
-			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
 				// Streaming scratch buffers are only used during parsing; never persist them.
@@ -713,6 +763,7 @@ function buildRequestBody(
 		context.tools,
 		model.compat?.supportsOpenAIGrammarTools ?? false,
 	),
+	overrides?: { suppressReasoningItems?: boolean },
 ): RequestBody {
 	const supportsStrictMode = model.compat?.supportsStrictMode ?? true;
 	const supportsOpenAIGrammarTools = model.compat?.supportsOpenAIGrammarTools ?? false;
@@ -735,12 +786,21 @@ function buildRequestBody(
 	});
 	assertNonEmptyResponsesInput(messages, context);
 
+	// Dropping reasoning items is only safe while something else remains to send:
+	// a request whose entire input is reasoning would become the empty-input fault
+	// that assertNonEmptyResponsesInput exists to prevent.
+	let input: typeof messages = messages;
+	if (overrides?.suppressReasoningItems) {
+		const withoutReasoning = messages.filter((item) => item.type !== "reasoning");
+		if (withoutReasoning.length > 0) input = withoutReasoning;
+	}
+
 	const body: RequestBody = {
 		model: model.id,
 		store: false,
 		stream: true,
 		instructions: context.systemPrompt || "You are a helpful assistant.",
-		input: messages,
+		input,
 		text: { verbosity: options?.textVerbosity || "low" },
 		include: ["reasoning.encrypted_content"],
 		prompt_cache_key: cacheSessionId,
@@ -894,6 +954,26 @@ function isMissingWebSocketContinuationError(error: unknown): boolean {
 		(error.code === PREVIOUS_RESPONSE_NOT_FOUND_CODE ||
 			error.message.includes("No tool call found for function call output"))
 	);
+}
+
+/**
+ * An opaque server-side rejection: `Codex error: An error occurred while
+ * processing your request ...` with no indication of what the provider
+ * objected to.
+ *
+ * Measured against the session corpus: this is what a single unverifiable
+ * encrypted-reasoning item produces. One replayed reasoning item made every
+ * subsequent request on that session fail identically -- 26 requests over 51
+ * minutes, because nothing dropped the offending item. Replaying the same
+ * conversation with reasoning items removed completes normally, so this is the
+ * one failure class where retrying with strictly less content is worth a
+ * second request.
+ *
+ * Deliberately narrow. Retrying a transient failure with a degraded body would
+ * double the request count for no gain, so only this code qualifies.
+ */
+function isOpaqueCodexServerError(error: unknown): boolean {
+	return error instanceof CodexApiError && error.code === OPAQUE_SERVER_ERROR_CODE;
 }
 
 function extractCodexEventError(event: Record<string, unknown>): { code?: string; message?: string } {
