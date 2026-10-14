@@ -12,6 +12,7 @@ import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type { SessionManager } from "../session-manager.ts";
+import { cloneContextMessages } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import type {
 	BeforeAgentStartEvent,
@@ -1076,7 +1077,7 @@ export class ExtensionRunner {
 		) => void,
 	): Promise<AgentMessage[]> {
 		const ctx = this.createContext();
-		let currentMessages = structuredClone(messages);
+		let currentMessages = cloneContextMessages(messages);
 		let handlerIndex = 0;
 
 		for (const ext of this.extensions) {

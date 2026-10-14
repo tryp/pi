@@ -33,6 +33,31 @@ export const CURRENT_SESSION_VERSION = 3;
 /** Marks usage metadata on rebuilt context messages that predates compaction. */
 export const INVALIDATED_CONTEXT_USAGE_ANCHOR = Symbol("invalidatedContextUsageAnchor");
 
+/**
+ * Deep-clone context messages for extension handlers without dropping the
+ * pre-compaction usage-invalidation marker.
+ *
+ * `structuredClone` is the right isolation primitive for the `context` hook, but
+ * it copies only own enumerable *string* properties, so the symbol that
+ * {@link buildSessionContext} attaches to retained pre-compaction assistant
+ * messages is silently dropped. Without the marker, `estimateContextTokens`
+ * re-anchors on a stale usage total and the pre-send context guard refuses a
+ * request that compaction already brought under budget. Re-apply symbol
+ * descriptors after cloning so the invalidation survives the clone.
+ */
+export function cloneContextMessages(messages: readonly AgentMessage[]): AgentMessage[] {
+	const cloned = structuredClone(messages) as AgentMessage[];
+	for (let i = 0; i < messages.length; i++) {
+		const source = messages[i];
+		if (!source) continue;
+		for (const symbol of Object.getOwnPropertySymbols(source)) {
+			const descriptor = Object.getOwnPropertyDescriptor(source, symbol);
+			if (descriptor) Object.defineProperty(cloned[i]!, symbol, descriptor);
+		}
+	}
+	return cloned;
+}
+
 export interface SessionHeader {
 	type: "session";
 	version?: number; // v1 sessions don't have this
