@@ -66,6 +66,7 @@ const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
 const OPAQUE_SERVER_ERROR_CODE = "server_error";
+const INVALID_ENCRYPTED_CONTENT_CODE = "invalid_encrypted_content";
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
@@ -464,14 +465,15 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						// replayed encrypted reasoning. A single unverifiable reasoning item
 						// otherwise poisons every subsequent request on the session, because
 						// the offending item is re-sent each time and re-sending cannot fix it.
-						if (!aborted && !retriedWithoutReasoningItems && isOpaqueCodexServerError(error)) {
+						if (!aborted && !retriedWithoutReasoningItems && isReasoningRejection(error)) {
 							if (telemetryIds)
 								observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
 							retriedWithoutReasoningItems = true;
-							const quarantined = collectReasoningItemIds(body.input);
+							const named = extractRejectedReasoningItemId(error);
+							const quarantined = named ? [named] : collectReasoningItemIds(body.input);
 							pendingReasoningRejection = {
 								reasoningItemIds: quarantined,
-								code: OPAQUE_SERVER_ERROR_CODE,
+								code: named ? INVALID_ENCRYPTED_CONTENT_CODE : OPAQUE_SERVER_ERROR_CODE,
 								provider: model.provider,
 								model: model.id,
 								transport: "websocket",
@@ -717,13 +719,14 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							break;
 				} catch (error) {
 					streamError = error;
-					if (ssePass === 0 && !options?.signal?.aborted && isOpaqueCodexServerError(error)) {
+					if (ssePass === 0 && !options?.signal?.aborted && isReasoningRejection(error)) {
 						if (telemetryIds)
 							observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
-						const quarantined = collectReasoningItemIds(body.input);
+						const named = extractRejectedReasoningItemId(error);
+						const quarantined = named ? [named] : collectReasoningItemIds(body.input);
 						pendingReasoningRejection = {
 							reasoningItemIds: quarantined,
-							code: OPAQUE_SERVER_ERROR_CODE,
+							code: named ? INVALID_ENCRYPTED_CONTENT_CODE : OPAQUE_SERVER_ERROR_CODE,
 							provider: model.provider,
 							model: model.id,
 							transport: "sse",
@@ -1047,8 +1050,30 @@ function collectReasoningItemIds(
 		.filter((id): id is string => Boolean(id));
 }
 
-function isOpaqueCodexServerError(error: unknown): boolean {
-	return error instanceof CodexApiError && error.code === OPAQUE_SERVER_ERROR_CODE;
+/**
+ * A provider refusal of a replayed reasoning item, in either of the two shapes
+ * observed against the corpus:
+ *
+ *  - `server_error`: opaque, names nothing. Suppressing reasoning recovers the
+ *    request, but the provider never says which item it rejected.
+ *  - `invalid_encrypted_content`: "The encrypted content for item rs_... could
+ *    not be verified", which names the culprit -- so the caller can quarantine
+ *    one item rather than the whole set.
+ *
+ * Deliberately narrow. Retrying a transient failure with a degraded body would
+ * double the request count for no gain, so only these codes qualify.
+ */
+function isReasoningRejection(error: unknown): boolean {
+	return (
+		error instanceof CodexApiError &&
+		(error.code === OPAQUE_SERVER_ERROR_CODE || error.code === INVALID_ENCRYPTED_CONTENT_CODE)
+	);
+}
+
+/** The item id from a named refusal, when the provider gave one. */
+function extractRejectedReasoningItemId(error: unknown): string | undefined {
+	if (!(error instanceof CodexApiError) || error.code !== INVALID_ENCRYPTED_CONTENT_CODE) return undefined;
+	return /for item (rs_[A-Za-z0-9_-]+)/.exec(error.message)?.[1];
 }
 
 function extractCodexEventError(event: Record<string, unknown>): { code?: string; message?: string } {

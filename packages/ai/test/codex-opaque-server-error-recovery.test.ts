@@ -74,7 +74,7 @@ function conversationWithReasoning(): Message[] {
 	];
 }
 
-type Decided = { kind: "fail"; code: string } | { kind: "complete" };
+type Decided = { kind: "fail"; code: string; message?: string } | { kind: "complete" };
 
 /**
  * Fake websocket. `decide` sees each decoded `response.create` payload, so a
@@ -101,7 +101,10 @@ function installFakeWebSocket(payloads: Record<string, unknown>[], decide: (payl
 					this.fire("message", {
 						data: JSON.stringify({
 							type: "response.failed",
-							response: { id: "resp_x", error: { code: verdict.code, message: "An error occurred while processing your request." } },
+							response: {
+							id: "resp_x",
+							error: { code: verdict.code, message: verdict.message ?? "An error occurred while processing your request." },
+						},
 						}),
 					});
 					return;
@@ -253,7 +256,10 @@ function installFakeFetch(payloads: Record<string, unknown>[], decide: (p: any) 
 			if (verdict.kind === "fail") {
 				return sse({
 					type: "response.failed",
-					response: { id: "resp_x", error: { code: verdict.code, message: "An error occurred while processing your request." } },
+					response: {
+						id: "resp_x",
+						error: { code: verdict.code, message: verdict.message ?? "An error occurred while processing your request." },
+					},
 				});
 			}
 			return sse({
@@ -396,5 +402,77 @@ describe("reasoning rejection reporting", () => {
 
 		// A recovered request must not become a failed one because reporting threw.
 		expect(result.stopReason).toBe("stop");
+	});
+});
+
+/**
+ * The second refusal shape. The provider names the item
+ * (`invalid_encrypted_content`), which is strictly better than the opaque
+ * error: only that one item needs quarantining, not the whole set.
+ */
+describe("named reasoning refusal", () => {
+	const namedError = (id: string) => ({
+		kind: "fail" as const,
+		code: "invalid_encrypted_content",
+		message: `The encrypted content for item ${id} could not be verified. Reason: Encrypted content could not be decrypted or parsed.`,
+	});
+
+	it("recovers and quarantines only the named item", async () => {
+		const payloads: Record<string, unknown>[] = [];
+		installFakeWebSocket(payloads, (p) =>
+			hasReasoning(p) ? namedError("rs_second") : { kind: "complete" },
+		);
+		const seen: string[][] = [];
+
+		const result = await streamCodex(model, { messages: conversationWithReasoning(), tools: [] }, {
+			apiKey: mockToken(),
+			transport: "websocket",
+			sessionId: "named-ok",
+			onReasoningRejected: (info) => {
+				seen.push(info.reasoningItemIds);
+			},
+		}).result();
+		vi.unstubAllGlobals();
+
+		expect(result.stopReason).toBe("stop");
+		// Not the whole set: the provider said which one, so only that one.
+		expect(seen).toEqual([["rs_second"]]);
+	});
+
+	it("quarantines the whole set when the refusal names nothing", async () => {
+		const payloads: Record<string, unknown>[] = [];
+		installFakeWebSocket(payloads, (p) => (hasReasoning(p) ? { kind: "fail", code: "server_error" } : { kind: "complete" }));
+		const seen: string[][] = [];
+
+		await streamCodex(model, { messages: conversationWithReasoning(), tools: [] }, {
+			apiKey: mockToken(),
+			transport: "websocket",
+			sessionId: "named-none",
+			onReasoningRejected: (info) => {
+				seen.push(info.reasoningItemIds);
+			},
+		}).result();
+		vi.unstubAllGlobals();
+
+		expect(seen).toEqual([["rs_first", "rs_second"]]);
+	});
+
+	it("still leaves an unrelated code alone", async () => {
+		const payloads: Record<string, unknown>[] = [];
+		installFakeWebSocket(payloads, () => ({ kind: "fail", code: "rate_limit_exceeded" }));
+		let calls = 0;
+
+		await streamCodex(model, { messages: conversationWithReasoning(), tools: [] }, {
+			apiKey: mockToken(),
+			transport: "websocket",
+			sessionId: "named-other",
+			onReasoningRejected: () => {
+				calls++;
+			},
+		}).result();
+		vi.unstubAllGlobals();
+
+		expect(payloads.length).toBe(1);
+		expect(calls).toBe(0);
 	});
 });
