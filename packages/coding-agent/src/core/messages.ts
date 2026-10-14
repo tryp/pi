@@ -155,6 +155,37 @@ export function isProviderUserInputMessage(message: AgentMessage): boolean {
 	}
 }
 
+function carriesProviderContent(content: unknown): boolean {
+	if (typeof content === "string") return content.length > 0;
+	if (Array.isArray(content)) return content.length > 0;
+	return content !== undefined && content !== null;
+}
+
+/**
+ * Whether this session message would actually put something on the wire.
+ *
+ * Being a provider user input is not sufficient: `convertToLlm` maps an empty
+ * `custom` or `user` message to `{ role: "user", content: [] }`, and the
+ * Responses converter skips empty-content user messages
+ * (`content.length === 0 -> continue`), so such a message contributes no input
+ * item at all. Extensions use empty-content markers deliberately -- pi-vcc's
+ * invisible auto-continue is a `custom` message with `content: []`.
+ */
+export function hasProviderInputContent(message: AgentMessage): boolean {
+	switch (message.role) {
+		case "user":
+		case "custom":
+			return carriesProviderContent(message.content);
+		case "branchSummary":
+		case "compactionSummary":
+			return carriesProviderContent(message.summary);
+		case "bashExecution":
+			return !message.excludeFromContext;
+		default:
+			return false;
+	}
+}
+
 /**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *

@@ -174,6 +174,58 @@ describe("the provider entry point enforces it", () => {
 	});
 });
 
+describe("every Responses provider enforces it", () => {
+	// Pins the wiring in all three builders. Without these, deleting the
+	// assertNonEmptyResponsesInput call from the azure or plain-openai builder
+	// would leave the suite green while that provider regressed to sending
+	// input: [].
+	const cases = [
+		{
+			name: "openai-codex-responses",
+			load: async () => (await import("../src/api/openai-codex-responses.ts")).stream,
+			api: "openai-codex-responses" as const,
+			baseUrl: "https://chatgpt.com/backend-api",
+		},
+		{
+			name: "openai-responses",
+			load: async () => (await import("../src/api/openai-responses.ts")).stream,
+			api: "openai-responses" as const,
+			baseUrl: "https://api.openai.com/v1",
+		},
+		{
+			name: "azure-openai-responses",
+			load: async () => (await import("../src/api/azure-openai-responses.ts")).stream,
+			api: "azure-openai-responses" as const,
+			baseUrl: "https://example.openai.azure.com/openai",
+		},
+	];
+
+	for (const testCase of cases) {
+		it(`${testCase.name} refuses before any network call`, async () => {
+			const streamFn = await testCase.load();
+			const providerModel = {
+				...model,
+				api: testCase.api,
+				baseUrl: testCase.baseUrl,
+			} as unknown as typeof model;
+			const fetchMock = vi.fn(async () => new Response("should not be called", { status: 500 }));
+			vi.stubGlobal("fetch", fetchMock);
+
+			const result = await streamFn(
+				providerModel as never,
+				{ messages: [toolResult("call_orphan")], tools: [] } as never,
+				{ apiKey: mockToken(), transport: "sse" } as never,
+			).result();
+
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toContain("empty input");
+
+			vi.unstubAllGlobals();
+		});
+	}
+});
+
 describe("the refusal is terminal, not a retryable provider error", () => {
 	const refused = new EmptyRequestInputError("all 1 message(s) in the context produced no input items");
 

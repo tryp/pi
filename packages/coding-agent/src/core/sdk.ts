@@ -22,7 +22,7 @@ import { createLocalCacheTelemetryWriter } from "./cache-telemetry.ts";
 import { estimateProviderContextTokens } from "./compaction/compaction.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
-import { convertToLlm, isProviderUserInputMessage } from "./messages.ts";
+import { convertToLlm, hasProviderInputContent, isProviderUserInputMessage } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
@@ -217,7 +217,12 @@ export function enforceRequestContextBudget(
 	const pendingCalls = new Set<string>();
 	for (let boundary = 0; boundary < messages.length; boundary++) {
 		const message = messages[boundary]!;
-		if (boundary > 0 && pendingCalls.size === 0 && isProviderUserInputMessage(message)) {
+		if (
+			boundary > 0 &&
+			pendingCalls.size === 0 &&
+			isProviderUserInputMessage(message) &&
+			hasProviderInputContent(message)
+		) {
 			const suffix = messages.slice(boundary);
 			const suffixCalls = new Set<string>();
 			const suffixCallIds = new Set<string>();
