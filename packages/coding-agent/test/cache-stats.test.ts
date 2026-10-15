@@ -21,6 +21,7 @@ function assistant(options: {
 	cacheWrite?: number;
 	cost?: Partial<typeof zeroCost>;
 	model?: string;
+	stopReason?: AssistantMessage["stopReason"];
 	timestamp?: number;
 }): AssistantMessage {
 	return {
@@ -37,7 +38,7 @@ function assistant(options: {
 			totalTokens: 0,
 			cost: { ...zeroCost, ...options.cost },
 		},
-		stopReason: "stop",
+		stopReason: options.stopReason ?? "stop",
 		timestamp: options.timestamp ?? 0,
 	} as AssistantMessage;
 }
@@ -86,6 +87,45 @@ describe("computeCacheWaste", () => {
 		expect(totals.missCount).toBe(1);
 	});
 
+	it.each(["error", "aborted"] as const)("does not count partial cache usage from %s turns", (stopReason) => {
+		const unsuccessful = assistant({
+			cacheWrite: 110_000,
+			cost: { cacheWrite: 0.4125 },
+			stopReason,
+			timestamp: 120_000,
+		});
+		const entries = [entry(turn1), entry(turn2), entry(unsuccessful)];
+		const totals = computeCacheWaste(entries, models);
+		expect(totals.missedTokens).toBe(0);
+		expect(totals.missCount).toBe(0);
+		expect(collectCacheMisses(entries, models).size).toBe(0);
+	});
+
+	it.each(["error", "aborted"] as const)(
+		"ignores %s usage when selecting the next successful baseline",
+		(stopReason) => {
+			const unsuccessful = assistant({
+				cacheWrite: 500_000,
+				cost: { cacheWrite: 1.875 },
+				stopReason,
+				timestamp: 120_000,
+			});
+			const nextSuccessful = assistant({ cacheWrite: 110_000, cost: { cacheWrite: 0.4125 }, timestamp: 180_000 });
+			const entries = [entry(turn1), entry(turn2), entry(unsuccessful), entry(nextSuccessful)];
+			const totals = computeCacheWaste(entries, models);
+			expect(totals.missedTokens).toBe(105_000);
+			expect(totals.missCount).toBe(1);
+			expect(collectCacheMisses(entries, models).get(nextSuccessful)?.missedTokens).toBe(105_000);
+			expect(collectCacheMisses(entries, models).has(unsuccessful)).toBe(false);
+
+			const uncachedBefore = assistant({ input: 100_000 });
+			const uncachedAfter = assistant({ input: 110_000, timestamp: 180_000 });
+			const uncachedEntries = [entry(uncachedBefore), entry(unsuccessful), entry(uncachedAfter)];
+			expect(computeCacheWaste(uncachedEntries, models).missedTokens).toBe(0);
+			expect(collectCacheMisses(uncachedEntries, models).size).toBe(0);
+		},
+	);
+
 	it("skips providers that report no cache activity", () => {
 		const a = assistant({ input: 100_000 });
 		const b = assistant({ input: 110_000 });
@@ -125,6 +165,16 @@ describe("detectCacheMiss", () => {
 		const miss = detectCacheMiss([entry(turn1), entry(turn2)], otherModel, models);
 		expect(miss?.missedTokens).toBe(105_000);
 		expect(miss?.modelChanged).toBe(true);
+	});
+
+	it("evaluates direct error targets as supplied", () => {
+		const errorMessage = assistant({
+			cacheWrite: 110_000,
+			cost: { cacheWrite: 0.4125 },
+			stopReason: "error",
+			timestamp: 120_000,
+		});
+		expect(detectCacheMiss([entry(turn1), entry(turn2)], errorMessage, models)?.missedTokens).toBe(105_000);
 	});
 
 	it("returns undefined for healthy turns", () => {

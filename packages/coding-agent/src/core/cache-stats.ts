@@ -117,7 +117,12 @@ function scan(
 			prev = undefined;
 			continue;
 		}
-		if (entry.type === "message" && entry.message.role === "assistant") {
+		if (
+			entry.type === "message" &&
+			entry.message.role === "assistant" &&
+			entry.message.stopReason !== "error" &&
+			entry.message.stopReason !== "aborted"
+		) {
 			const miss = detectMiss(prev, entry.message, models);
 			if (miss) {
 				totals.missedTokens += miss.missedTokens;
@@ -154,6 +159,8 @@ export function collectCacheMisses(
 /**
  * Detect a cache miss on a just-completed assistant message.
  * `entries` must not yet contain `message` (message_end fires before persistence).
+ * Unlike historical scans, this evaluates `message` as supplied, including error or aborted targets;
+ * callers that report only successful requests must filter those targets themselves.
  */
 export function detectCacheMiss(
 	entries: SessionEntry[],

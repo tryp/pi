@@ -559,6 +559,7 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 			requestOptions: "unknown",
 			input: "unknown",
 			inputCardinality: "unknown",
+			inputCount: "unknown",
 		});
 		expect(await observe(structuredClone(baseBody), true)).toEqual({
 			cacheIdentity: "unchanged",
@@ -570,6 +571,7 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 			requestOptions: "unchanged",
 			input: "unchanged",
 			inputCardinality: "unchanged",
+			inputCount: "same",
 		});
 		const changedBody = structuredClone(baseBody);
 		changedBody.prompt_cache_key = "different-private-cache-key";
@@ -589,13 +591,128 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 			requestOptions: "changed",
 			input: "changed",
 			inputCardinality: "unchanged",
+			inputCount: "grown",
 		});
+		// `input: changed` alone cannot tell this apart from the append above; the length relation
+		// can. Same length and different content is a rewrite, which invalidates a provider prefix.
+		const rewrittenBody = structuredClone(changedBody);
+		rewrittenBody.input[0] = { role: "user", content: `rewritten ${privacySentinel}` };
+		expect(await observe(rewrittenBody, true)).toEqual(
+			expect.objectContaining({ input: "changed", inputCardinality: "unchanged", inputCount: "same" }),
+		);
 		const unmatchedFirst = structuredClone(changedBody);
 		unmatchedFirst.prompt_cache_key = "unmatched-private-key-one";
 		const unmatchedSecond = structuredClone(unmatchedFirst);
 		unmatchedSecond.prompt_cache_key = "unmatched-private-key-two";
 		expect((await observe(unmatchedFirst, false))?.cacheIdentity).toBe("unknown");
 		expect((await observe(unmatchedSecond, false))?.cacheIdentity).toBe("unknown");
+		assertTelemetryPrivacy(telemetry.records);
+	});
+
+	it("names why a prefix comparison did not happen instead of reporting an ambiguous zero", async () => {
+		const telemetry = createTelemetryCollector();
+		const observe = async (messages: number, phase: "canonical_body" | "final_wire_body" = "canonical_body") => {
+			const payload = {
+				model: "gpt-6-luna",
+				instructions: `private ${privacySentinel}`,
+				input: Array.from({ length: messages }, (_, index) => ({
+					role: "user",
+					content: `message ${index} ${privacySentinel}`,
+				})),
+			};
+			const ids = telemetry.observer.observeRequest({
+				provider: "openai-codex",
+				model: codexModel.id,
+				phase,
+				transport: "sse",
+				payload,
+				wirePayload: JSON.stringify(payload),
+			});
+			telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
+			await telemetry.observer.flush();
+			return requestRecords(telemetry.records).at(-1);
+		};
+
+		// A first request in the lane has nothing to compare against, and says so. The recorded
+		// zero must not read as "the entire prefix changed".
+		const first = await observe(2);
+		expect(first).toMatchObject({
+			prefixComparable: true,
+			previousCommonPrefixSegments: 0,
+			previousSegmentCount: 0,
+			comparisonUnavailableCause: "no_predecessor",
+		});
+		expect(first?.comparisonBasis).toBeUndefined();
+
+		// An append-only turn gets an exact comparison over every retained segment.
+		const appended = await observe(3);
+		expect(appended).toMatchObject({
+			prefixComparable: true,
+			previousCommonPrefixSegments: 3,
+			previousSegmentCount: 3,
+			comparisonBasis: "complete",
+		});
+		expect(appended?.comparisonUnavailableCause).toBeUndefined();
+
+		// Exceeding the segment cap truncates this fingerprint but must not wipe the lane: the
+		// retained segments are still a usable prefix, and the answer is marked as a bound.
+		const truncated = await observe(400);
+		expect(truncated).toMatchObject({
+			fingerprintStatus: "truncated",
+			prefixComparable: true,
+			comparisonBasis: "bounded_truncated",
+			previousSegmentCount: 4,
+		});
+		// This is the regression: the record after a truncated predecessor used to report a
+		// zero-length common prefix for a comparison that never ran.
+		const afterTruncation = await observe(401);
+		expect(afterTruncation).toMatchObject({ comparisonBasis: "bounded_truncated" });
+		expect(afterTruncation?.comparisonUnavailableCause).toBeUndefined();
+		expect(afterTruncation?.previousSegmentCount).toBe(128);
+		expect(afterTruncation?.previousCommonPrefixSegments).toBe(128);
+
+		// A final-wire record is not comparison eligible, and now names that as the reason.
+		const wire = await observe(2, "final_wire_body");
+		expect(wire).toMatchObject({
+			prefixComparable: false,
+			previousCommonPrefixSegments: 0,
+			comparisonUnavailableCause: "not_comparison_eligible",
+		});
+		assertTelemetryPrivacy(telemetry.records);
+	});
+
+	it("names an unfingerprintable predecessor instead of reporting a broken prefix", async () => {
+		const telemetry = createTelemetryCollector();
+		const observe = async (payload: Record<string, unknown>, wirePayload: string | undefined) => {
+			const ids = telemetry.observer.observeRequest({
+				provider: "openai-codex",
+				model: codexModel.id,
+				phase: "canonical_body",
+				transport: "sse",
+				payload,
+				wirePayload,
+			});
+			telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
+			await telemetry.observer.flush();
+			return requestRecords(telemetry.records).at(-1);
+		};
+		const body = { model: "gpt-6-luna", input: [{ role: "user", content: `private ${privacySentinel}` }] };
+
+		const unavailable = await observe(body, undefined);
+		expect(unavailable).toMatchObject({
+			fingerprintStatus: "unavailable",
+			comparisonUnavailableCause: "fingerprint_unavailable",
+		});
+
+		// The predecessor existed but was never fingerprinted. `previousCommonPrefixSegments: 0`
+		// here means "unknown", not "the prefix broke", and the cause says which one it is.
+		const after = await observe(body, JSON.stringify(body));
+		expect(after).toMatchObject({
+			fingerprintStatus: "ok",
+			previousCommonPrefixSegments: 0,
+			previousSegmentCount: 0,
+			comparisonUnavailableCause: "predecessor_not_recorded",
+		});
 		assertTelemetryPrivacy(telemetry.records);
 	});
 

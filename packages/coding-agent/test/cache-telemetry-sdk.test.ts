@@ -435,12 +435,14 @@ it("refuses an oversized transformed context before any Codex provider submissio
 	}
 });
 
-it("activates SDK telemetry only for exact opt-in and writes paired private local records", async () => {
+it("activates SDK telemetry by default and writes paired private local records unless explicitly opted out", async () => {
 	const previous = process.env.PI_CACHE_TELEMETRY;
 	const directories: string[] = [];
 	try {
-		for (const value of ["0", "true", "1"]) {
-			process.env.PI_CACHE_TELEMETRY = value;
+		// `undefined` means the variable is unset, which is the default-on case.
+		for (const value of ["0", "false", undefined, "1", "true"]) {
+			if (value === undefined) delete process.env.PI_CACHE_TELEMETRY;
+			else process.env.PI_CACHE_TELEMETRY = value;
 			const agentDir = mkdtempSync(join(tmpdir(), "pi-cache-sdk-offline-"));
 			directories.push(agentDir);
 			const { session } = await createAgentSession({
@@ -449,7 +451,7 @@ it("activates SDK telemetry only for exact opt-in and writes paired private loca
 				sessionManager: SessionManager.inMemory(),
 			});
 			const observer = (session.agent as unknown as { cacheTelemetry?: CacheTelemetryObserver }).cacheTelemetry;
-			if (value !== "1") {
+			if (value === "0" || value === "false") {
 				expect(observer).toBeUndefined();
 				session.dispose();
 				continue;

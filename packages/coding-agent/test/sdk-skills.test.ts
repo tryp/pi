@@ -38,16 +38,47 @@ This is a test skill.
 		}
 	});
 
-	it("keeps cache telemetry disabled when its opt-in environment variable is unset", async () => {
+	it("keeps cache telemetry disabled only when it is explicitly opted out", async () => {
 		const previous = process.env.PI_CACHE_TELEMETRY;
 		delete process.env.PI_CACHE_TELEMETRY;
 		try {
-			await createAgentSession({
+			// Unset is the default-on case: a session that is never told anything still
+			// records, because the incident this exists to explain cannot be reconstructed
+			// from a flag nobody turned on.
+			const defaulted = await createAgentSession({
 				cwd: tempDir,
 				agentDir: tempDir,
 				sessionManager: SessionManager.inMemory(),
 			});
-			expect(existsSync(join(tempDir, "cache-telemetry"))).toBe(false);
+			expect(existsSync(join(tempDir, "cache-telemetry"))).toBe(true);
+			await defaulted.session.dispose();
+			rmSync(join(tempDir, "cache-telemetry"), { recursive: true, force: true });
+
+			// Every spelling an explicit opt-out already used must still disable: before the
+			// default flipped, any value except "1" disabled telemetry, so "off"/"no" are
+			// opt-outs users may already have set. "" and "1" stay on.
+			for (const value of ["0", "false", "off", "no", " OFF "]) {
+				process.env.PI_CACHE_TELEMETRY = value;
+				const disabled = await createAgentSession({
+					cwd: tempDir,
+					agentDir: tempDir,
+					sessionManager: SessionManager.inMemory(),
+				});
+				expect(existsSync(join(tempDir, "cache-telemetry")), value).toBe(false);
+				await disabled.session.dispose();
+			}
+
+			for (const value of ["1", ""]) {
+				process.env.PI_CACHE_TELEMETRY = value;
+				const enabled = await createAgentSession({
+					cwd: tempDir,
+					agentDir: tempDir,
+					sessionManager: SessionManager.inMemory(),
+				});
+				expect(existsSync(join(tempDir, "cache-telemetry")), value).toBe(true);
+				await enabled.session.dispose();
+				rmSync(join(tempDir, "cache-telemetry"), { recursive: true, force: true });
+			}
 		} finally {
 			if (previous === undefined) delete process.env.PI_CACHE_TELEMETRY;
 			else process.env.PI_CACHE_TELEMETRY = previous;

@@ -4,6 +4,37 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 export type CacheOperationKind = "handler" | "final_context";
 export type CacheOperationReason = "unchanged" | "history_rewrite" | "append" | "shrink" | "unavailable" | "failed";
 
+/**
+ * Every `unavailable` observation names its cause. Without this field the single
+ * `unavailable` bucket conflates an absent hook annotation with an exhausted snapshot
+ * budget, and the record cannot be acted on.
+ */
+export type CacheOperationUnavailableCause =
+	/** The hook returned no annotation at all; distinct from one that was unusable. */
+	| "no_annotation"
+	| "unusable_annotation"
+	/** The observation carries an annotation but no before/after comparison was made. */
+	| "no_comparison"
+	/** The compared side did not exist. */
+	| "no_before_context"
+	| "no_after_context"
+	/** No usable predecessor snapshot exists for this lane. */
+	| "no_prior_request"
+	/** The snapshot walk stopped; `observedCount` says how much it managed to digest. */
+	| "not_an_array"
+	| "unusable_message"
+	| "too_many_messages"
+	| "oversized_message"
+	| "snapshot_budget_exhausted"
+	| "unusable_system_prompt"
+	| "unusable_tools"
+	/** Observations were lost before they could be recorded. */
+	| "pending_queue_overflow"
+	| "observation_dropped";
+
+/** How an across-request comparison obtained its predecessor. */
+export type CacheOperationComparisonBasis = "first_request" | "prior_available" | "prior_unavailable";
+
 export interface CacheOperationAnnotationData {
 	reason: "sidecar_gate" | "plan_marker_filter" | "auto_continue_filter" | "unavailable";
 	counters?: Record<string, number>;
@@ -29,6 +60,9 @@ export interface CacheOperationRecord {
 	operationClass?: "agent_main" | "unknown";
 	roleCounts?: Record<string, number> | null;
 	stopReasonCounts?: Record<string, number> | null;
+	unavailableCause?: CacheOperationUnavailableCause;
+	observedCount?: number;
+	comparisonBasis?: CacheOperationComparisonBasis;
 }
 
 export interface CacheOperationObservation {
@@ -45,6 +79,9 @@ export interface CacheOperationObservation {
 	operationClass?: "agent_main" | "unknown";
 	roleCounts?: Record<string, number> | null;
 	stopReasonCounts?: Record<string, number> | null;
+	unavailableCause?: CacheOperationUnavailableCause;
+	observedCount?: number;
+	comparisonBasis?: CacheOperationComparisonBasis;
 }
 
 export interface CacheOperationContextSnapshot {
@@ -60,20 +97,44 @@ interface MessageSnapshot {
 
 const MAX_MESSAGES = 4096;
 const MAX_CONTENT_PARTS = 4096;
-const MAX_TEXT_BYTES = 1024 * 1024;
+// Per-message ceiling. Measured over 65 sessions: the largest single message was 1,465
+// nodes / 43 KiB, so these stand at roughly 2.8x and 3x that tail.
+const MAX_MESSAGE_NODES = 4096;
+const MAX_MESSAGE_TEXT_BYTES = 128 * 1024;
+// Whole-snapshot ceiling from the same 65 sessions: 2x p95 (20,456 nodes, 1.08 MiB).
+// The budget is per message, so one expensive message cannot blind the messages after it;
+// the snapshot ceiling is what stops runaway growth, and the walk reports how far it got.
+const MAX_SNAPSHOT_NODES = 41_000;
+const MAX_SNAPSHOT_TEXT_BYTES = 4 * 1024 * 1024;
+const MAX_DEPTH = 24;
+
+interface FingerprintBudget {
+	nodes: number;
+	textBytes: number;
+	nodeCap: number;
+	textCap: number;
+}
+
+function newBudget(nodeCap = MAX_MESSAGE_NODES, textCap = MAX_MESSAGE_TEXT_BYTES): FingerprintBudget {
+	return { nodes: 0, textBytes: 0, nodeCap, textCap };
+}
 
 function digest(key: Uint8Array, value: string): string {
 	return createHmac("sha256", key).update(value).digest("hex");
 }
 
-function boundedFingerprint(value: unknown, key: Uint8Array, budget = { nodes: 0, textBytes: 0 }): string | undefined {
+function boundedFingerprint(
+	value: unknown,
+	key: Uint8Array,
+	budget: FingerprintBudget = newBudget(),
+): string | undefined {
 	const state = budget;
 	const visit = (item: unknown, depth: number): string | undefined => {
-		if (++state.nodes > 8192 || depth > 24) return undefined;
+		if (++state.nodes > state.nodeCap || depth > MAX_DEPTH) return undefined;
 		if (item === null || typeof item === "boolean" || typeof item === "number") return String(item);
 		if (typeof item === "string") {
 			state.textBytes += Buffer.byteLength(item, "utf8");
-			if (state.textBytes > MAX_TEXT_BYTES) return undefined;
+			if (state.textBytes > state.textCap) return undefined;
 			return digest(key, item);
 		}
 		if (typeof item !== "object") return undefined;
@@ -114,11 +175,16 @@ export function cloneMessagesForObservation(messages: unknown): AgentMessage[] |
 	try {
 		if (!Array.isArray(messages) || messages.length > MAX_MESSAGES) return undefined;
 		const copy: AgentMessage[] = [];
-		const budget = { nodes: 0, textBytes: 0 };
+		const total = { nodes: 0, textBytes: 0 };
 		for (let index = 0; index < messages.length; index++) {
 			const descriptor = Object.getOwnPropertyDescriptor(messages, String(index));
 			if (!descriptor || !("value" in descriptor)) return undefined;
+			// A per-message budget: one expensive message must not blind every message after it.
+			const budget = newBudget();
 			copy.push(cloneBounded(descriptor.value, 0, budget) as AgentMessage);
+			total.nodes += budget.nodes;
+			total.textBytes += budget.textBytes;
+			if (total.nodes > MAX_SNAPSHOT_NODES || total.textBytes > MAX_SNAPSHOT_TEXT_BYTES) return undefined;
 		}
 		return copy;
 	} catch {
@@ -126,33 +192,69 @@ export function cloneMessagesForObservation(messages: unknown): AgentMessage[] |
 	}
 }
 
-function messageSnapshot(messages: unknown, key: Uint8Array): MessageSnapshot | undefined {
-	if (!Array.isArray(messages) || messages.length > MAX_MESSAGES) return undefined;
-	const digests: string[] = [];
-	const budget = { nodes: 0, textBytes: 0 };
-	for (let index = 0; index < messages.length; index++) {
-		const descriptor = Object.getOwnPropertyDescriptor(messages, String(index));
-		if (
-			!descriptor ||
-			!("value" in descriptor) ||
-			typeof descriptor.value !== "object" ||
-			descriptor.value === null
-		) {
-			return undefined;
-		}
-		const messageDigest = boundedFingerprint(descriptor.value, key, budget);
-		if (messageDigest === undefined) return undefined;
-		digests.push(messageDigest);
-	}
-	return { count: messages.length, digests };
+interface MessageSnapshot {
+	count: number;
+	digests: string[];
+	/** How many messages were actually digested; equals `count` when `cause` is undefined. */
+	observed: number;
+	cause?: CacheOperationUnavailableCause;
 }
 
-function cloneBounded(value: unknown, depth: number, budget: { nodes: number; textBytes: number }): unknown {
-	if (++budget.nodes > 8192 || depth > 24) throw new Error("unavailable");
+interface MessageClassification {
+	reason: CacheOperationReason;
+	cause?: CacheOperationUnavailableCause;
+	observedCount?: number;
+}
+
+function emptySnapshot(cause: CacheOperationUnavailableCause, count = 0): MessageSnapshot {
+	return { count, digests: [], observed: 0, cause };
+}
+
+/**
+ * Fingerprint an ordered message list. A failure returns the messages it did observe plus a
+ * cause, instead of `undefined`, so a truncated observation stays distinguishable from an
+ * absent one and the record can say which happened.
+ */
+function messageSnapshot(messages: unknown, key: Uint8Array): MessageSnapshot {
+	if (!Array.isArray(messages)) return emptySnapshot("not_an_array");
+	if (messages.length > MAX_MESSAGES) return emptySnapshot("too_many_messages", messages.length);
+	const digests: string[] = [];
+	const total = { nodes: 0, textBytes: 0 };
+	for (let index = 0; index < messages.length; index++) {
+		const descriptor = Object.getOwnPropertyDescriptor(messages, String(index));
+		const item = descriptor && "value" in descriptor ? descriptor.value : undefined;
+		if (item === undefined || typeof item !== "object" || item === null) {
+			return { count: messages.length, digests, observed: index, cause: "unusable_message" };
+		}
+		const budget = newBudget();
+		const messageDigest = boundedFingerprint(item, key, budget);
+		if (messageDigest === undefined) {
+			return {
+				count: messages.length,
+				digests,
+				observed: index,
+				cause:
+					budget.nodes > budget.nodeCap || budget.textBytes > budget.textCap
+						? "oversized_message"
+						: "unusable_message",
+			};
+		}
+		total.nodes += budget.nodes;
+		total.textBytes += budget.textBytes;
+		if (total.nodes > MAX_SNAPSHOT_NODES || total.textBytes > MAX_SNAPSHOT_TEXT_BYTES) {
+			return { count: messages.length, digests, observed: index, cause: "snapshot_budget_exhausted" };
+		}
+		digests.push(messageDigest);
+	}
+	return { count: messages.length, digests, observed: messages.length };
+}
+
+function cloneBounded(value: unknown, depth: number, budget: FingerprintBudget): unknown {
+	if (++budget.nodes > budget.nodeCap || depth > MAX_DEPTH) throw new Error("unavailable");
 	if (value === null || typeof value === "boolean" || typeof value === "number") return value;
 	if (typeof value === "string") {
 		budget.textBytes += Buffer.byteLength(value, "utf8");
-		if (budget.textBytes > MAX_TEXT_BYTES) throw new Error("unavailable");
+		if (budget.textBytes > budget.textCap) throw new Error("unavailable");
 		return value;
 	}
 	if (typeof value !== "object") throw new Error("unavailable");
@@ -182,12 +284,11 @@ function cloneBounded(value: unknown, depth: number, budget: { nodes: number; te
 export function cloneToolsForObservation(tools: readonly unknown[]): readonly unknown[] | undefined {
 	try {
 		if (!Array.isArray(tools) || tools.length > 256) return undefined;
-		const budget = { nodes: 0, textBytes: 0 };
 		const copy: unknown[] = [];
 		for (let index = 0; index < tools.length; index++) {
 			const descriptor = Object.getOwnPropertyDescriptor(tools, String(index));
 			if (!descriptor || !("value" in descriptor)) return undefined;
-			copy.push(cloneBounded(descriptor.value, 0, budget));
+			copy.push(cloneBounded(descriptor.value, 0, newBudget()));
 		}
 		return copy;
 	} catch {
@@ -200,11 +301,14 @@ function toolFingerprint(tools: readonly unknown[], key: Uint8Array): string | u
 	return boundedFingerprint(tools, key);
 }
 
-function classifyMessages(
-	before: MessageSnapshot | undefined,
-	after: MessageSnapshot | undefined,
-): CacheOperationReason {
-	if (!before || !after) return "unavailable";
+function classifyMessages(before: MessageSnapshot, after: MessageSnapshot): MessageClassification {
+	if (before.cause !== undefined || after.cause !== undefined) {
+		return {
+			reason: "unavailable",
+			cause: before.cause ?? after.cause,
+			observedCount: Math.min(before.observed, after.observed),
+		};
+	}
 	const commonLength = Math.min(before.count, after.count);
 	let firstDifference = commonLength;
 	for (let index = 0; index < commonLength; index++) {
@@ -213,9 +317,9 @@ function classifyMessages(
 			break;
 		}
 	}
-	if (firstDifference === commonLength && before.count === after.count) return "unchanged";
-	if (firstDifference < commonLength) return "history_rewrite";
-	return after.count > before.count ? "append" : "shrink";
+	if (firstDifference === commonLength && before.count === after.count) return { reason: "unchanged" };
+	if (firstDifference < commonLength) return { reason: "history_rewrite" };
+	return { reason: after.count > before.count ? "append" : "shrink" };
 }
 
 function messageCategories(messages: unknown): Pick<CacheOperationObservation, "roleCounts" | "stopReasonCounts"> {
@@ -261,11 +365,13 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 	const key = randomBytes(32);
 	let sequence = 0;
 	let dropped = 0;
+	// True when a request happened but its snapshot was too incomplete to become a baseline.
+	let priorUnavailable = false;
 	let previousFinal:
 		| {
-				messages?: MessageSnapshot;
-				systemPrompt?: string;
-				tools?: string;
+				messages: MessageSnapshot;
+				systemPrompt: string;
+				tools: string;
 				messageCount: number | null;
 				toolCount: number | null;
 				systemPromptLength: number;
@@ -281,41 +387,57 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 			failed = false,
 			annotation?: unknown,
 		): void {
-			let before: MessageSnapshot | undefined;
-			let after: MessageSnapshot | undefined;
+			let before = emptySnapshot("no_before_context");
+			let after = emptySnapshot("no_after_context");
 			try {
-				before = beforeMessages ? messageSnapshot(beforeMessages, key) : undefined;
-				after = messageSnapshot(afterMessages, key);
+				if (beforeMessages !== undefined) before = messageSnapshot(beforeMessages, key);
+				if (afterMessages !== undefined) after = messageSnapshot(afterMessages, key);
 			} catch {
-				before = undefined;
-				after = undefined;
+				before = emptySnapshot("not_an_array");
+				after = emptySnapshot("not_an_array");
 			}
+			const classification: MessageClassification = failed
+				? { reason: "failed" }
+				: classifyMessages(before, after);
+			const safeAnnotation = sanitizeAnnotation(annotation);
 			try {
 				onObservation({
 					surface: "messages",
 					operation: "handler",
-					reason: failed ? "failed" : classifyMessages(before, after),
+					reason: classification.reason,
 					handlerIndex,
 					durationMs: Math.max(0, Math.min(60_000, Math.round(durationMs))),
-					beforeCount: before?.count ?? null,
-					afterCount: after?.count ?? null,
-					...(annotation === undefined ? {} : { annotation: sanitizeAnnotation(annotation) }),
+					beforeCount: beforeMessages === undefined ? null : before.count,
+					afterCount: afterMessages === undefined ? null : after.count,
+					...(classification.cause === undefined ? {} : { unavailableCause: classification.cause }),
+					...(classification.observedCount === undefined ? {} : { observedCount: classification.observedCount }),
+					...(safeAnnotation === undefined ? {} : { annotation: safeAnnotation }),
 				});
 			} catch {
 				dropped = Math.min(1_000_000, dropped + 1);
 			}
 		},
 		observeAnnotation(surface: "tool_result", annotation: unknown, handlerIndex: number, durationMs: number): void {
+			// Absence and corruption are different facts, and neither is an annotation. Never write
+			// an annotation object that carries no reason: the reader cannot tell it from a real one.
+			const safeAnnotation = sanitizeAnnotation(annotation);
+			const unavailableCause: CacheOperationUnavailableCause =
+				safeAnnotation !== undefined
+					? "no_comparison"
+					: annotation === undefined
+						? "no_annotation"
+						: "unusable_annotation";
 			try {
 				onObservation({
 					surface,
 					operation: "handler",
 					reason: "unavailable",
+					unavailableCause,
 					handlerIndex,
 					durationMs: Math.max(0, Math.min(60_000, Math.round(durationMs))),
 					beforeCount: null,
 					afterCount: null,
-					annotation: sanitizeAnnotation(annotation),
+					...(safeAnnotation === undefined ? {} : { annotation: safeAnnotation }),
 				});
 			} catch {
 				dropped = Math.min(1_000_000, dropped + 1);
@@ -328,22 +450,22 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 			contextStage: "post_context" | "stream_input" = "stream_input",
 			operationClass: "agent_main" | "unknown" = "unknown",
 		): void {
-			let beforeMessages: MessageSnapshot | undefined;
-			let afterMessages: MessageSnapshot | undefined;
+			let beforeMessages = emptySnapshot("no_before_context");
+			let afterMessages = emptySnapshot("no_after_context");
 			let beforeTools: string | undefined;
 			let afterTools: string | undefined;
 			let beforePrompt: string | undefined;
 			let afterPrompt: string | undefined;
 			try {
-				beforeMessages = messageSnapshot(before.messages, key);
-				afterMessages = messageSnapshot(after.messages, key);
-				beforeTools = before.tools ? toolFingerprint(before.tools, key) : undefined;
-				afterTools = after.tools ? toolFingerprint(after.tools, key) : undefined;
+				if (before.messages !== undefined) beforeMessages = messageSnapshot(before.messages, key);
+				if (after.messages !== undefined) afterMessages = messageSnapshot(after.messages, key);
+				beforeTools = toolFingerprint(before.tools ?? [], key);
+				afterTools = toolFingerprint(after.tools ?? [], key);
 				beforePrompt = boundedFingerprint(before.systemPrompt, key);
 				afterPrompt = boundedFingerprint(after.systemPrompt, key);
 			} catch {
-				beforeMessages = undefined;
-				afterMessages = undefined;
+				beforeMessages = emptySnapshot("not_an_array");
+				afterMessages = emptySnapshot("not_an_array");
 				beforeTools = undefined;
 				afterTools = undefined;
 				beforePrompt = undefined;
@@ -353,21 +475,49 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 				messages: afterMessages,
 				systemPrompt: afterPrompt,
 				tools: afterTools,
-				messageCount: afterMessages?.count ?? null,
-				toolCount: afterTools === undefined ? null : (after.tools?.length ?? null),
+				messageCount: afterMessages.cause === undefined ? afterMessages.count : null,
+				toolCount: afterTools === undefined ? null : (after.tools?.length ?? 0),
 				systemPromptLength: after.systemPrompt.length,
 			};
 			const prior = previousFinal;
-			if (contextStage === "stream_input") previousFinal = currentFinal;
+			if (contextStage === "stream_input") {
+				// Only a complete snapshot may become the next request's baseline. Advancing on a
+				// partial one makes the following comparison compare against a truncated history and
+				// report the difference as "unchanged".
+				if (afterMessages.cause === undefined && afterTools !== undefined && afterPrompt !== undefined) {
+					// Rebuilt inside the guard: a narrowed `let` does not narrow the object built from it
+					// before the check.
+					previousFinal = {
+						messages: afterMessages,
+						systemPrompt: afterPrompt,
+						tools: afterTools,
+						messageCount: afterMessages.count,
+						toolCount: after.tools?.length ?? 0,
+						systemPromptLength: after.systemPrompt.length,
+					};
+				} else {
+					previousFinal = undefined;
+					priorUnavailable = true;
+				}
+			}
+			const comparisonBasis: CacheOperationComparisonBasis =
+				prior !== undefined ? "prior_available" : priorUnavailable ? "prior_unavailable" : "first_request";
+			const withinMessages = classifyMessages(beforeMessages, afterMessages);
+			const acrossMessages: MessageClassification =
+				prior === undefined
+					? { reason: "unavailable", cause: "no_prior_request", observedCount: afterMessages.observed }
+					: classifyMessages(prior.messages, afterMessages);
 			const surfaces: Array<CacheOperationObservation> = [
 				{
 					surface: "messages",
 					operation: "final_context",
-					reason: classifyMessages(beforeMessages, afterMessages),
-					beforeCount: beforeMessages?.count ?? null,
-					afterCount: afterMessages?.count ?? null,
+					reason: withinMessages.reason,
+					beforeCount: before.messages === undefined ? null : beforeMessages.count,
+					afterCount: after.messages === undefined ? null : afterMessages.count,
 					durationMs,
 					comparisonScope: "within_request",
+					...(withinMessages.cause === undefined ? {} : { unavailableCause: withinMessages.cause }),
+					...(withinMessages.observedCount === undefined ? {} : { observedCount: withinMessages.observedCount }),
 				},
 				{
 					surface: "system_prompt",
@@ -378,6 +528,9 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 							: beforePrompt === afterPrompt
 								? "unchanged"
 								: "history_rewrite",
+					...(beforePrompt === undefined || afterPrompt === undefined
+						? { unavailableCause: "unusable_system_prompt" as const }
+						: {}),
 					beforeCount: before.systemPrompt.length,
 					afterCount: after.systemPrompt.length,
 					durationMs,
@@ -392,7 +545,10 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 							: beforeTools === afterTools
 								? "unchanged"
 								: "history_rewrite",
-					beforeCount: beforeTools === undefined ? null : (before.tools?.length ?? null),
+					...(beforeTools === undefined || afterTools === undefined
+						? { unavailableCause: "unusable_tools" as const }
+						: {}),
+					beforeCount: beforeTools === undefined ? null : (before.tools?.length ?? 0),
 					afterCount: currentFinal.toolCount,
 					durationMs,
 					comparisonScope: "within_request",
@@ -400,41 +556,54 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 				{
 					surface: "messages",
 					operation: "final_context",
-					reason: prior ? classifyMessages(prior.messages, afterMessages) : "unavailable",
+					reason: acrossMessages.reason,
 					beforeCount: prior?.messageCount ?? null,
 					afterCount: currentFinal.messageCount,
 					durationMs,
 					comparisonScope: "across_requests",
+					comparisonBasis,
+					...(acrossMessages.cause === undefined ? {} : { unavailableCause: acrossMessages.cause }),
+					...(acrossMessages.observedCount === undefined ? {} : { observedCount: acrossMessages.observedCount }),
 				},
 				{
 					surface: "system_prompt",
 					operation: "final_context",
 					reason:
-						prior?.systemPrompt === undefined
+						prior === undefined || afterPrompt === undefined
 							? "unavailable"
-							: afterPrompt === undefined
-								? "unavailable"
-								: prior.systemPrompt === afterPrompt
-									? "unchanged"
-									: "history_rewrite",
-					beforeCount: prior?.systemPrompt === undefined ? null : prior.systemPromptLength,
+							: prior.systemPrompt === afterPrompt
+								? "unchanged"
+								: "history_rewrite",
+					...(prior === undefined
+						? { unavailableCause: "no_prior_request" as const }
+						: afterPrompt === undefined
+							? { unavailableCause: "unusable_system_prompt" as const }
+							: {}),
+					beforeCount: prior?.systemPromptLength ?? null,
 					afterCount: currentFinal.systemPromptLength,
 					durationMs,
 					comparisonScope: "across_requests",
+					comparisonBasis,
 				},
 				{
 					surface: "tools",
 					operation: "final_context",
 					reason:
-						prior?.tools === undefined || afterTools === undefined
+						prior === undefined || prior.tools === undefined || afterTools === undefined
 							? "unavailable"
 							: prior.tools === afterTools
 								? "unchanged"
 								: "history_rewrite",
+					...(prior === undefined
+						? { unavailableCause: "no_prior_request" as const }
+						: prior.tools === undefined || afterTools === undefined
+							? { unavailableCause: "unusable_tools" as const }
+							: {}),
 					beforeCount: prior?.toolCount ?? null,
 					afterCount: currentFinal.toolCount,
 					durationMs,
 					comparisonScope: "across_requests",
+					comparisonBasis,
 				},
 			];
 			const categories = messageCategories(after.messages);
@@ -453,6 +622,7 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 			}
 		},
 		resetFinal(): void {
+			priorUnavailable = false;
 			previousFinal = undefined;
 		},
 		nextSequence(): number {

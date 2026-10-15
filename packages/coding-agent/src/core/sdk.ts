@@ -263,7 +263,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let pendingCacheOperationsDropped = false;
 	let postContextSnapshot: CacheOperationContextSnapshot | undefined;
 	let operationModel: string | undefined;
-	if (process.env.PI_CACHE_TELEMETRY === "1") {
+	// Enabled by default. The records are content-free (HMAC fingerprints under a key that is
+	// never persisted), local-only, and bounded by the writer's retention window; an incident
+	// cannot be diagnosed after the fact from a flag nobody had turned on. Only an explicit
+	// opt-out disables it. Before the default flipped, every value except "1" disabled
+	// telemetry, so accept the spellings an explicit opt-out already used rather than
+	// silently re-enabling those sessions.
+	const cacheTelemetrySetting = process.env.PI_CACHE_TELEMETRY?.trim().toLowerCase();
+	const cacheTelemetryDisabled =
+		cacheTelemetrySetting === "0" ||
+		cacheTelemetrySetting === "false" ||
+		cacheTelemetrySetting === "off" ||
+		cacheTelemetrySetting === "no";
+	if (!cacheTelemetryDisabled) {
 		try {
 			const writer = await createLocalCacheTelemetryWriter(agentDir);
 			const observer = createCacheTelemetrySession(

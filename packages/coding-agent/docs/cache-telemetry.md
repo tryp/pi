@@ -1,10 +1,16 @@
 # Cache telemetry
 
-Cache telemetry is disabled by default. Set `PI_CACHE_TELEMETRY=1` to opt in when creating an SDK agent session. It records bounded request metadata and normalized usage for supported providers; it does not change provider requests or add records to session/conversation history.
+Cache telemetry is enabled by default. Set `PI_CACHE_TELEMETRY` to `0`, `false`, `off`, or `no` (trailing whitespace and case are ignored) to turn it off when creating an SDK agent session. Every other value, including unset, leaves it on. Before the default flipped, any value except `1` disabled telemetry, so `off` and `no` are accepted to avoid silently re-enabling a session that had explicitly opted out. It records bounded request metadata and normalized usage for supported providers; it does not change provider requests or add records to session/conversation history.
+
+It is on by default because the failure it exists to explain cannot be reconstructed after the fact, and the marginal cost is measured and small: on a 115k-token Codex body the synchronous part of a request is ~12 ms, and a request writes ~28 KB of records (measured over a real 5.5 h corpus: 20.7 MB, 732 requests). The synchronous part runs before `socket.send()` and scales with context size (~2.5 ms per 100 KB); hashing and file I/O run off the request path, and the provider never awaits telemetry.
 
 ## Local storage and privacy
 
 Records are written only to a dedicated `cache-telemetry` directory under the local agent directory. The directory is restricted to mode `0700`; JSONL files use `0600` and opaque random names. Nothing is uploaded, exported, or added to provider context. Do not share these files: hashes and metadata are local diagnostics even though prompt text and cache-key/header values are not persisted.
+
+## Retention
+
+Nothing else removes these files, so each new session bounds the directory before opening its own file: files older than 14 days are removed, then the oldest remaining files are removed while the directory exceeds 512 MB. A file younger than one hour is never removed, so a live session cannot lose the file it is still appending to. `getStats()` reports `prunedFiles`, `prunedBytes`, and `pruneFailures`, so a prune that could not run is visible instead of looking like an empty directory.
 
 Provider/model labels are allowlisted; unknown values become `custom`/`unknown`. Payload fingerprints are HMAC-SHA-256 values under an in-memory key. Arbitrary SDK objects are intentionally unavailable rather than traversed; fingerprints are available only for bounded provider-owned wire JSON. Thus some requests have no comparable fingerprint. A key epoch is random per agent session, so hashes cannot be compared across sessions or process restarts.
 

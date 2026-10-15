@@ -5,6 +5,29 @@ export type CacheTelemetryPayloadMode = "full" | "delta";
 export type CacheTelemetryRetention = "none" | "short" | "long" | "unknown";
 export type CacheTelemetryChange = "changed" | "unchanged" | "unknown";
 export type CacheTelemetryInputCardinality = "missing" | "empty" | "nonempty" | "unknown";
+/**
+ * Whether the input array grew, kept its length, or shrank relative to the previous request in
+ * the lane. `input` alone cannot separate an append from a rewrite: one HMAC over the whole
+ * array reports `changed` for both, and `inputCardinality` is a three-value category that is
+ * `nonempty` in every observed request. Without a length relation the operation that actually
+ * invalidates a provider prefix -- a history rewrite -- has no request-level witness.
+ */
+export type CacheTelemetryInputLengthChange = "grown" | "same" | "shrunk" | "unknown";
+/**
+ * Why no cross-request prefix comparison happened. `previousCommonPrefixSegments: 0` covers
+ * three different events -- a genuinely broken prefix, a first request in the lane, and a lane
+ * whose predecessor was never fingerprinted -- so a zero is only interpretable with its cause.
+ */
+export type CacheTelemetryComparisonUnavailableCause =
+	| "not_comparison_eligible"
+	| "fingerprint_unavailable"
+	| "no_predecessor"
+	| "predecessor_not_recorded";
+/**
+ * How exact a recorded comparison is. A truncated fingerprint retains only a prefix of the
+ * payload, so its common-prefix count is a lower bound rather than the whole answer.
+ */
+export type CacheTelemetryComparisonBasis = "complete" | "bounded_truncated";
 export type CacheTelemetryFallbackReason =
 	| "none"
 	| "no_continuation"
@@ -22,6 +45,7 @@ export interface CacheTelemetryOperationChanges {
 	readonly requestOptions: CacheTelemetryChange;
 	readonly input: CacheTelemetryChange;
 	readonly inputCardinality: CacheTelemetryChange;
+	readonly inputCount: CacheTelemetryInputLengthChange;
 }
 
 export interface CacheTelemetrySegment {
@@ -58,6 +82,12 @@ export interface CacheTelemetryRequestRecord {
 	readonly fallbackReason?: CacheTelemetryFallbackReason;
 	readonly operationChanges?: CacheTelemetryOperationChanges;
 	readonly postHookInputCardinality?: CacheTelemetryInputCardinality;
+	/** Item count of the observed input array; absent when it was not an array. */
+	readonly postHookInputCount?: number;
+	readonly comparisonUnavailableCause?: CacheTelemetryComparisonUnavailableCause;
+	readonly comparisonBasis?: CacheTelemetryComparisonBasis;
+	/** Segments the predecessor retained, so a partial comparison reads as partial. */
+	readonly previousSegmentCount?: number;
 }
 
 export interface CacheTelemetryRawField {
@@ -378,6 +408,7 @@ type OperationName = keyof CacheTelemetryOperationChanges;
 type OperationValues = Partial<Record<OperationName, string>> & {
 	postHookInputCardinality?: CacheTelemetryInputCardinality;
 	cacheIdentity?: string;
+	inputItemCount?: number;
 };
 
 function getDataProperty(object: unknown, key: string): { present: boolean; value: unknown } {
@@ -425,6 +456,7 @@ function operationValues(payload: unknown): OperationValues {
 		}
 		const result: OperationValues = {
 			postHookInputCardinality: inputCardinality,
+			...(Array.isArray(input.value) ? { inputItemCount: input.value.length } : {}),
 			...(cacheIdentity.present && typeof cacheIdentity.value === "string"
 				? { cacheIdentity: cacheIdentity.value }
 				: {}),
@@ -474,10 +506,20 @@ export function createCacheTelemetrySession(
 	} catch {
 		/* unavailable fingerprints are reported without affecting requests */
 	}
-	const previousByLane = new Map<string, readonly string[]>();
+	const previousByLane = new Map<string, { digests: readonly string[]; bounded: boolean }>();
+	/**
+	 * Lanes whose predecessor could not be fingerprinted. Kept so the next comparable record can
+	 * name `predecessor_not_recorded` instead of reporting a zero-length common prefix, which is
+	 * indistinguishable from a genuinely broken prefix.
+	 */
+	const resetLanes = new Set<string>();
 	const previousOperations = new Map<
 		string,
-		{ hashes: Partial<Record<keyof CacheTelemetryOperationChanges, string>>; cacheIdentityHash?: string }
+		{
+			hashes: Partial<Record<keyof CacheTelemetryOperationChanges, string>>;
+			cacheIdentityHash?: string;
+			inputItemCount?: number;
+		}
 	>();
 	const jobs: Promise<void>[] = [];
 	const acceptedAttempts = new Map<string, { requestId: string; phaseCount: number }>();
@@ -608,9 +650,12 @@ export function createCacheTelemetrySession(
 				const accepted = enqueue(async () => {
 					const segments: CacheTelemetrySegment[] = [];
 					let previousCommonPrefixSegments = 0;
-					let comparable = prefixComparable;
+					let comparisonBasis: CacheTelemetryComparisonBasis | undefined;
+					let comparisonUnavailableCause: CacheTelemetryComparisonUnavailableCause | undefined;
+					let previousSegmentCount: number | undefined;
 					let postHookInputCardinality: CacheTelemetryInputCardinality | undefined =
 						phase === "canonical_body" && payloadMode === "full" ? "unknown" : undefined;
+					let postHookInputCount: number | undefined;
 					let operationChanges: CacheTelemetryOperationChanges | undefined =
 						phase === "canonical_body" && payloadMode === "full"
 							? {
@@ -623,6 +668,7 @@ export function createCacheTelemetrySession(
 									requestOptions: "unknown",
 									input: "unknown",
 									inputCardinality: "unknown",
+									inputCount: "unknown",
 								}
 							: undefined;
 					if (fingerprintStatus !== "unavailable" && keyPromise) {
@@ -687,6 +733,19 @@ export function createCacheTelemetrySession(
 										: previous.cacheIdentityHash === cacheIdentityHash
 											? "unchanged"
 											: "changed";
+								const inputItems = values.inputItemCount;
+								postHookInputCount =
+									inputItems !== undefined && Number.isSafeInteger(inputItems) && inputItems <= 1_000_000
+										? inputItems
+										: undefined;
+								const countChange: CacheTelemetryInputLengthChange =
+									postHookInputCount === undefined || previous?.inputItemCount === undefined
+										? "unknown"
+										: postHookInputCount > previous.inputItemCount
+											? "grown"
+											: postHookInputCount < previous.inputItemCount
+												? "shrunk"
+												: "same";
 								operationChanges = {
 									cacheIdentity: identityChange,
 									instructions: changed("instructions"),
@@ -697,10 +756,15 @@ export function createCacheTelemetrySession(
 									requestOptions: changed("requestOptions"),
 									input: changed("input"),
 									inputCardinality: changed("inputCardinality"),
+									inputCount: countChange,
 								};
 								if (previousOperations.size >= MAX_LANES && !previousOperations.has(operationLane))
 									previousOperations.delete(previousOperations.keys().next().value!);
-								previousOperations.set(operationLane, { hashes, cacheIdentityHash });
+								previousOperations.set(operationLane, {
+									hashes,
+									cacheIdentityHash,
+									...(postHookInputCount === undefined ? {} : { inputItemCount: postHookInputCount }),
+								});
 							}
 							for (const item of prepared) {
 								const signature = await globalThis.crypto.subtle.sign(
@@ -713,35 +777,50 @@ export function createCacheTelemetrySession(
 								).join("");
 								segments.push({ name: item.name, byteLength: item.byteLength, hmacSha256 });
 							}
-							if (fingerprintStatus === "ok" && comparable) {
-								const previous = previousByLane.get(lane) ?? [];
-								while (
-									previousCommonPrefixSegments < segments.length &&
-									previousCommonPrefixSegments < previous.length &&
-									segments[previousCommonPrefixSegments]!.hmacSha256 === previous[previousCommonPrefixSegments]
-								)
-									previousCommonPrefixSegments++;
+							if (prefixComparable) {
+								const previous = previousByLane.get(lane);
+								previousSegmentCount = previous?.digests.length ?? 0;
+								if (!previous) {
+									// A zero here is not a broken prefix: nothing was available to compare against.
+									comparisonUnavailableCause = resetLanes.has(lane)
+										? "predecessor_not_recorded"
+										: "no_predecessor";
+								} else {
+									while (
+										previousCommonPrefixSegments < segments.length &&
+										previousCommonPrefixSegments < previous.digests.length &&
+										segments[previousCommonPrefixSegments]!.hmacSha256 ===
+											previous.digests[previousCommonPrefixSegments]
+									)
+										previousCommonPrefixSegments++;
+									comparisonBasis =
+										fingerprintStatus === "truncated" || previous.bounded
+											? "bounded_truncated"
+											: "complete";
+								}
 								if (!previousByLane.has(lane) && previousByLane.size >= MAX_LANES)
 									previousByLane.delete(previousByLane.keys().next().value!);
-								previousByLane.set(
-									lane,
-									segments.map((segment) => segment.hmacSha256),
-								);
-							} else {
-								comparable = false;
-								previousByLane.delete(lane);
+								// Retained even when this fingerprint was truncated: dropping the lane made the
+								// *next* record report a zero-length common prefix for a comparison that never ran.
+								previousByLane.set(lane, {
+									digests: segments.map((segment) => segment.hmacSha256),
+									bounded: fingerprintStatus === "truncated",
+								});
+								resetLanes.delete(lane);
 							}
 						} catch {
 							fingerprintStatus = "unavailable";
-							comparable = false;
 							previousByLane.delete(lane);
+							resetLanes.add(lane);
 							segments.length = 0;
 						}
 					} else {
 						fingerprintStatus = "unavailable";
-						comparable = false;
 						previousByLane.delete(lane);
+						resetLanes.add(lane);
 					}
+					if (fingerprintStatus === "unavailable") comparisonUnavailableCause = "fingerprint_unavailable";
+					else if (!prefixComparable) comparisonUnavailableCause = "not_comparison_eligible";
 					const record: CacheTelemetryRequestRecord = {
 						schemaVersion: 2,
 						kind: "cache_request",
@@ -759,9 +838,13 @@ export function createCacheTelemetrySession(
 						cacheIdentityMatch,
 						fingerprintStatus,
 						segments,
-						prefixComparable: comparable,
+						prefixComparable,
 						previousCommonPrefixSegments,
 						truncatedSegmentCount,
+						...(comparisonUnavailableCause === undefined ? {} : { comparisonUnavailableCause }),
+						...(comparisonBasis === undefined ? {} : { comparisonBasis }),
+						...(previousSegmentCount === undefined ? {} : { previousSegmentCount }),
+						...(postHookInputCount === undefined ? {} : { postHookInputCount }),
 						...(continuationPresent !== undefined ? { continuationPresent } : {}),
 						...(deltaGenerated !== undefined ? { deltaGenerated } : {}),
 						...(deltaEmpty !== undefined ? { deltaEmpty } : {}),

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { CacheTelemetryRecord } from "@earendil-works/pi-ai";
 import type { CacheOperationRecord } from "./cache-operations.ts";
@@ -10,12 +10,32 @@ export interface LocalCacheTelemetryWriter {
 	appendBatch(records: readonly CacheTelemetryRecord[]): boolean;
 	appendOperation(record: CacheOperationRecord): boolean;
 	flush(): Promise<void>;
-	getStats(): Readonly<{ queueDrops: number; serializationErrors: number; writeErrors: number }>;
+	getStats(): Readonly<{
+		queueDrops: number;
+		serializationErrors: number;
+		writeErrors: number;
+		prunedFiles: number;
+		prunedBytes: number;
+		pruneFailures: number;
+	}>;
 }
 
 const MAX_PENDING_RECORDS = 256;
 const MAX_RECORD_BYTES = 64 * 1024;
 const MAX_SEGMENTS = 128;
+/**
+ * Telemetry is written by every session that has it enabled and nothing else ever
+ * removes it, so without a bound the directory grows with total agent usage forever.
+ * Measured on a real corpus: 20.7 MB over 5.5 h of active agent time (3.7 MB/h,
+ * 28 KB per request). A 14-day window therefore holds a few hundred MB; the byte cap
+ * is the backstop for a pathological session inside the window, and the minimum age
+ * keeps a live session from losing the file it is still appending to.
+ */
+const TELEMETRY_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+const TELEMETRY_MAX_BYTES = 512 * 1024 * 1024;
+const TELEMETRY_MIN_PRUNE_AGE_MS = 60 * 60 * 1000;
+/** Only names this writer creates are eligible: it never removes a file it did not write. */
+const TELEMETRY_FILE_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/;
 const USAGE_FIELDS = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h"] as const;
 const RAW_STATES = new Set(["absent", "null", "valid", "invalid"]);
 const REQUEST_PHASES = new Set(["canonical_body", "final_wire_body"]);
@@ -24,6 +44,32 @@ const PAYLOAD_MODES = new Set(["full", "delta"]);
 const RETENTIONS = new Set(["none", "short", "long", "unknown"]);
 const SEGMENT_NAMES = new Set(["system", "tools", "message", "other"]);
 const FINGERPRINT_STATUSES = new Set(["ok", "truncated", "unavailable"]);
+const COMPARISON_UNAVAILABLE_CAUSES = new Set([
+	"not_comparison_eligible",
+	"fingerprint_unavailable",
+	"no_predecessor",
+	"predecessor_not_recorded",
+]);
+const COMPARISON_BASES = new Set(["complete", "bounded_truncated"]);
+const INPUT_LENGTH_CHANGES = new Set(["grown", "same", "shrunk", "unknown"]);
+const OPERATION_UNAVAILABLE_CAUSES = new Set([
+	"no_annotation",
+	"unusable_annotation",
+	"no_comparison",
+	"no_before_context",
+	"no_after_context",
+	"no_prior_request",
+	"not_an_array",
+	"unusable_message",
+	"too_many_messages",
+	"oversized_message",
+	"snapshot_budget_exhausted",
+	"unusable_system_prompt",
+	"unusable_tools",
+	"pending_queue_overflow",
+	"observation_dropped",
+]);
+const OPERATION_COMPARISON_BASES = new Set(["first_request", "prior_available", "prior_unavailable"]);
 const OUTCOMES = new Set(["success", "failed", "aborted"]);
 const PROVIDERS = new Set([
 	"anthropic",
@@ -203,6 +249,11 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 					changes[field] = value;
 				}
 			}
+			const inputCount = data(changesSource, "inputCount");
+			if (inputCount !== undefined) {
+				if (typeof inputCount !== "string" || !INPUT_LENGTH_CHANGES.has(inputCount)) return undefined;
+				changes.inputCount = inputCount;
+			}
 			output.operationChanges = changes;
 		}
 		for (const [field, allowed] of [
@@ -218,6 +269,26 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 				if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) return undefined;
 				output[field] = value;
 			}
+		}
+		const comparisonUnavailableCause = data(source, "comparisonUnavailableCause");
+		if (comparisonUnavailableCause !== undefined) {
+			if (
+				typeof comparisonUnavailableCause !== "string" ||
+				!COMPARISON_UNAVAILABLE_CAUSES.has(comparisonUnavailableCause)
+			)
+				return undefined;
+			output.comparisonUnavailableCause = comparisonUnavailableCause;
+		}
+		const comparisonBasis = data(source, "comparisonBasis");
+		if (comparisonBasis !== undefined) {
+			if (typeof comparisonBasis !== "string" || !COMPARISON_BASES.has(comparisonBasis)) return undefined;
+			output.comparisonBasis = comparisonBasis;
+		}
+		for (const field of ["previousSegmentCount", "postHookInputCount"] as const) {
+			const value = data(source, field);
+			if (value === undefined) continue;
+			if (!boundedCount(value, 1_000_000)) return undefined;
+			output[field] = value;
 		}
 		return output as unknown as CacheTelemetryRecord;
 	}
@@ -303,12 +374,19 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 			comparisonScope: ["within_request", "across_requests"],
 			contextStage: ["post_context", "stream_input"],
 			operationClass: ["agent_main", "unknown"],
+			unavailableCause: [...OPERATION_UNAVAILABLE_CAUSES],
+			comparisonBasis: [...OPERATION_COMPARISON_BASES],
 		})) {
 			const value = data(source, name);
 			if (value !== undefined) {
 				if (typeof value !== "string" || !allowed.includes(value)) return undefined;
 				output[name] = value;
 			}
+		}
+		const observedCount = data(source, "observedCount");
+		if (observedCount !== undefined) {
+			if (!boundedCount(observedCount, 1_000_000)) return undefined;
+			output.observedCount = observedCount;
 		}
 		for (const [name, keys] of Object.entries({
 			roleCounts: ["user", "assistant", "toolResult", "other"],
@@ -375,6 +453,67 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 	return output as unknown as CacheTelemetryRecord;
 }
 
+/**
+ * Bound the telemetry directory before opening this session's file. Two bounds are
+ * applied oldest-first: an age window and a total-size cap. A file younger than
+ * TELEMETRY_MIN_PRUNE_AGE_MS is never removed, so a live session cannot lose the file
+ * it is still appending to (an unlinked file keeps accepting writes and the data is
+ * lost silently, which is worse than the disk it saves). Every removal and every
+ * failure is counted: a prune that could not run must not read as "nothing to prune".
+ */
+async function pruneTelemetryDirectory(
+	directory: string,
+): Promise<{ files: number; bytes: number; failures: number }> {
+	const outcome = { files: 0, bytes: 0, failures: 0 };
+	let names: string[];
+	try {
+		names = await readdir(directory);
+	} catch {
+		outcome.failures++;
+		return outcome;
+	}
+	const now = Date.now();
+	const entries: Array<{ path: string; size: number; ageMs: number }> = [];
+	for (const name of names) {
+		if (!TELEMETRY_FILE_NAME.test(name)) continue;
+		const path = join(directory, name);
+		try {
+			const stats = await lstat(path);
+			// A symlink or subdirectory is not a file this writer created; never follow one.
+			if (!stats.isFile()) continue;
+			entries.push({ path, size: stats.size, ageMs: now - stats.mtimeMs });
+		} catch {
+			outcome.failures++;
+		}
+	}
+	const remove = async (entry: (typeof entries)[number]): Promise<void> => {
+		try {
+			await unlink(entry.path);
+			outcome.files++;
+			outcome.bytes += entry.size;
+		} catch {
+			outcome.failures++;
+		}
+	};
+	const survivors: typeof entries = [];
+	for (const entry of entries) {
+		if (entry.ageMs >= TELEMETRY_RETENTION_MS) await remove(entry);
+		else survivors.push(entry);
+	}
+	let total = survivors.reduce((sum, entry) => sum + entry.size, 0);
+	if (total > TELEMETRY_MAX_BYTES) {
+		const oldestFirst = survivors
+			.filter((entry) => entry.ageMs >= TELEMETRY_MIN_PRUNE_AGE_MS)
+			.sort((left, right) => right.ageMs - left.ageMs);
+		for (const entry of oldestFirst) {
+			if (total <= TELEMETRY_MAX_BYTES) break;
+			await remove(entry);
+			total -= entry.size;
+		}
+	}
+	return outcome;
+}
+
 export async function createLocalCacheTelemetryWriter(agentDir: string): Promise<LocalCacheTelemetryWriter> {
 	const directory = join(agentDir, "cache-telemetry");
 	await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -382,6 +521,7 @@ export async function createLocalCacheTelemetryWriter(agentDir: string): Promise
 	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink())
 		throw new Error("cache telemetry directory must be a real directory");
 	await chmod(directory, 0o700);
+	const pruned = await pruneTelemetryDirectory(directory);
 	const filePath = join(directory, `${randomUUID()}.jsonl`);
 	const noFollow = constants.O_NOFOLLOW ?? 0;
 	const file = await open(
@@ -455,7 +595,14 @@ export async function createLocalCacheTelemetryWriter(agentDir: string): Promise
 			return closePromise;
 		},
 		getStats() {
-			return { queueDrops, serializationErrors, writeErrors };
+			return {
+				queueDrops,
+				serializationErrors,
+				writeErrors,
+				prunedFiles: pruned.files,
+				prunedBytes: pruned.bytes,
+				pruneFailures: pruned.failures,
+			};
 		},
 	};
 }
