@@ -641,7 +641,7 @@ export class AgentSession {
 				...previousSnapshot,
 				context: {
 					...previousContext,
-					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
+					systemPrompt: this.agent.state.systemPrompt,
 					tools: this.agent.state.tools.slice(),
 				},
 				model: this.agent.state.model,
@@ -837,7 +837,6 @@ export class AgentSession {
 			}
 		} finally {
 			this._queuedMessageWakeActive = false;
-			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
 			await this._emitAgentSettled(generation);
@@ -1587,7 +1586,6 @@ export class AgentSession {
 				await this.agent.continue();
 			}
 		} finally {
-			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
 			await this._emitAgentSettled();
@@ -1780,7 +1778,8 @@ export class AgentSession {
 					});
 				}
 			}
-			// Apply extension-modified system prompt, or reset to base
+			// Re-derive for each user prompt (including plan-mode changes), then keep fixed
+			// across internal turns and queued wakes so the provider's cacheable prefix stays stable.
 			if (result?.systemPrompt !== undefined) {
 				this._systemPromptOverride = result.systemPrompt;
 				this.agent.state.systemPrompt = result.systemPrompt;
@@ -3176,7 +3175,7 @@ export class AgentSession {
 
 		this._resourceLoader.extendResources(extensionPaths);
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
-		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this.agent.state.systemPrompt = this._systemPromptOverride ?? this._baseSystemPrompt;
 	}
 
 	private buildExtensionResourcePaths(entries: Array<{ path: string; extensionPath: string }>): Array<{
