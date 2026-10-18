@@ -2,6 +2,7 @@ import { openAICompletionsApi } from "../api/openai-completions.lazy.ts";
 import { envApiKeyAuth } from "../auth/helpers.ts";
 import { createProvider, type Provider } from "../models.ts";
 import { ZAI_MODELS } from "./zai.models.ts";
+import { fetchZaiModels } from "./zai-discovery.ts";
 
 export function zaiProvider(): Provider<"openai-completions"> {
 	return createProvider({
@@ -10,6 +11,7 @@ export function zaiProvider(): Provider<"openai-completions"> {
 		baseUrl: "https://api.z.ai/api/coding/paas/v4",
 		auth: { apiKey: envApiKeyAuth("Z.AI API key", ["ZAI_API_KEY"]) },
 		models: Object.values(ZAI_MODELS),
+		fetchModels: (context) => fetchZaiModels(context, Object.values(ZAI_MODELS)),
 		api: openAICompletionsApi(),
 	});
 }
