@@ -4,6 +4,7 @@ import {
 	type CacheTelemetryObserver,
 	type CacheTelemetryRecord,
 	createCacheTelemetrySession,
+	normalizeOpenCodeHeaders,
 } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
@@ -542,16 +543,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				onReasoningRejected: (info) => {
 					sessionRef.current?.appendReasoningRejection(info);
 				},
-				transformHeaders: async (requestHeaders) => {
+				transformHeaders: async (requestHeaders, requestModel) => {
 					const headers = mergeProviderAttributionHeaders(
-						model,
+						requestModel ?? model,
 						settingsManager,
 						options?.sessionId,
 						requestHeaders,
 					);
-					return headerRunner?.hasHandlers("before_provider_headers")
-						? headerRunner.emitBeforeProviderHeaders(headers ?? {})
+					const transformedHeaders = headerRunner?.hasHandlers("before_provider_headers")
+						? await headerRunner.emitBeforeProviderHeaders(headers ?? {})
 						: (headers ?? {});
+					return normalizeOpenCodeHeaders(transformedHeaders);
 				},
 			});
 		},

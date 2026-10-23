@@ -17,6 +17,7 @@ import {
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
+	getOpenCodeSessionHeaders,
 	lazyStream,
 	type Model,
 	type Models,
@@ -30,6 +31,8 @@ import {
 	type ModelsSimpleStreamOptions,
 	type ModelsStore,
 	type MutableModels,
+	markOpenCodeSessionHeaderTransformed,
+	normalizeOpenCodeHeaders,
 	type Provider,
 	type ProviderHeaders,
 	type ProviderRequestOptions,
@@ -593,22 +596,37 @@ export class ModelRuntime implements Models {
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
 		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
-		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
-		if (transformHeaders) headers = await transformHeaders(headers ?? {});
+		const requestModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
+		const sessionId =
+			"sessionId" in providerOptions && typeof providerOptions.sessionId === "string"
+				? providerOptions.sessionId
+				: undefined;
+		const sessionHeaders = getOpenCodeSessionHeaders(requestModel.provider, requestModel.baseUrl, sessionId);
+		let headers = mergeHeaders(
+			mergeHeaders(
+				mergeHeaders(sessionHeaders, sessionHeaders ? model.headers : undefined),
+				resolution.auth.headers,
+			),
+			providerOptions.headers,
+		);
+		if (transformHeaders) {
+			headers = await transformHeaders(headers ?? {}, requestModel);
+			if (sessionHeaders) headers = normalizeOpenCodeHeaders(headers);
+		}
 		const env =
 			resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
 				: undefined;
-		return {
-			provider,
-			model: resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model,
-			options: {
-				...providerOptions,
-				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
-				headers,
-				env,
-			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions,
-		};
+		const requestOptions = {
+			...providerOptions,
+			apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+			headers,
+			env,
+		} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
+		if (transformHeaders && sessionHeaders) {
+			markOpenCodeSessionHeaderTransformed(requestOptions);
+		}
+		return { provider, model: requestModel, options: requestOptions };
 	}
 
 	stream<TApi extends Api>(

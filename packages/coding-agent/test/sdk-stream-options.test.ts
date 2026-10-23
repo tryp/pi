@@ -5,6 +5,7 @@ import {
 	type Api,
 	type AssistantMessage,
 	createAssistantMessageEventStream,
+	createProvider,
 	type Model,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
@@ -35,19 +36,24 @@ describe("createAgentSession stream options", () => {
 		}
 	});
 
-	function createModel(api: Api): Model<Api> {
+	function createModel(
+		api: Api,
+		provider = "capture-provider",
+		baseUrl = "https://capture.invalid/v1",
+		modelHeaders: Record<string, string> = { "x-model": "model" },
+	): Model<Api> {
 		return {
 			id: "capture-model",
 			name: "Capture Model",
 			api,
-			provider: "capture-provider",
-			baseUrl: "https://capture.invalid/v1",
+			provider,
+			baseUrl,
 			reasoning: false,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128000,
 			maxTokens: 4096,
-			headers: { "x-model": "model" },
+			headers: modelHeaders,
 		};
 	}
 
@@ -79,8 +85,13 @@ describe("createAgentSession stream options", () => {
 		settings: Partial<Settings>,
 		requestOptions: SimpleStreamOptions = {},
 		extensionSource?: string,
+		provider = "capture-provider",
+		baseUrl = "https://capture.invalid/v1",
+		modelHeaders?: Record<string, string>,
+		authBaseUrl?: string,
+		providerHeaders: Record<string, string> = { "x-provider": "provider" },
 	): Promise<SimpleStreamOptions | undefined> {
-		const model = createModel(api);
+		const model = createModel(api, provider, baseUrl, modelHeaders);
 		const settingsManager = SettingsManager.inMemory(settings);
 		if (extensionSource) {
 			const extensionsDir = join(agentDir, "extensions");
@@ -92,17 +103,42 @@ describe("createAgentSession stream options", () => {
 		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
 		const modelRegistry = await createModelRegistry(authStorage, join(agentDir, "models.json"));
 		let capturedOptions: SimpleStreamOptions | undefined;
-
-		modelRegistry.registerProvider(model.provider, {
-			api,
-			headers: { "x-provider": "provider" },
-			streamSimple: (_model, _context, providerOptions) => {
-				capturedOptions = providerOptions;
-				return createDoneStream(api);
-			},
-		});
-
 		const modelRuntime = getModelRuntime(modelRegistry);
+		if (authBaseUrl) {
+			modelRegistry.unregisterProvider(model.provider);
+			modelRuntime.registerNativeProvider(
+				createProvider({
+					id: model.provider,
+					name: model.provider,
+					models: [model],
+					auth: {
+						apiKey: {
+							name: "test key",
+							resolve: async () => ({ auth: { apiKey: "test-api-key", baseUrl: authBaseUrl } }),
+						},
+					},
+					api: {
+						stream: (_model, _context, providerOptions) => {
+							capturedOptions = providerOptions;
+							return createDoneStream(api);
+						},
+						streamSimple: (_model, _context, providerOptions) => {
+							capturedOptions = providerOptions;
+							return createDoneStream(api);
+						},
+					},
+				}),
+			);
+		} else {
+			modelRegistry.registerProvider(model.provider, {
+				api,
+				headers: providerHeaders,
+				streamSimple: (_model, _context, providerOptions) => {
+					capturedOptions = providerOptions;
+					return createDoneStream(api);
+				},
+			});
+		}
 		const sessionManager = SessionManager.inMemory(cwd);
 		const { session } = await createAgentSession({
 			cwd,
@@ -115,7 +151,8 @@ describe("createAgentSession stream options", () => {
 
 		try {
 			const stream = await session.agent.streamFunction(model, { messages: [] }, requestOptions);
-			await stream.result();
+			const result = await stream.result();
+			if (!capturedOptions) throw new Error(`Provider was not called: ${JSON.stringify(result)}`);
 			return capturedOptions;
 		} finally {
 			session.dispose();
@@ -168,6 +205,136 @@ describe("createAgentSession stream options", () => {
 
 		expect(options?.maxRetries).toBe(2);
 		expect(options?.maxRetryDelayMs).toBe(3000);
+	});
+
+	it("maps sessionId for a custom provider targeting the exact OpenCode host", async () => {
+		const options = await captureStreamOptions(
+			"openai-responses",
+			{},
+			{ sessionId: "custom-session" },
+			undefined,
+			"custom-opencode",
+			"https://opencode.ai/inference/v1",
+			{ "x-model-extra": "model-header" },
+		);
+
+		expect(options?.headers?.["x-opencode-session"]).toBe("custom-session");
+		expect(options?.headers?.["x-model-extra"]).toBe("model-header");
+	});
+
+	it("preserves case-insensitive model and explicit null session-header overrides", async () => {
+		const modelHeaders = await captureStreamOptions(
+			"openai-responses",
+			{},
+			{ sessionId: "generated" },
+			undefined,
+			"custom-opencode",
+			"https://opencode.ai/inference/v1",
+			{ "X-OpenCode-Session": "model-value" },
+		);
+		const callerHeaders = await captureStreamOptions(
+			"openai-responses",
+			{},
+			{ sessionId: "generated", headers: { "X-OpenCode-Session": null } },
+			undefined,
+			"custom-opencode",
+			"https://opencode.ai/inference/v1",
+		);
+
+		expect(modelHeaders?.headers?.["X-OpenCode-Session"]).toBe("model-value");
+		expect(callerHeaders?.headers).toHaveProperty("X-OpenCode-Session", null);
+	});
+
+	it("tracks custom providers using the resolved auth base URL", async () => {
+		const routedToOpenCode = await captureStreamOptions(
+			"openai-responses",
+			{},
+			{ sessionId: "session-id" },
+			undefined,
+			"custom-provider",
+			"https://elsewhere.invalid/v1",
+			undefined,
+			"https://opencode.ai/custom/v1",
+		);
+		const routedAwayFromOpenCode = await captureStreamOptions(
+			"openai-responses",
+			{},
+			{ sessionId: "session-id" },
+			undefined,
+			"custom-provider",
+			"https://opencode.ai/custom/v1",
+			undefined,
+			"https://elsewhere.invalid/v1",
+		);
+
+		expect(routedToOpenCode?.headers?.["x-opencode-session"]).toBe("session-id");
+		expect(routedAwayFromOpenCode?.headers?.["x-opencode-session"]).toBeUndefined();
+	});
+
+	it("preserves auth session-header overrides case-insensitively", async () => {
+		const options = await captureStreamOptions(
+			"openai-responses",
+			{},
+			{ sessionId: "session-id" },
+			undefined,
+			"custom-provider",
+			"https://opencode.ai/custom/v1",
+			undefined,
+			undefined,
+			{ "X-OpenCode-Session": "auth-value" },
+		);
+
+		expect(options?.headers).toHaveProperty("X-OpenCode-Session", "auth-value");
+		expect(Object.keys(options?.headers ?? {}).filter((name) => name.toLowerCase() === "x-opencode-session")).toEqual(
+			["X-OpenCode-Session"],
+		);
+	});
+
+	it("keeps mixed-case OpenCode session/client overrides unique through CLI attribution", async () => {
+		const options = await captureStreamOptions(
+			"openai-responses",
+			{},
+			{ sessionId: "session-id" },
+			`export default function (pi) {
+				pi.on("before_provider_headers", async (event) => {
+					await Promise.resolve();
+					event.headers["X-OpenCode-Session"] = "caller-session";
+					event.headers["X-OpenCode-Client"] = "caller-client";
+				});
+			}`,
+			"custom-opencode",
+			"https://opencode.ai/inference/v1",
+		);
+		const sessionHeaders = Object.keys(options?.headers ?? {}).filter(
+			(name) => name.toLowerCase() === "x-opencode-session",
+		);
+		const clientHeaders = Object.keys(options?.headers ?? {}).filter(
+			(name) => name.toLowerCase() === "x-opencode-client",
+		);
+
+		expect(sessionHeaders).toEqual(["X-OpenCode-Session"]);
+		expect(clientHeaders).toEqual(["X-OpenCode-Client"]);
+		expect(options?.headers?.["X-OpenCode-Session"]).toBe("caller-session");
+		expect(options?.headers?.["X-OpenCode-Client"]).toBe("caller-client");
+	});
+
+	it("allows the final CLI header hook to remove OpenCode session routing", async () => {
+		const options = await captureStreamOptions(
+			"openai-responses",
+			{},
+			{ sessionId: "session-id" },
+			`export default function (pi) {
+				pi.on("before_provider_headers", (event) => {
+					delete event.headers["x-opencode-session"];
+				});
+			}`,
+			"custom-opencode",
+			"https://opencode.ai/inference/v1",
+		);
+
+		expect(Object.keys(options?.headers ?? {}).some((name) => name.toLowerCase() === "x-opencode-session")).toBe(
+			false,
+		);
 	});
 
 	it("runs before_provider_headers on assembled headers without forwarding the transform", async () => {

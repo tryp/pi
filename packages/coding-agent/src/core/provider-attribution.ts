@@ -88,8 +88,12 @@ export function mergeProviderAttributionHeaders(
 	};
 
 	for (const headers of headerSources) {
-		if (headers) {
-			Object.assign(merged, headers);
+		for (const [name, value] of Object.entries(headers ?? {})) {
+			const lowerName = name.toLowerCase();
+			for (const existingName of Object.keys(merged)) {
+				if (existingName.toLowerCase() === lowerName) delete merged[existingName];
+			}
+			merged[name] = value;
 		}
 	}
 

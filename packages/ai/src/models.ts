@@ -14,6 +14,11 @@ import type {
 	ProviderAuth,
 } from "./auth/types.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "./models-store.ts";
+import {
+	getOpenCodeSessionHeaders,
+	markOpenCodeSessionHeaderTransformed,
+	normalizeOpenCodeHeaders,
+} from "./providers/opencode-headers.ts";
 import type {
 	Api,
 	ApiStreamOptions,
@@ -77,7 +82,7 @@ export interface ModelsRefreshResult {
 
 export interface ModelsRequestTransforms {
 	/** Transform fully assembled model/auth/request headers before provider dispatch. */
-	transformHeaders?: (headers: ProviderHeaders) => ProviderHeaders | Promise<ProviderHeaders>;
+	transformHeaders?: (headers: ProviderHeaders, model?: Model<Api>) => ProviderHeaders | Promise<ProviderHeaders>;
 }
 
 export type ModelsApiStreamOptions<TApi extends Api> = ApiStreamOptions<TApi> & ModelsRequestTransforms;
@@ -650,16 +655,28 @@ class ModelsImpl implements MutableModels {
 			throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
 		}
 		const auth = resolution.auth;
+		const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
 
 		// Explicit request options win per-field; the Models-only transform runs last.
 		const apiKey = options?.apiKey ?? auth.apiKey;
-		let headers = mergeHeaders(auth.headers, options?.headers);
-		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
+		const sessionId =
+			options && "sessionId" in options && typeof options.sessionId === "string" ? options.sessionId : undefined;
+		const sessionHeaders = getOpenCodeSessionHeaders(requestModel.provider, requestModel.baseUrl, sessionId);
+		let headers = mergeHeaders(
+			mergeHeaders(mergeHeaders(sessionHeaders, sessionHeaders ? model.headers : undefined), auth.headers),
+			options?.headers,
+		);
+		if (options?.transformHeaders) {
+			headers = await options.transformHeaders(headers ?? {}, requestModel);
+			if (sessionHeaders) headers = normalizeOpenCodeHeaders(headers);
+		}
 		const env = resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
-		const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
 		const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
 		const requestOptions = { ...providerOptions, apiKey, headers, env } as Omit<TOptions, "transformHeaders"> &
 			ProviderRequestOptions;
+		if (options?.transformHeaders && sessionHeaders) {
+			markOpenCodeSessionHeaderTransformed(requestOptions);
+		}
 
 		return { requestModel, requestOptions };
 	}
