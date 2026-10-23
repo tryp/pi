@@ -879,6 +879,10 @@ describe("resolveCliModel", () => {
 });
 
 describe("default model selection", () => {
+	test("OpenCode Go defaults to Kimi K3", () => {
+		expect(defaultModelPerProvider["opencode-go"]).toBe("kimi-k3");
+	});
+
 	test("openai defaults track current models", () => {
 		expect(defaultModelPerProvider.openai).toBe("gpt-5.5");
 		expect(defaultModelPerProvider["openai-codex"]).toBe("gpt-5.5");

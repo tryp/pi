@@ -23,7 +23,7 @@ import type {
 	OpenAICompletionsCompat,
 	OpenAIResponsesCompat,
 } from "../src/types.ts";
-import { isDeepSeekModelId } from "../src/providers/deepseek-compat.ts";
+import { getOpenCodeModelRouting } from "./opencode-model-routing.ts";
 import {
 	assertExactModelIds,
 	createModelDataManifest,
@@ -2012,84 +2012,25 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		// - @ai-sdk/google → google-generative-ai
 		// - null/undefined/@ai-sdk/openai-compatible → openai-completions
 		const opencodeVariants = [
-			{ key: "opencode", provider: "opencode", basePath: "https://opencode.ai/zen" },
-			{ key: "opencode-go", provider: "opencode-go", basePath: "https://opencode.ai/zen/go" },
+			{ key: "opencode", provider: "opencode" },
+			{ key: "opencode-go", provider: "opencode-go" },
 		] as const;
 
 		for (const variant of opencodeVariants) {
-			if (!data[variant.key]?.models) continue;
+			const variantModels = data[variant.key]?.models;
+			if (!variantModels) continue;
 
-			for (const [modelId, model] of Object.entries(data[variant.key].models)) {
+			for (const [modelId, model] of Object.entries(variantModels)) {
 				const m = model as ModelsDevModel;
 				if (m.tool_call !== true) continue;
 				if (m.status === "deprecated") continue;
 
-				const npm = m.provider?.npm;
-				let api: Api;
-				let baseUrl: string;
-				let compat: OpenAICompletionsCompat | OpenAIResponsesCompat | undefined;
-
-				if (npm === "@ai-sdk/openai") {
-					api = "openai-responses";
-					baseUrl = `${variant.basePath}/v1`;
-					compat = { sessionAffinityFormat: "openai-nosession" };
-				} else if (npm === "@ai-sdk/anthropic") {
-					api = "anthropic-messages";
-					// Anthropic SDK appends /v1/messages to baseURL
-					baseUrl = variant.basePath;
-				} else if (npm === "@ai-sdk/google") {
-					api = "google-generative-ai";
-					baseUrl = `${variant.basePath}/v1`;
-				} else if (npm === "@ai-sdk/alibaba") {
-					api = "openai-completions";
-					baseUrl = `${variant.basePath}/v1`;
-					compat = { cacheControlFormat: "anthropic" };
-				} else {
-					// null, undefined, or @ai-sdk/openai-compatible
-					api = "openai-completions";
-					baseUrl = `${variant.basePath}/v1`;
-				}
-
-				if (variant.provider === "opencode" && modelId === "grok-build-0.1") {
-					compat = { ...(compat ?? {}), supportsReasoningEffort: false };
-				}
-
-				if ((variant.provider === "opencode" || variant.provider === "opencode-go") && modelId === "kimi-k2.6") {
-					// OpenCode Kimi K2.6 accepts Anthropic-style thinking objects
-					// and rejects string thinking values or combined reasoning_effort.
-					compat = { ...(compat ?? {}), thinkingFormat: "deepseek", supportsReasoningEffort: false };
-				}
-
-				// Fix known mismatches between models.dev npm data and actual
-				// OpenCode Go endpoint behaviour. models.dev reports these models
-				// as @ai-sdk/anthropic, but the OpenCode Go endpoints either don't
-				// accept Anthropic SDK auth (MiniMax M2.7) or are served through
-				// the OpenAI-compatible /v1/chat/completions path (Qwen 3.5/3.6).
-				// Switch them to openai-completions so requests use Bearer auth
-				// and the standard /v1/chat/completions endpoint.
-				if (variant.provider === "opencode-go") {
-					if (modelId === "minimax-m2.7") {
-						api = "openai-completions";
-						baseUrl = `${variant.basePath}/v1`;
-					}
-					if (modelId === "qwen3.5-plus" || modelId === "qwen3.6-plus") {
-						api = "openai-completions";
-						baseUrl = `${variant.basePath}/v1`;
-						// Qwen/DashScope uses enable_thinking at the top level.
-						compat = { ...(compat ?? {}), thinkingFormat: "qwen" };
-					}
-				}
-
-				// Keep DeepSeek compatibility based on the shared family predicate so
-				// model renames such as deepseek-flash retain the required replay behavior.
-				if (api === "openai-completions" && isDeepSeekModelId(modelId)) {
-					compat = {
-						...(compat ?? {}),
-						...(variant.provider === "opencode-go"
-							? { requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek" }
-							: { requiresReasoningContentOnAssistantMessages: true }),
-					};
-				}
+				const { api, baseUrl, compat: routingCompat } = getOpenCodeModelRouting(
+					variant.provider,
+					modelId,
+					m.provider?.npm,
+				);
+				let compat = routingCompat;
 
 				if (api === "openai-completions") {
 					compat = { ...(compat ?? {}), maxTokensField: "max_tokens" };

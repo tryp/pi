@@ -15,6 +15,8 @@ import {
 	DEFAULT_MAX_TOKENS,
 	fetchOfficialEntries,
 	fetchOpencodeModels,
+	GO_MODELS_ENDPOINT,
+	migrateStoredOpencodeModels,
 	ZEN_MODELS_ENDPOINT,
 } from "../src/providers/opencode-helpers.ts";
 
@@ -84,11 +86,11 @@ describe("opencode helpers", () => {
 			},
 		};
 
-		const models = buildModelsFromEntries("opencode", "https://opencode.ai/zen", entries, providerData as any);
+		const models = buildModelsFromEntries("opencode", "https://opencode.ai/inference", entries, providerData as any);
 
 		const opus = models.find((m) => m.id === "claude-opus-4-5")!;
 		expect(opus.api).toBe("anthropic-messages");
-		expect(opus.baseUrl).toBe("https://opencode.ai/zen");
+		expect(opus.baseUrl).toBe("https://opencode.ai/inference");
 		expect(opus.reasoning).toBe(true);
 		expect(opus.input).toEqual(["text", "image"]);
 		expect(opus.cost.input).toBe(5);
@@ -96,11 +98,11 @@ describe("opencode helpers", () => {
 
 		const gemini = models.find((m) => m.id === "gemini-3-flash")!;
 		expect(gemini.api).toBe("google-generative-ai");
-		expect(gemini.baseUrl).toBe("https://opencode.ai/zen/v1");
+		expect(gemini.baseUrl).toBe("https://opencode.ai/inference/v1");
 
 		const gpt = models.find((m) => m.id === "gpt-5")!;
 		expect(gpt.api).toBe("openai-responses");
-		expect(gpt.baseUrl).toBe("https://opencode.ai/zen/v1");
+		expect(gpt.baseUrl).toBe("https://opencode.ai/inference/v1");
 		expect((gpt.compat as any)?.sessionAffinityFormat).toBe("openai-nosession");
 
 		const ds = models.find((m) => m.id === "deepseek-v4-flash")!;
@@ -111,7 +113,7 @@ describe("opencode helpers", () => {
 
 	it("uses defaults when metadata missing (new model not yet in models.dev)", () => {
 		const entries = [{ id: "future-model-xyz" }];
-		const models = buildModelsFromEntries("opencode", "https://opencode.ai/zen", entries, undefined);
+		const models = buildModelsFromEntries("opencode", "https://opencode.ai/inference", entries, undefined);
 		const m = models[0]!;
 		expect(m.id).toBe("future-model-xyz");
 		expect(m.name).toBe("future-model-xyz");
@@ -124,13 +126,16 @@ describe("opencode helpers", () => {
 	it("applies per-model compat overrides (kimi-k2.6, minimax-m2.7, qwen)", () => {
 		const entries = [{ id: "kimi-k2.6" }, { id: "minimax-m2.7" }, { id: "qwen3.5-plus" }];
 		// No npm metadata, rely on heuristic overrides
-		const zen = buildModelsFromEntries("opencode", "https://opencode.ai/zen", [{ id: "kimi-k2.6" }], undefined);
+		const zen = buildModelsFromEntries("opencode", "https://opencode.ai/inference", [{ id: "kimi-k2.6" }], undefined);
 		expect((zen[0] as any).compat.thinkingFormat).toBe("deepseek");
 		expect((zen[0] as any).compat.supportsReasoningEffort).toBe(false);
 
-		const go = buildModelsFromEntries("opencode-go", "https://opencode.ai/zen/go", entries, undefined);
+		const go = buildModelsFromEntries("opencode-go", "https://opencode.ai/inference/go", entries, {
+			models: { "minimax-m2.7": { id: "minimax-m2.7", provider: { npm: "@ai-sdk/anthropic" } } },
+		});
 		const mm = go.find((m) => m.id === "minimax-m2.7")!;
-		expect(mm.api).toBe("openai-completions");
+		expect(mm.api).toBe("anthropic-messages");
+		expect(mm.baseUrl).toBe("https://opencode.ai/inference/go");
 		const qwen = go.find((m) => m.id === "qwen3.5-plus")!;
 		expect((qwen.compat as any).thinkingFormat).toBe("qwen");
 	});
@@ -139,7 +144,7 @@ describe("opencode helpers", () => {
 		const entries = [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }];
 
 		// opencode keeps native reasoning effort; only the replay flag is forced
-		const zen = buildModelsFromEntries("opencode", "https://opencode.ai/zen", entries, undefined);
+		const zen = buildModelsFromEntries("opencode", "https://opencode.ai/inference", entries, undefined);
 		for (const m of zen) {
 			expect((m.compat as any).requiresReasoningContentOnAssistantMessages).toBe(true);
 			expect((m.compat as any).thinkingFormat).toBeUndefined();
@@ -147,7 +152,7 @@ describe("opencode helpers", () => {
 		}
 
 		// opencode-go gets the full deepseek compat (flag + deepseek thinking format)
-		const go = buildModelsFromEntries("opencode-go", "https://opencode.ai/zen/go", entries, undefined);
+		const go = buildModelsFromEntries("opencode-go", "https://opencode.ai/inference/go", entries, undefined);
 		for (const m of go) {
 			expect((m.compat as any).requiresReasoningContentOnAssistantMessages).toBe(true);
 			expect((m.compat as any).thinkingFormat).toBe("deepseek");
@@ -156,7 +161,12 @@ describe("opencode helpers", () => {
 		}
 
 		// non-deepseek opencode-go models are untouched
-		const other = buildModelsFromEntries("opencode-go", "https://opencode.ai/zen/go", [{ id: "glm-5.2" }], undefined);
+		const other = buildModelsFromEntries(
+			"opencode-go",
+			"https://opencode.ai/inference/go",
+			[{ id: "glm-5.2" }],
+			undefined,
+		);
 		expect((other[0]?.compat as any)?.requiresReasoningContentOnAssistantMessages).toBeUndefined();
 	});
 
@@ -175,7 +185,7 @@ describe("opencode helpers", () => {
 
 		const goWithMetadata = buildModelsFromEntries(
 			"opencode-go",
-			"https://opencode.ai/zen/go",
+			"https://opencode.ai/inference/go",
 			[{ id: "deepseek-flash" }],
 			providerData,
 		)[0]!;
@@ -185,7 +195,7 @@ describe("opencode helpers", () => {
 
 		const goWithoutMetadata = buildModelsFromEntries(
 			"opencode-go",
-			"https://opencode.ai/zen/go",
+			"https://opencode.ai/inference/go",
 			[{ id: "deepseek-flash" }],
 			undefined,
 		)[0]!;
@@ -204,7 +214,7 @@ describe("opencode helpers", () => {
 		};
 		const nonDeepSeek = buildModelsFromEntries(
 			"opencode-go",
-			"https://opencode.ai/zen/go",
+			"https://opencode.ai/inference/go",
 			[{ id: "glm-5.2" }],
 			nonDeepSeekProviderData,
 		)[0]!;
@@ -213,7 +223,7 @@ describe("opencode helpers", () => {
 
 		const zen = buildModelsFromEntries(
 			"opencode",
-			"https://opencode.ai/zen",
+			"https://opencode.ai/inference",
 			[{ id: "deepseek-flash" }],
 			undefined,
 		)[0]!;
@@ -238,7 +248,7 @@ describe("opencode helpers", () => {
 
 	it("deduplicates and trims entries", () => {
 		const entries = [{ id: "a " }, { id: "a" }, { id: " b" }, { id: "" }, { id: undefined as any }];
-		const models = buildModelsFromEntries("opencode", "https://opencode.ai/zen", entries as any, undefined);
+		const models = buildModelsFromEntries("opencode", "https://opencode.ai/inference", entries as any, undefined);
 		expect(models.map((m) => m.id)).toEqual(["a", "b"]);
 	});
 
@@ -253,6 +263,32 @@ describe("opencode helpers", () => {
 		} as any;
 		const entries = buildFallbackEntriesFromModelsDev(data);
 		expect(entries.map((e) => e.id).sort()).toEqual(["good", "undef"]);
+	});
+
+	it("migrates only exact legacy OpenCode cached routing", () => {
+		const stale = {
+			id: "minimax-m2.7",
+			name: "MiniMax",
+			api: "openai-completions" as const,
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			reasoning: true,
+			input: ["text"] as "text"[],
+			cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1000,
+			maxTokens: 100,
+		};
+		const migrated = migrateStoredOpencodeModels("opencode-go", [stale])[0]!;
+		expect(migrated.api).toBe("anthropic-messages");
+		expect(migrated.baseUrl).toBe("https://opencode.ai/inference/go");
+		expect(migrated.reasoning).toBe(true);
+		const custom = { ...stale, baseUrl: "https://custom.example/v1" };
+		expect(migrateStoredOpencodeModels("opencode-go", [custom])[0]).toEqual(custom);
+	});
+
+	it("discovers Zen and Go models at the inference endpoints", async () => {
+		expect(ZEN_MODELS_ENDPOINT).toBe("https://opencode.ai/inference/v1/models");
+		expect(GO_MODELS_ENDPOINT).toBe("https://opencode.ai/inference/go/v1/models");
 	});
 
 	it("fetchOfficialEntries validates payload", async () => {
@@ -284,7 +320,7 @@ describe("opencode helpers", () => {
 			"opencode-go": { models: {} },
 		};
 		vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
-			if (String(url).includes("opencode.ai/zen/v1/models")) {
+			if (String(url).includes("opencode.ai/inference/v1/models")) {
 				return new Response(JSON.stringify(officialData), {
 					status: 200,
 					headers: { "content-type": "application/json" },
@@ -356,7 +392,7 @@ describe("opencode helpers", () => {
 		} as any;
 
 		vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
-			if (String(url).includes("opencode.ai/zen/v1/models")) {
+			if (String(url).includes("opencode.ai/inference/v1/models")) {
 				return new Response(JSON.stringify(officialData), {
 					status: 200,
 					headers: { "content-type": "application/json" },
@@ -411,7 +447,7 @@ describe("opencode helpers", () => {
 		} as any;
 
 		vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
-			if (String(url).includes("opencode.ai/zen/go/v1/models")) {
+			if (String(url).includes("opencode.ai/inference/go/v1/models")) {
 				return new Response(JSON.stringify(officialData), {
 					status: 200,
 					headers: { "content-type": "application/json" },
@@ -428,21 +464,267 @@ describe("opencode helpers", () => {
 
 		const provider = opencodeGoProvider();
 		const store = new InMemoryModelsStore();
+		const staleStored = {
+			models: [
+				{
+					id: "minimax-m2.7",
+					name: "Cached MiniMax",
+					api: "openai-completions" as const,
+					provider: "opencode-go",
+					baseUrl: "https://opencode.ai/zen/go/v1",
+					reasoning: true,
+					input: ["text"] as "text"[],
+					cost: { input: 3, output: 4, cacheRead: 5, cacheWrite: 6 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
+				{
+					id: "custom-model",
+					name: "Custom",
+					api: "openai-completions" as const,
+					provider: "opencode-go",
+					baseUrl: "https://custom.example/v1",
+					reasoning: false,
+					input: ["text"] as "text"[],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
+			],
+			lastModified: 123,
+			checkedAt: 456,
+			etag: '"cached-etag"',
+		};
+		const publish = vi.fn(async (pub: Parameters<RefreshModelsContext["publish"]>[0]) => {
+			if (pub.persist) await store.write("opencode-go", pub.persist);
+			else if ((pub as any).persist === null) await store.delete("opencode-go");
+			pub.update?.();
+			return true;
+		});
 		const ctx: RefreshModelsContext = {
-			stored: await store.read("opencode-go"),
-			publish: async (pub) => {
-				if (pub.persist) await store.write("opencode-go", pub.persist);
-				else if ((pub as any).persist === null) await store.delete("opencode-go");
-				pub.update?.();
-				return true;
-			},
+			stored: staleStored,
+			publish,
 			allowNetwork: true,
 			signal: new AbortController().signal,
 		};
 		await provider.refreshModels!(ctx);
 		expect(provider.getModels().some((m) => m.id === "minimax-m2.7")).toBe(true);
-		// Should be overridden to openai-completions per helper fix
-		expect(provider.getModels().find((m) => m.id === "minimax-m2.7")?.api).toBe("openai-completions");
+		// models.dev's Anthropic protocol is authoritative for MiniMax M2.7.
+		expect(provider.getModels().find((m) => m.id === "minimax-m2.7")?.api).toBe("anthropic-messages");
+		expect(publish.mock.calls[0]?.[0].update).toBeTypeOf("function");
+		expect(publish.mock.calls[0]?.[0].persist).toBeUndefined();
+		const published = publish.mock.calls.find(([entry]) => entry.persist)?.[0];
+		expect(published?.persist?.checkedAt).toBeTypeOf("number");
+		const cached = published?.persist?.models.find((model) => model.id === "minimax-m2.7");
+		expect(cached?.api).toBe("anthropic-messages");
+		expect(cached?.baseUrl).toBe("https://opencode.ai/inference/go");
+		expect(cached?.name).toBe("minimax-m2.7");
+		expect(cached?.cost.input).toBe(1);
+		expect(published?.persist?.models.some((model) => model.id === "custom-model")).toBe(false);
+	});
+
+	it("publishes offline Zen legacy-route migrations without mutating stored metadata", async () => {
+		const provider = opencodeProvider();
+		const stored = {
+			models: [
+				...[
+					["legacy-zen", "https://opencode.ai/zen"],
+					["legacy-zen-v1", "https://opencode.ai/zen/v1"],
+				].map(([id, baseUrl]) => ({
+					id: id!,
+					name: `Cached ${id}`,
+					api: "openai-completions" as const,
+					provider: "opencode",
+					baseUrl: baseUrl!,
+					reasoning: true,
+					input: ["text"] as "text"[],
+					cost: { input: 3, output: 4, cacheRead: 5, cacheWrite: 6 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				})),
+				{
+					id: "custom-url-control",
+					name: "Custom URL",
+					api: "openai-completions" as const,
+					provider: "opencode",
+					baseUrl: "https://custom.example/zen",
+					reasoning: false,
+					input: ["text"] as "text"[],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
+				{
+					id: "provider-control",
+					name: "Other Provider",
+					api: "openai-completions" as const,
+					provider: "custom-provider",
+					baseUrl: "https://opencode.ai/zen",
+					reasoning: false,
+					input: ["text"] as "text"[],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
+			],
+			lastModified: 123,
+			checkedAt: 456,
+			etag: '"offline-zen-cache"',
+		};
+		const storedSnapshot = structuredClone(stored);
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const publish = vi.fn(async (pub: Parameters<RefreshModelsContext["publish"]>[0]) => {
+			pub.update?.();
+			return true;
+		});
+
+		await provider.refreshModels!({
+			stored,
+			publish,
+			allowNetwork: false,
+			signal: new AbortController().signal,
+		});
+
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(publish.mock.calls[0]?.[0].update).toBeTypeOf("function");
+		expect(provider.getModels().find((model) => model.id === "legacy-zen")?.baseUrl).toBe(
+			"https://opencode.ai/inference",
+		);
+		expect(provider.getModels().find((model) => model.id === "legacy-zen-v1")?.baseUrl).toBe(
+			"https://opencode.ai/inference/v1",
+		);
+		expect(provider.getModels().find((model) => model.id === "custom-url-control")?.baseUrl).toBe(
+			"https://custom.example/zen",
+		);
+		expect(stored.models.find((model) => model.id === "provider-control")).toEqual(
+			storedSnapshot.models.find((model) => model.id === "provider-control"),
+		);
+		expect(stored).toEqual(storedSnapshot);
+	});
+
+	it("publishes offline Go legacy-route and MiniMax migrations without mutating stored metadata", async () => {
+		const provider = opencodeGoProvider();
+		const stored = {
+			models: [
+				...[
+					["legacy-go", "https://opencode.ai/zen/go"],
+					["legacy-go-v1", "https://opencode.ai/zen/go/v1"],
+				].map(([id, baseUrl]) => ({
+					id: id!,
+					name: `Cached ${id}`,
+					api: "openai-completions" as const,
+					provider: "opencode-go",
+					baseUrl: baseUrl!,
+					reasoning: true,
+					input: ["text"] as "text"[],
+					cost: { input: 3, output: 4, cacheRead: 5, cacheWrite: 6 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				})),
+				{
+					id: "minimax-m2.7",
+					name: "Cached MiniMax",
+					api: "openai-completions" as const,
+					provider: "opencode-go",
+					baseUrl: "https://opencode.ai/zen/go/v1",
+					reasoning: true,
+					input: ["text"] as "text"[],
+					cost: { input: 3, output: 4, cacheRead: 5, cacheWrite: 6 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
+				{
+					id: "custom-url-control",
+					name: "Custom URL",
+					api: "openai-completions" as const,
+					provider: "opencode-go",
+					baseUrl: "https://custom.example/zen/go",
+					reasoning: false,
+					input: ["text"] as "text"[],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
+				{
+					id: "provider-control",
+					name: "Other Provider",
+					api: "openai-completions" as const,
+					provider: "custom-provider",
+					baseUrl: "https://opencode.ai/zen/go",
+					reasoning: false,
+					input: ["text"] as "text"[],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 1000,
+					maxTokens: 100,
+				},
+			],
+			lastModified: 123,
+			checkedAt: 456,
+			etag: '"offline-go-cache"',
+		};
+		const storedSnapshot = structuredClone(stored);
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const publish = vi.fn(async (pub: Parameters<RefreshModelsContext["publish"]>[0]) => {
+			pub.update?.();
+			return true;
+		});
+
+		await provider.refreshModels!({
+			stored,
+			publish,
+			allowNetwork: false,
+			signal: new AbortController().signal,
+		});
+
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(publish.mock.calls[0]?.[0].update).toBeTypeOf("function");
+		expect(provider.getModels().find((model) => model.id === "legacy-go")?.baseUrl).toBe(
+			"https://opencode.ai/inference/go",
+		);
+		expect(provider.getModels().find((model) => model.id === "legacy-go-v1")?.baseUrl).toBe(
+			"https://opencode.ai/inference/go/v1",
+		);
+		expect(provider.getModels().find((model) => model.id === "minimax-m2.7")?.api).toBe("anthropic-messages");
+		expect(provider.getModels().find((model) => model.id === "custom-url-control")?.baseUrl).toBe(
+			"https://custom.example/zen/go",
+		);
+		expect(stored.models.find((model) => model.id === "provider-control")).toEqual(
+			storedSnapshot.models.find((model) => model.id === "provider-control"),
+		);
+		expect(stored).toEqual(storedSnapshot);
+	});
+
+	it("does not fetch or update cached models when initial publication is rejected", async () => {
+		const provider = opencodeGoProvider();
+		const modelsBeforeRefresh = provider.getModels();
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const publish = vi.fn(async () => false);
+		await provider.refreshModels!({
+			stored: {
+				models: [
+					{
+						id: "minimax-m2.7",
+						name: "Cached MiniMax",
+						api: "openai-completions",
+						provider: "opencode-go",
+						baseUrl: "https://opencode.ai/zen/go/v1",
+						reasoning: true,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 1000,
+						maxTokens: 100,
+					},
+				],
+			},
+			publish,
+			allowNetwork: true,
+			signal: new AbortController().signal,
+		});
+		expect(publish).toHaveBeenCalledTimes(1);
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(provider.getModels()).toEqual(modelsBeforeRefresh);
 	});
 
 	it("respects abort signal", async () => {

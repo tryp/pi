@@ -7,6 +7,7 @@
  * handles `compat` per-model.
  */
 
+import type { Provider, RefreshModelsContext } from "../models.ts";
 import type { Api, Model, ModelCost } from "../types.ts";
 import { isDeepSeekModelId } from "./deepseek-compat.ts";
 import {
@@ -17,18 +18,18 @@ import {
 	type ModelsDevProviderEntry,
 } from "./models-dev-client.ts";
 
-export const ZEN_MODELS_ENDPOINT = "https://opencode.ai/zen/v1/models";
-export const GO_MODELS_ENDPOINT = "https://opencode.ai/zen/go/v1/models";
+export const ZEN_MODELS_ENDPOINT = "https://opencode.ai/inference/v1/models";
+export const GO_MODELS_ENDPOINT = "https://opencode.ai/inference/go/v1/models";
 /** The models.dev catalog endpoint. Owned by `models-dev-client.ts`. */
 export const MODELS_DEV_ENDPOINT = MODELS_DEV_CATALOG_URL;
 
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
 export const DEFAULT_MAX_TOKENS = 16_384;
 
-export const ZEN_V1_BASE = "https://opencode.ai/zen/v1";
-export const ZEN_ANTHROPIC_BASE = "https://opencode.ai/zen";
-export const GO_V1_BASE = "https://opencode.ai/zen/go/v1";
-export const GO_ANTHROPIC_BASE = "https://opencode.ai/zen/go";
+export const ZEN_V1_BASE = "https://opencode.ai/inference/v1";
+export const ZEN_ANTHROPIC_BASE = "https://opencode.ai/inference";
+export const GO_V1_BASE = "https://opencode.ai/inference/go/v1";
+export const GO_ANTHROPIC_BASE = "https://opencode.ai/inference/go";
 
 const OPENCODE_OPENAI_COMPLETIONS_LONG_CACHE_RETENTION_UNSUPPORTED_MODELS = new Set([
 	"opencode:deepseek-v4-flash",
@@ -104,6 +105,45 @@ export type ModelsDevResponse = ModelsDevCatalog;
 
 function normalizePositiveNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+export function migrateStoredOpencodeModels(
+	variant: OpencodeVariant,
+	models: readonly Model<Api>[],
+): readonly Model<Api>[] {
+	const oldBase = variant === "opencode" ? "https://opencode.ai/zen" : "https://opencode.ai/zen/go";
+	const newBase = variant === "opencode" ? "https://opencode.ai/inference" : "https://opencode.ai/inference/go";
+	return models.map((model) => {
+		if (model.provider !== variant) return model;
+		if (model.baseUrl === oldBase || model.baseUrl === `${oldBase}/v1`) {
+			return {
+				...model,
+				...(variant === "opencode-go" && model.id === "minimax-m2.7" && model.api === "openai-completions"
+					? { api: "anthropic-messages" as const, baseUrl: newBase }
+					: { baseUrl: model.baseUrl === oldBase ? newBase : `${newBase}/v1` }),
+			};
+		}
+		return model;
+	});
+}
+
+/** Restore a migrated OpenCode cache without changing generic provider cache behavior. */
+export function migrateStoredOpencodeProvider<TApi extends Api>(
+	provider: Provider<TApi>,
+	variant: OpencodeVariant,
+): Provider<TApi> {
+	const refreshModels = provider.refreshModels;
+	if (!refreshModels) return provider;
+	return {
+		...provider,
+		refreshModels: (context: RefreshModelsContext) =>
+			refreshModels({
+				...context,
+				stored: context.stored
+					? { ...context.stored, models: migrateStoredOpencodeModels(variant, context.stored.models) }
+					: undefined,
+			}),
+	};
 }
 
 export async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
@@ -262,10 +302,6 @@ function buildModelForEntry(
 		};
 	}
 	if (variant === "opencode-go") {
-		if (modelId === "minimax-m2.7") {
-			api = "openai-completions";
-			baseUrl = `${basePath}/v1`;
-		}
 		if (modelId === "qwen3.5-plus" || modelId === "qwen3.6-plus") {
 			api = "openai-completions";
 			baseUrl = `${basePath}/v1`;
@@ -358,7 +394,7 @@ export async function fetchOpencodeModels(
 	signal?: AbortSignal,
 	options: { allowNetwork?: boolean; force?: boolean } = {},
 ): Promise<readonly Model<Api>[]> {
-	const basePath = variant === "opencode" ? "https://opencode.ai/zen" : "https://opencode.ai/zen/go";
+	const basePath = variant === "opencode" ? "https://opencode.ai/inference" : "https://opencode.ai/inference/go";
 	const endpoint = variant === "opencode" ? ZEN_MODELS_ENDPOINT : GO_MODELS_ENDPOINT;
 
 	let official: OpenCodeModelListEntry[] | undefined;
