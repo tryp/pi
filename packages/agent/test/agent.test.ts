@@ -668,6 +668,63 @@ describe("Agent", () => {
 		expect(agent.state.messages[agent.state.messages.length - 1].role).toBe("assistant");
 	});
 
+	it("can cancel only pending keyed follow-ups after steering and one-at-a-time delivery", async () => {
+		let responseCount = 0;
+		let deliveredFollowUpKeyCancellation: boolean | undefined;
+		let pendingFollowUpKeyCancellation: boolean | undefined;
+		let sawRetainedFollowUp = false;
+		let sawCancelledFollowUp = false;
+		const agent = new Agent({
+			streamFn: (_model, context) => {
+				responseCount++;
+				if (responseCount === 3) {
+					deliveredFollowUpKeyCancellation = agent.cancelQueuedMessage("delivered-follow-up");
+					pendingFollowUpKeyCancellation = agent.cancelQueuedMessage("pending-follow-up");
+				}
+				if (responseCount === 4) {
+					sawRetainedFollowUp = context.messages.some(
+						(message) => message.role === "user" && message.content === "retained follow-up",
+					);
+					sawCancelledFollowUp = context.messages.some(
+						(message) => message.role === "user" && message.content === "cancelled follow-up",
+					);
+				}
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage(`Processed ${responseCount}`),
+					});
+				});
+				return stream;
+			},
+		});
+		agent.steeringMode = "one-at-a-time";
+		agent.followUpMode = "one-at-a-time";
+		agent.state.messages = [
+			{ role: "user", content: "Initial", timestamp: Date.now() - 10 },
+			createAssistantMessage("Initial response"),
+		];
+		agent.steer({ role: "user", content: "Steering 1", timestamp: Date.now() });
+		agent.steer({ role: "user", content: "Steering 2", timestamp: Date.now() + 1 });
+		agent.followUp(
+			{ role: "user", content: "delivered follow-up", timestamp: Date.now() + 2 },
+			"delivered-follow-up",
+		);
+		agent.followUp({ role: "user", content: "cancelled follow-up", timestamp: Date.now() + 3 }, "pending-follow-up");
+		agent.followUp({ role: "user", content: "retained follow-up", timestamp: Date.now() + 4 }, "retained-follow-up");
+
+		await expect(agent.continue()).resolves.toBeUndefined();
+
+		expect(responseCount).toBe(4);
+		expect(deliveredFollowUpKeyCancellation).toBe(false);
+		expect(pendingFollowUpKeyCancellation).toBe(true);
+		expect(sawRetainedFollowUp).toBe(true);
+		expect(sawCancelledFollowUp).toBe(false);
+		expect(agent.hasQueuedMessages()).toBe(false);
+	});
+
 	it("continue() should keep one-at-a-time steering semantics from assistant tail", async () => {
 		let responseCount = 0;
 		const agent = new Agent({
