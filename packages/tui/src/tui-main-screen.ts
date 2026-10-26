@@ -272,14 +272,18 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		newLines = this.applyLineResets(newLines);
 
-		// Helper to clear scrollback and viewport and render all new lines
-		const fullRender = (clear: boolean): void => {
+		// Helper to clear the viewport and render all new lines. Preserve scrollback
+		// for content and height redraws; only a width change invalidates saved wrapped lines.
+		const fullRender = (clear: boolean, clearScrollback = false): void => {
 			this.fullRedrawCount += 1;
 			const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
 			output.append("\x1b[?2026h"); // Begin synchronized output
 			if (clear) {
 				output.append(this.deleteKittyImages(this.previousKittyImageIds));
-				output.append("\x1b[2J\x1b[H\x1b[3J"); // Clear screen, home, then clear scrollback
+				output.append("\x1b[2J\x1b[H"); // Clear the visible screen and home
+				if (clearScrollback) {
+					output.append("\x1b[3J"); // Width changes make saved wrapped lines unreadable
+				}
 			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) output.append("\r\n");
@@ -336,7 +340,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// Width changes always need a full re-render because wrapping changes.
 		if (widthChanged) {
 			logRedraw(`terminal width changed (${this.previousWidth} -> ${width})`);
-			fullRender(true);
+			fullRender(true, true);
 			return;
 		}
 
