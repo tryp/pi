@@ -9,12 +9,15 @@ import {
 	mkdirSync,
 	openSync,
 	readdirSync,
+	readFileSync,
 	readSync,
+	renameSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -988,14 +991,196 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	}
 }
 
-export type SessionListProgress = (loaded: number, total: number) => void;
-
+// --- Persistent metadata cache for session listing (/resume) ---
+// Metadata is stable while a JSONL file's size and mtime are unchanged. Cache
+// picker fields beside each sessions directory and fully parse only cache misses.
+// On cache hits, search covers only the first 8 KiB of session text.
+const METADATA_CACHE_FILENAME = ".metadata-cache-v1.json";
+const METADATA_CACHE_VERSION = 1;
+const METADATA_CACHE_SEARCHTEXT_MAX_CHARS = 8192;
 const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
 
-async function buildSessionInfosWithConcurrency(
+interface MetadataCacheEntry {
+	size: number;
+	mtimeMs: number;
+	id: string;
+	cwd: string;
+	created: string;
+	modified: string;
+	messageCount: number;
+	firstMessage: string;
+	name: string | null;
+	parentSession: string | null;
+	searchText: string;
+}
+
+interface MetadataCacheContext {
+	entries: Record<string, MetadataCacheEntry>;
+	knownFileNames: Set<string>;
+	dirty: boolean;
+}
+
+const pendingMetadataCacheWrites = new Map<string, Promise<void>>();
+
+function metadataCacheDebug(message: string): void {
+	if (process.env.PI_METADATA_CACHE_DEBUG === "1") {
+		console.error(`[metadata-cache] ${message}`);
+	}
+}
+
+function readMetadataCacheEntries(dir: string): Record<string, MetadataCacheEntry> {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(join(dir, METADATA_CACHE_FILENAME), "utf8"));
+		if (
+			parsed &&
+			typeof parsed === "object" &&
+			"version" in parsed &&
+			parsed.version === METADATA_CACHE_VERSION &&
+			"entries" in parsed &&
+			parsed.entries &&
+			typeof parsed.entries === "object"
+		) {
+			return parsed.entries as Record<string, MetadataCacheEntry>;
+		}
+	} catch {
+		// Missing or corrupt cache: rebuild from scratch.
+	}
+	return {};
+}
+
+function isUsableMetadataCacheEntry(entry: MetadataCacheEntry | undefined): entry is MetadataCacheEntry {
+	return Boolean(
+		entry &&
+			typeof entry.id === "string" &&
+			typeof entry.created === "string" &&
+			typeof entry.modified === "string" &&
+			typeof entry.size === "number" &&
+			typeof entry.mtimeMs === "number",
+	);
+}
+
+function sessionInfoFromCacheEntry(filePath: string, entry: MetadataCacheEntry): SessionInfo | null {
+	const created = new Date(entry.created);
+	const modified = new Date(entry.modified);
+	if (Number.isNaN(created.getTime()) || Number.isNaN(modified.getTime())) return null;
+	return {
+		path: filePath,
+		id: entry.id,
+		cwd: typeof entry.cwd === "string" ? entry.cwd : "",
+		name: entry.name ?? undefined,
+		parentSessionPath: entry.parentSession ?? undefined,
+		created,
+		modified,
+		messageCount: entry.messageCount,
+		firstMessage: entry.firstMessage,
+		allMessagesText: typeof entry.searchText === "string" ? entry.searchText : "",
+	};
+}
+
+function writeMetadataCache(dir: string, context: MetadataCacheContext): Promise<void> {
+	if (!context.dirty) return Promise.resolve();
+	const cachePath = join(dir, METADATA_CACHE_FILENAME);
+	const previous = pendingMetadataCacheWrites.get(cachePath) ?? Promise.resolve();
+	const write = previous
+		.catch(() => {})
+		.then(() => {
+			for (const name of Object.keys(context.entries)) {
+				if (!context.knownFileNames.has(name)) delete context.entries[name];
+			}
+			const payload = JSON.stringify({
+				version: METADATA_CACHE_VERSION,
+				updatedAt: new Date().toISOString(),
+				entries: context.entries,
+			});
+			const tmpPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+			try {
+				writeFileSync(tmpPath, payload);
+				renameSync(tmpPath, cachePath);
+				metadataCacheDebug(`wrote ${cachePath} (${Object.keys(context.entries).length} entries)`);
+			} catch {
+				// Best effort: a failed cache write must never break listing.
+				try {
+					unlinkSync(tmpPath);
+				} catch {
+					// Ignore cleanup failures.
+				}
+			}
+		});
+	pendingMetadataCacheWrites.set(cachePath, write);
+	return write;
+}
+
+async function pruneEmptyDirectoryMetadataCache(dir: string): Promise<void> {
+	const entries = readMetadataCacheEntries(dir);
+	if (Object.keys(entries).length === 0) return;
+	await writeMetadataCache(dir, { entries, knownFileNames: new Set(), dirty: true });
+}
+
+async function resolveMetadataCacheHits(
 	files: string[],
 	onLoaded: () => void,
-): Promise<(SessionInfo | null)[]> {
+): Promise<{
+	hits: Map<string, SessionInfo>;
+	misses: string[];
+	contexts: Map<string, MetadataCacheContext>;
+}> {
+	const byDir = new Map<string, string[]>();
+	for (const file of files) {
+		const dir = dirname(file);
+		const dirFiles = byDir.get(dir) ?? [];
+		dirFiles.push(file);
+		byDir.set(dir, dirFiles);
+	}
+
+	const hits = new Map<string, SessionInfo>();
+	const misses: string[] = [];
+	const contexts = new Map<string, MetadataCacheContext>();
+	await Promise.all(
+		[...byDir.entries()].map(async ([dir, dirFiles]) => {
+			const context: MetadataCacheContext = {
+				entries: readMetadataCacheEntries(dir),
+				knownFileNames: new Set(dirFiles.map((file) => basename(file))),
+				dirty: false,
+			};
+			contexts.set(dir, context);
+			if (Object.keys(context.entries).some((name) => !context.knownFileNames.has(name))) {
+				context.dirty = true;
+			}
+			await Promise.all(
+				dirFiles.map(async (file) => {
+					const cached = context.entries[basename(file)];
+					let stats: Awaited<ReturnType<typeof stat>> | undefined;
+					try {
+						stats = await stat(file);
+					} catch {
+						// Deleted mid-listing: the original parser would also fail.
+					}
+					if (
+						stats &&
+						isUsableMetadataCacheEntry(cached) &&
+						cached.size === stats.size &&
+						cached.mtimeMs === stats.mtimeMs
+					) {
+						const info = sessionInfoFromCacheEntry(file, cached);
+						if (info) {
+							hits.set(file, info);
+							onLoaded();
+							return;
+						}
+					}
+					misses.push(file);
+					if (cached) {
+						delete context.entries[basename(file)];
+						context.dirty = true;
+					}
+				}),
+			);
+		}),
+	);
+	return { hits, misses, contexts };
+}
+
+async function buildSessionInfosUncached(files: string[], onLoaded: () => void): Promise<(SessionInfo | null)[]> {
 	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
 	const inFlight = new Set<Promise<void>>();
 	let nextIndex = 0;
@@ -1032,6 +1217,50 @@ async function buildSessionInfosWithConcurrency(
 	return results;
 }
 
+async function buildSessionInfosWithConcurrency(
+	files: string[],
+	onLoaded: () => void,
+): Promise<(SessionInfo | null)[]> {
+	const cache = await resolveMetadataCacheHits(files, onLoaded);
+	const missInfos = await buildSessionInfosUncached(cache.misses, onLoaded);
+	const infoByFile = new Map<string, SessionInfo>();
+	await Promise.all(
+		cache.misses.map(async (file, index) => {
+			const info = missInfos[index];
+			if (!info || Number.isNaN(info.created.getTime()) || Number.isNaN(info.modified.getTime())) return;
+			let stats: Awaited<ReturnType<typeof stat>> | undefined;
+			try {
+				stats = await stat(file);
+			} catch {
+				// Deleted between parse and stat: drop rather than cache stale metadata.
+				return;
+			}
+			const context = cache.contexts.get(dirname(file));
+			if (!context) return;
+			context.entries[basename(file)] = {
+				size: stats.size,
+				mtimeMs: stats.mtimeMs,
+				id: info.id,
+				cwd: info.cwd,
+				created: info.created.toISOString(),
+				modified: info.modified.toISOString(),
+				messageCount: info.messageCount,
+				firstMessage: info.firstMessage,
+				name: info.name ?? null,
+				parentSession: info.parentSessionPath ?? null,
+				searchText: (info.allMessagesText ?? "").slice(0, METADATA_CACHE_SEARCHTEXT_MAX_CHARS),
+			};
+			context.dirty = true;
+			infoByFile.set(file, info);
+		}),
+	);
+	await Promise.all([...cache.contexts.entries()].map(([dir, context]) => writeMetadataCache(dir, context)));
+	metadataCacheDebug(`hits=${cache.hits.size} misses=${cache.misses.length}`);
+	return files.map((file) => cache.hits.get(file) ?? infoByFile.get(file) ?? null);
+}
+
+export type SessionListProgress = (loaded: number, total: number) => void;
+
 async function listSessionsFromDir(
 	dir: string,
 	onProgress?: SessionListProgress,
@@ -1046,6 +1275,7 @@ async function listSessionsFromDir(
 	try {
 		const dirEntries = await readdir(dir);
 		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+		if (files.length === 0) await pruneEmptyDirectoryMetadataCache(dir);
 		const total = progressTotal ?? files.length;
 
 		let loaded = 0;
@@ -1980,6 +2210,7 @@ export class SessionManager {
 					const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
 					dirFiles.push(files.map((f) => join(dir, f)));
 					totalFiles += files.length;
+					if (files.length === 0) await pruneEmptyDirectoryMetadataCache(dir);
 				} catch {
 					dirFiles.push([]);
 				}
