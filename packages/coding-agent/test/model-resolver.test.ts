@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
-import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
+import { builtinModels, getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -905,6 +905,30 @@ describe("default model selection", () => {
 				`${provider} default ${defaultId} should exist in its generated catalog`,
 			).toBe(true);
 		}
+	});
+
+	test("ollama-cloud default exists in its curated baseline", () => {
+		// ollama-cloud is not in the generated catalog: models.dev owns its list.
+		const defaults = builtinModels()
+			.getModels("ollama-cloud")
+			.map((model) => model.id);
+		expect(defaults).toContain(defaultModelPerProvider["ollama-cloud"]);
+	});
+
+	test("ollama-cloud ids carry colons and still resolve verbatim", () => {
+		const available = builtinModels().getModels("ollama-cloud");
+
+		const exact = parseModelPattern("gpt-oss:120b", available);
+		expect(exact.model?.id).toBe("gpt-oss:120b");
+		expect(exact.thinkingLevel).toBeUndefined();
+
+		const canonical = parseModelPattern("ollama-cloud/gpt-oss:120b", available);
+		expect(canonical.model?.id).toBe("gpt-oss:120b");
+
+		// A thinking suffix after the colon-bearing id is still read as a suffix.
+		const suffixed = parseModelPattern("gpt-oss:120b:high", available);
+		expect(suffixed.model?.id).toBe("gpt-oss:120b");
+		expect(suffixed.thinkingLevel).toBe("high");
 	});
 
 	test("ai-gateway default tracks current model", () => {

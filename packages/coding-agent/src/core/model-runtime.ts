@@ -183,6 +183,9 @@ export class ModelRuntime implements Models {
 				? new FileModelsStore(options.modelsStorePath ?? join(dirname(modelsPath), "models-store.json"))
 				: new InMemoryCodingAgentModelsStore());
 		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
+		// Providers that refresh from their own source: wrapping one in the hosted
+		// pi.dev catalog overlay would replace its refreshModels and swap its catalog
+		// for a 404. A new discovery-backed builtin provider belongs in this list.
 		const providers = builtinProviderCatalog
 			.builtinProviders()
 			.map((provider) =>
@@ -190,7 +193,8 @@ export class ModelRuntime implements Models {
 				provider.id === "opencode" ||
 				provider.id === "opencode-go" ||
 				provider.id === "zai" ||
-				provider.id === "openai-codex"
+				provider.id === "openai-codex" ||
+				provider.id === "ollama-cloud"
 					? provider
 					: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
 			);

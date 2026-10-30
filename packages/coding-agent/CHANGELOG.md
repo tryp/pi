@@ -7,6 +7,7 @@
 - Added the `stream_inactivity` agent event and configurable stream inactivity diagnostics. This additive event-union change may require updates to exhaustive switches in external agent consumers.
 - Added `ui_prompt_start` and `ui_prompt_end` extension events so host integrations can distinguish active agent work from waiting on user-facing `ctx.ui` prompts ([#5329](https://github.com/earendil-works/pi/issues/5329)).
 - Added transcript usage notices for compaction and branch summaries when cache miss notices are enabled.
+- Added the builtin `ollama-cloud` provider (hosted Ollama Cloud, `OLLAMA_API_KEY`), with its model catalog refreshed from models.dev and documented in the provider and environment variable help.
 - Added RPC `clear_queue` to retrieve and remove queued steering and follow-up messages ([#8432](https://github.com/earendil-works/pi/issues/8432)).
 - Added environment variables and advanced settings for overriding auto-detected terminal hyperlink, image, and truecolor capabilities ([#8665](https://github.com/earendil-works/pi/issues/8665)).
 - Added `fullscreenCopyOnSelect` to disable automatic fullscreen selection copy; when disabled, `Ctrl+X` copies the active text selection before falling back to the last assistant message, while `/tree` still copies the selected message ([#7720](https://github.com/earendil-works/pi/issues/7720)).

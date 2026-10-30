@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `ollama-cloud` builtin provider for the hosted Ollama Cloud service (`https://ollama.com/v1`, `OLLAMA_API_KEY`). Its curated offline baseline is overlaid by models.dev discovery, so the hosted catalog (Kimi, GLM, DeepSeek, GPT-OSS, MiniMax, ...) stays current without a release.
+
 ### Fixed
 
 - Dropped orphaned OpenAI Responses tool results after errors or context compaction to prevent unmatched function-call outputs.

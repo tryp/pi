@@ -36,6 +36,8 @@ For local models (Ollama, LM Studio, vLLM), only `id` is required per model:
 
 The `apiKey` value is a placeholder because Ollama ignores it. pi still treats models as requiring auth before they appear in `/model`, so keyless local servers should keep a dummy value, save a key for that provider with `/login`, or pass `--api-key` when selecting the model.
 
+Ollama Cloud (`https://ollama.com/v1`) is built in: set `OLLAMA_API_KEY` or save a key with `/login ollama-cloud`, and the hosted catalog (Kimi, GLM, DeepSeek, GPT-OSS, MiniMax and friends) is available without any `models.json` entry.
+
 Some OpenAI-compatible servers do not understand the `developer` role used for reasoning-capable models. For those providers, set `compat.supportsDeveloperRole` to `false` so pi sends the system prompt as a `system` message instead. If the server also does not support `reasoning_effort`, set `compat.supportsReasoningEffort` to `false` too.
 
 You can set `compat` at the provider level to apply to all models, or at the model level to override a specific model. This commonly applies to Ollama, vLLM, SGLang, and similar OpenAI-compatible servers.

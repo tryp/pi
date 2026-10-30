@@ -88,6 +88,7 @@ pi
 | ZAI Coding Plan (China) | `ZAI_CODING_CN_API_KEY` | `zai-coding-cn` |
 | OpenCode Zen | `OPENCODE_API_KEY` | `opencode` |
 | OpenCode Go | `OPENCODE_API_KEY` | `opencode-go` |
+| Ollama Cloud | `OLLAMA_API_KEY` | `ollama-cloud` |
 | Radius | `RADIUS_API_KEY` | `radius` |
 | Hugging Face | `HF_TOKEN` | `huggingface` |
 | Fireworks | `FIREWORKS_API_KEY` | `fireworks` |
@@ -303,7 +304,9 @@ See [llama.cpp](llama-cpp.md) for server setup, model directory layout, environm
 
 ## Custom Providers
 
-**Via models.json:** Add Ollama, LM Studio, vLLM, or any provider that speaks a supported API (OpenAI Completions, OpenAI Responses, Anthropic Messages, Google Generative AI). See [models.md](models.md).
+**Via models.json:** Add a local Ollama server, LM Studio, vLLM, or any provider that speaks a supported API (OpenAI Completions, OpenAI Responses, Anthropic Messages, Google Generative AI). See [models.md](models.md).
+
+**Ollama Cloud:** The hosted service is built in as `ollama-cloud`. Set `OLLAMA_API_KEY` (or save a key with `/login ollama-cloud`) and pick a model with `/model`; its catalog refreshes from models.dev, so no `models.json` entry is needed. Only a self-hosted Ollama server belongs under Custom Providers.
 
 **Via extensions:** For providers that need custom API implementations or OAuth flows, create an extension. See [custom-provider.md](custom-provider.md) and [examples/extensions/custom-provider-gitlab-duo](../examples/extensions/custom-provider-gitlab-duo/).
 

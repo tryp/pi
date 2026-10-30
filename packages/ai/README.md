@@ -87,7 +87,8 @@ Unified LLM API with provider collections, automatic auth resolution, token and 
 - **Kimi For Coding** (Moonshot AI subscription endpoint, uses Anthropic-compatible API)
 - **Qwen Token Plan** (separate Individual and existing catalogs, with a separate China provider)
 - **Xiaomi MiMo** (defaults to API billing endpoint, with separate Token Plan providers for `cn`/`ams`/`sgp` regions)
-- **Any OpenAI-compatible API**: Ollama, vLLM, LM Studio, etc.
+- **Ollama Cloud** (hosted `ollama.com`, `OLLAMA_API_KEY`; the model list is discovered from models.dev)
+- **Any OpenAI-compatible API**: a local Ollama server, vLLM, LM Studio, etc.
 
 ## Installation
 
@@ -438,6 +439,7 @@ Built-in providers resolve these env vars (Node.js; in browsers pass `apiKey` ex
 | Moonshot AI / Moonshot AI (China) | `MOONSHOT_API_KEY` |
 | Hugging Face | `HF_TOKEN` |
 | OpenCode Zen / OpenCode Go | `OPENCODE_API_KEY` |
+| Ollama Cloud | `OLLAMA_API_KEY` |
 | Kimi For Coding | `KIMI_API_KEY` |
 | Qwen Token Plan (existing catalog) | `QWEN_TOKEN_PLAN_API_KEY` |
 | Qwen Token Plan (Individual) | `QWEN_TOKEN_PLAN_API_KEY` |
@@ -1615,6 +1617,8 @@ Add a lazy wrapper `src/api/<api-id>.lazy.ts` (`<name>Api()` via `lazyApi()`) so
 - Map chat/tool-capable provider model data to the standardized `Model` interface via `scripts/generate-models.ts`; hydration groups the ignored `src/providers/data/<id>.json` values by API, while stable `src/providers/<id>.models.ts` wrappers derive exact model/API types directly from those JSON keys
 - Map image-generation provider model data to the standardized `ImagesModel` interface via `scripts/generate-image-models.ts`
 - Handle provider-specific quirks (pricing format, capability flags, model ID transformations)
+
+A provider whose catalog is owned upstream and changes without a pi release can skip this step entirely: keep a small curated floor in `src/providers/<id>-baseline.ts`, overlay models.dev in a `<id>-discovery.ts` `fetchModels` callback, and leave `src/providers/data/` and `src/models.generated.ts` untouched. The floor must not be named `<id>.models.ts` — the generator owns that namespace, refuses the extra shard in `check:model-data`, and deletes it on the next `generate-models` run. `ollama-cloud.ts` is the models.dev-backed example; `radius.ts` is the same shape fed by a gateway instead. A discovery-backed builtin provider must also be listed in `packages/coding-agent/src/core/model-runtime.ts` next to `radius`, or the hosted-catalog wrapper replaces its `refreshModels`.
 
 #### 4. Provider Factory (`src/providers/<id>.ts`)
 
