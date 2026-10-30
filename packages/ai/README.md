@@ -1620,6 +1620,8 @@ Add a lazy wrapper `src/api/<api-id>.lazy.ts` (`<name>Api()` via `lazyApi()`) so
 
 A provider whose catalog is owned upstream and changes without a pi release can skip this step entirely: keep a small curated floor in `src/providers/<id>-baseline.ts`, overlay models.dev in a `<id>-discovery.ts` `fetchModels` callback, and leave `src/providers/data/` and `src/models.generated.ts` untouched. The floor must not be named `<id>.models.ts` — the generator owns that namespace, refuses the extra shard in `check:model-data`, and deletes it on the next `generate-models` run. `ollama-cloud.ts` is the models.dev-backed example; `radius.ts` is the same shape fed by a gateway instead. A discovery-backed builtin provider must also be listed in `packages/coding-agent/src/core/model-runtime.ts` next to `radius`, or the hosted-catalog wrapper replaces its `refreshModels`.
 
+When the provider also publishes its own model list, use it for existence and models.dev for metadata: neither source is authoritative alone. `ollama-cloud` intersects the two, because an endpoint list carries no limits or capability flags (and includes embedding, vision and speech models), while models.dev lags the service and lists ids a given key may not be entitled to call.
+
 #### 4. Provider Factory (`src/providers/<id>.ts`)
 
 - `createProvider()` wiring catalog + auth + the lazy API wrapper

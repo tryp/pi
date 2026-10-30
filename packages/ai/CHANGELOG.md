@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added the `ollama-cloud` builtin provider for the hosted Ollama Cloud service (`https://ollama.com/v1`, `OLLAMA_API_KEY`). Its curated offline baseline is overlaid by models.dev discovery, so the hosted catalog (Kimi, GLM, DeepSeek, GPT-OSS, MiniMax, ...) stays current without a release.
+- Added the `ollama-cloud` builtin provider for the hosted Ollama Cloud service (`https://ollama.com/v1`, `OLLAMA_API_KEY`). Its curated offline baseline is overlaid by models.dev discovery, so the hosted catalog (Kimi, GLM, DeepSeek, GPT-OSS, MiniMax, ...) stays current without a release. The overlay is intersected with the ids `GET /v1/models` reports for the configured key, an empty intersection falls back to the unfiltered catalog rather than publishing nothing, and discovery exposes counters (`servedButUnmapped`, `knownButUnserved`, `entitlementFailed`, `servedEmpty`, `intersectionEmpty`) for diagnostics.
 
 ### Fixed
 

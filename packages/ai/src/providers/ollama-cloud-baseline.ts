@@ -1,13 +1,17 @@
 /**
  * Curated offline floor for Ollama Cloud.
  *
- * models.dev is authoritative for this provider and `ollama-cloud-discovery.ts`
- * overlays it on every refresh (23 tool-capable models at the time of writing).
- * This list exists so `/model` and `pi --model ollama-cloud/<id>` work before the
- * first catalog refresh, and so the provider keeps a usable set when the catalog
- * endpoint cannot be reached. Ids carry colons (`deepseek-v4.1-flash:1017`,
- * `gpt-oss:120b`); model resolution matches the full id before it reads a colon
- * as a thinking-level suffix, so they resolve as-is.
+ * models.dev supplies this provider's model metadata and the hosted endpoint
+ * supplies the ids the configured key can actually call; `ollama-cloud-discovery.ts`
+ * intersects the two on every refresh (23 described models against 25 served at
+ * the time of writing). This list exists so `/model` and `pi --model
+ * ollama-cloud/<id>` work before the first catalog refresh, and so the provider
+ * keeps a usable set when the catalog endpoint cannot be reached. Every id here
+ * is pinned by a test against the ids the service was observed serving; the
+ * provider is authoritative, so a retired id is removed rather than kept.
+ *
+ * Ids carry colons (`gpt-oss:120b`); model resolution matches the full id before
+ * it reads a colon as a thinking-level suffix, so they resolve as-is.
  */
 
 import type { Model } from "../types.ts";
@@ -55,19 +59,6 @@ export const OLLAMA_CLOUD_MODELS: readonly Model<"openai-completions">[] = [
 		compat: OLLAMA_CLOUD_COMPAT,
 		contextWindow: 1_048_576,
 		maxTokens: 131_072,
-	},
-	{
-		id: "deepseek-v4-pro",
-		name: "DeepSeek V4 Pro",
-		api: "openai-completions",
-		provider: OLLAMA_CLOUD_PROVIDER_ID,
-		baseUrl: OLLAMA_CLOUD_BASE_URL,
-		reasoning: true,
-		input: ["text"],
-		cost: { input: 0.66, output: 1.98, cacheRead: 0.022, cacheWrite: 0 },
-		compat: OLLAMA_CLOUD_COMPAT,
-		contextWindow: 1_048_576,
-		maxTokens: 1_048_576,
 	},
 	{
 		id: "minimax-m3.1-flash",

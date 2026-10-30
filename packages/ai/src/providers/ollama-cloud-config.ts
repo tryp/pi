@@ -24,6 +24,9 @@ export const OLLAMA_CLOUD_PROVIDER_ID = "ollama-cloud";
 export const OLLAMA_CLOUD_PROVIDER_NAME = "Ollama Cloud";
 export const OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1";
 
+/** The account-scoped model list. It carries ids only, and is not capability-filtered. */
+export const OLLAMA_CLOUD_MODELS_URL = `${OLLAMA_CLOUD_BASE_URL}/models`;
+
 /** models.dev serves the authoritative model list under this provider key. */
 export const OLLAMA_CLOUD_CATALOG_KEY = "ollama-cloud";
 
