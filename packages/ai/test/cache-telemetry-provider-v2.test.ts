@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
@@ -22,7 +23,7 @@ import {
 	createCacheTelemetrySession,
 	getCacheTelemetryDataProperty,
 } from "../src/cache-telemetry.ts";
-import { getBuiltinModel } from "../src/providers/all.ts";
+import { getBuiltinModel, getBuiltinProviders } from "../src/providers/all.ts";
 import type { Context, Model } from "../src/types.ts";
 
 const captured = vi.hoisted(() => ({
@@ -1652,13 +1653,128 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 		} as never);
 		telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
 		await telemetry.observer.flush();
-		expect(requestRecords(telemetry.records)[0]).toMatchObject({
-			provider: "custom",
-			model: "unknown",
+		const request = requestRecords(telemetry.records)[0];
+		expect(request).toMatchObject({
+			provider: expect.stringMatching(/^provider-sha256:[a-f0-9]{64}$/),
+			model: expect.stringMatching(/^model-sha256:[a-f0-9]{64}$/),
+			labelsSuppressed: { provider: true, model: true },
 			phase: "final_wire_body",
 			transport: "unknown",
 		});
 		assertTelemetryPrivacy(telemetry.records);
+	});
+
+	it("keeps each telemetry API adapter tied to provider IDs in the catalog or explicit dynamic set", () => {
+		const apiDirectory = new URL("../src/api/", import.meta.url);
+		const adapterFiles = readdirSync(apiDirectory)
+			.filter((file) => file.endsWith(".ts") && !file.endsWith(".lazy.ts"))
+			.filter((file) => readFileSync(new URL(file, apiDirectory), "utf8").includes("observeCacheRequestSafely"));
+		expect(adapterFiles.sort()).toEqual([
+			"anthropic-messages.ts",
+			"azure-openai-responses.ts",
+			"google-generative-ai.ts",
+			"google-vertex.ts",
+			"openai-codex-responses.ts",
+			"openai-completions.ts",
+			"openai-responses.ts",
+			"pi-messages.ts",
+		].sort());
+		for (const file of adapterFiles) {
+			const source = readFileSync(new URL(file, apiDirectory), "utf8");
+			expect(source).toMatch(/provider:\s*model\.provider/);
+		}
+	});
+
+	it("derives accepted provider labels from every generated built-in provider and explicit dynamic provider", async () => {
+		for (const provider of [...getBuiltinProviders(), "radius", "ollama-cloud"]) {
+			const telemetry = createTelemetryCollector();
+			const ids = telemetry.observer.observeRequest({
+				provider,
+				model: "gpt-6-luna",
+				phase: "canonical_body",
+				transport: "sse",
+				payload: {},
+				wirePayload: "{}",
+			});
+			telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
+			await telemetry.observer.flush();
+			const request = requestRecords(telemetry.records)[0];
+			expect(request?.provider).toBe(provider);
+			expect(request).not.toHaveProperty("labelsSuppressed");
+		}
+	});
+
+	it("emits label suppression flags on request records and omits them for ordinary labels", async () => {
+		const recordFor = async (provider: string, model: string) => {
+			const telemetry = createTelemetryCollector();
+			const ids = telemetry.observer.observeRequest({
+				provider,
+				model,
+				phase: "canonical_body",
+				transport: "sse",
+				payload: {},
+				wirePayload: "{}",
+			});
+			telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
+			await telemetry.observer.flush();
+			return requestRecords(telemetry.records)[0]!;
+		};
+
+		expect(await recordFor("openai", "gpt-6-luna")).not.toHaveProperty("labelsSuppressed");
+		expect(await recordFor("local-provider", "gpt-6-luna")).toMatchObject({
+			labelsSuppressed: { provider: true, model: false },
+		});
+		expect(await recordFor("openai", "my-private-model")).toMatchObject({
+			labelsSuppressed: { provider: false, model: true },
+		});
+	});
+
+	it("keeps unknown model lanes distinct and hashes them stably across processes", async () => {
+		const telemetry = createTelemetryCollector();
+		const modelLabel = async (model: string) => {
+			const ids = telemetry.observer.observeRequest({
+				provider: "openai",
+				model,
+				phase: "canonical_body",
+				transport: "sse",
+				payload: { input: [{ role: "user", content: "same" }] },
+				wirePayload: JSON.stringify({ input: [{ role: "user", content: "same" }] }),
+			});
+			telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
+			await telemetry.observer.flush();
+			return requestRecords(telemetry.records).at(-1)!;
+		};
+		const first = await modelLabel("private-model-alpha");
+		const different = await modelLabel("private-model-beta");
+		const longModel = await modelLabel("x".repeat(512));
+		const telemetryModuleUrl = new URL("../src/cache-telemetry.ts", import.meta.url).href;
+		const otherProcessScript = `
+			import { createCacheTelemetrySession } from ${JSON.stringify(telemetryModuleUrl)};
+			const records = [];
+			const observer = createCacheTelemetrySession((record) => records.push(record));
+			const ids = observer.observeRequest({
+				provider: "openai", model: "private-model-alpha", phase: "canonical_body",
+				transport: "sse", payload: {}, wirePayload: "{}",
+			});
+			observer.observeOutcome({ ...ids, outcome: "success" });
+			await observer.flush();
+			process.stdout.write(records.find((record) => record.kind === "cache_request").model);
+		`;
+		const otherProcessLabel = execFileSync(
+			process.execPath,
+			["--experimental-strip-types", "--input-type=module", "-e", otherProcessScript],
+			{ encoding: "utf8" },
+		);
+		const second = requestRecords(telemetry.records)[1]!;
+
+		expect(first.model).toMatch(/^model-sha256:[a-f0-9]{64}$/);
+		expect(first.model).not.toBe(different.model);
+		expect(first.model).toBe(otherProcessLabel);
+		expect(longModel.model).toMatch(/^model-sha256:[a-f0-9]{64}$/);
+		expect(longModel.prefixComparable).toBe(true);
+		expect(second.comparisonUnavailableCause).toBe("no_predecessor");
+		expect(first.prefixComparable).toBe(true);
+		expect(second.prefixComparable).toBe(true);
 	});
 
 	it("reserves terminal admission and writes each admitted attempt as one bounded batch", async () => {
