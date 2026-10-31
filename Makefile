@@ -50,6 +50,11 @@
 #    again through the public deployed interface.
 
 RUNTIME_DIR ?= $(HOME)/.pi/local/pi-coding-agent
+
+# The analyzer records deploy events so a later effectiveness analysis can tell
+# what was live when. It is optional on purpose: this repo must still deploy on a
+# machine with no analyzer checkout.
+DEPLOY_LEDGER_RECORDER ?= $(HOME)/src/pi-session-analysis/scripts/record-deploy
 CORE_PKGS := telemetry agent coding-agent ai client protocol tui
 PI ?= pi
 SMOKE_TIMEOUT ?= 90
@@ -69,7 +74,7 @@ define assert-dist-fresh
 	fi
 endef
 
-.PHONY: deploy deploy-full verify smoke-test test-deploy-runtime deployed-commit build-telemetry build-agent build-ai build-client build-protocol build-tui build-coding-agent build-extra mutcheck-deploy-gates
+.PHONY: deploy deploy-full verify smoke-test test-deploy-runtime deployed-commit record-deploy build-telemetry build-agent build-ai build-client build-protocol build-tui build-coding-agent build-extra mutcheck-deploy-gates
 
 build-telemetry:
 	cd packages/telemetry && npm run build
@@ -148,8 +153,38 @@ deploy: check-tree-clean build-telemetry build-agent build-extra build-coding-ag
 	./scripts/deploy-runtime.sh --source-dir "$(CURDIR)" --runtime-dir "$(RUNTIME_DIR)"
 	@$(MAKE) --no-print-directory verify
 	@$(MAKE) --no-print-directory smoke-test
+	@$(MAKE) --no-print-directory record-deploy
 
 deploy-full: deploy  ## Compatibility alias for the complete local-package deployment
+
+# Record the deployment in the analyzer's ledger, after verify and smoke-test
+# have already passed.
+#
+# Three rules are encoded here, each from a failure this project has already had:
+#
+# 1. This step runs LAST, never before the install. A record written ahead of the
+#    runtime replacement claims a deploy that may still fail -- evidence of a
+#    deployment that never happened, which is worse than no record.
+# 2. A recording failure must NOT fail the deploy. The runtime is already
+#    replaced and verified at this point; rolling back a good deploy because a
+#    bookkeeping step could not run would be the tail wagging the dog. It is loud
+#    instead, because a silently unrecorded deploy is the exact gap this step
+#    exists to close.
+# 3. An absent analyzer is a skip, not an error. Reporting failure on a machine
+#    that simply does not have the checkout would train people to ignore the
+#    warning that matters.
+#
+# `make record-deploy` can be run alone to backfill the record for a deployment
+# whose stamp is already on disk; that is also how the step is tested.
+record-deploy:  ## Record this deployment in the analyzer's deploy ledger (skipped when the analyzer is absent)
+	@if [ -n "$$SKIP_DEPLOY_LEDGER" ]; then \
+		echo "deploy ledger: skipped (SKIP_DEPLOY_LEDGER set)"; \
+	elif [ -x "$(DEPLOY_LEDGER_RECORDER)" ]; then \
+		"$(DEPLOY_LEDGER_RECORDER)" "$$(git log -1 --format=%s)" || \
+			echo "WARNING: deployed, but the ledger record failed; this deploy is invisible to effectiveness analysis" >&2; \
+	else \
+		echo "deploy ledger: skipped (no recorder at $(DEPLOY_LEDGER_RECORDER))"; \
+	fi
 
 # protocol before client: packages/client imports @earendil-works/pi-protocol's
 # emitted types. The order was load-bearing when a failed compile was swallowed
