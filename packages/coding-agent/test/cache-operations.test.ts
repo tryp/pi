@@ -172,6 +172,44 @@ it("treats tool order as part of the cacheable provider schema", () => {
 	expect(acrossTools.map((record) => record.reason)).toEqual(["unavailable", "history_rewrite"]);
 });
 
+it("gives structurally identical tools the same digest when only their runtime callbacks differ", () => {
+	// The projection exists so ordinary tools carrying execute/formatCall stay
+	// observable. That only holds if callback identity is excluded from the
+	// digest, so build two separate arrays whose closures capture different
+	// values while the provider-visible fields are byte-identical.
+	const buildTools = (label: string) => [
+		{
+			name: "read",
+			description: "Read a file",
+			parameters: { type: "object", properties: { path: { type: "string" } } },
+			execute: async () => ({ content: [{ type: "text" as const, text: label }] }),
+			formatCall: () => label,
+		},
+	];
+	const first = buildTools("first");
+	const second = buildTools("second");
+	const firstProjection = cloneToolsForObservation(first);
+	const secondProjection = cloneToolsForObservation(second);
+	// Guard against a vacuous pass: two `undefined` projections are trivially equal.
+	expect(firstProjection).toBeDefined();
+	expect(secondProjection).toEqual(firstProjection);
+
+	const records: Array<{ surface: string; reason: string; comparisonScope?: string }> = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools: first },
+		{ messages: messages("same"), systemPrompt: "system", tools: first },
+		1,
+	);
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools: first },
+		{ messages: messages("same"), systemPrompt: "system", tools: second },
+		1,
+	);
+	const acrossTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "across_requests");
+	expect(acrossTools.map((record) => record.reason)).toEqual(["unavailable", "unchanged"]);
+});
+
 it("reports cyclic and oversized tool schemas unavailable without throwing", () => {
 	const cyclic: Record<string, unknown> = { type: "object" };
 	cyclic["self"] = cyclic;
@@ -311,6 +349,52 @@ it("persists only bounded private operation metadata in the dedicated telemetry 
 			annotation: { reason: "sidecar_gate", counters: { considered: 3, changed: 1 } },
 		});
 		expect(contents).not.toContain("PRIVATE PROMPT");
+	} finally {
+		await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+it("persists tool comparisons without tool names, descriptions, schemas, or digests", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-cache-operations-tools-"));
+	const writer = await createLocalCacheTelemetryWriter(root);
+	try {
+		const instrumentation = createCacheOperationInstrumentation((observation) => {
+			writer.appendOperation(
+				createCacheOperationRecord(observation, instrumentation.epoch, instrumentation.nextSequence(), "a".repeat(32), "b".repeat(32)),
+			);
+		});
+		const tools = [
+			{
+				name: "private_tool",
+				description: "private schema details",
+				parameters: { type: "object", properties: { secretField: { type: "string" } } },
+				execute: async () => ({ content: [] }),
+			},
+		];
+		instrumentation.observeFinal(
+			{ messages: messages("same"), systemPrompt: "system", tools },
+			{ messages: messages("same"), systemPrompt: "system", tools },
+			1,
+		);
+		await writer.flush();
+		const directory = join(root, "cache-telemetry");
+		const contents = readdirSync(directory)
+			.map((name) => readFileSync(join(directory, name), "utf8"))
+			.join("");
+		expect(contents).toContain("cache_context_operation");
+		expect(contents).toContain('"surface":"tools"');
+		expect(contents).not.toContain("private_tool");
+		expect(contents).not.toContain("private schema details");
+		expect(contents).not.toContain("secretField");
+		// The tool digest never reaches the sink: it lives in-process only, and the
+		// record carries the verdict plus counts. Assert that, rather than trusting
+		// the field list to stay closed.
+		for (const line of contents.split("\n")) {
+			if (line.trim().length === 0) continue;
+			const record = JSON.parse(line).data as Record<string, unknown>;
+			expect(Object.keys(record).join(",")).not.toMatch(/digest|fingerprint|hmac/i);
+		}
 	} finally {
 		await writer.flush();
 		rmSync(root, { recursive: true, force: true });
