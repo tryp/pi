@@ -82,6 +82,30 @@ it("fingerprints custom-prototype metadata by its own data properties", () => {
 	expect(records[0]).toMatchObject({ surface: "messages", reason: "unchanged" });
 });
 
+it("treats a Date and the ISO string it serializes to as the same cacheable bytes", () => {
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	// `JSON.stringify(new Date(x))` is `JSON.stringify(x.toISOString())`, so the provider sees the
+	// same bytes for both. The fingerprint predicts those bytes, which is why it must not report a
+	// rewrite here -- and why a different instant still has to.
+	const stamp = "2025-01-01T00:00:00.000Z";
+	instrumentation.observeHandler(
+		[{ role: "assistant", createdAt: new Date(stamp) }] as unknown as AgentMessage[],
+		[{ role: "assistant", createdAt: stamp }] as unknown as AgentMessage[],
+		0,
+		1,
+	);
+	instrumentation.observeHandler(
+		[{ role: "assistant", createdAt: new Date(stamp) }] as unknown as AgentMessage[],
+		[{ role: "assistant", createdAt: "2025-01-01T00:00:01.000Z" }] as unknown as AgentMessage[],
+		0,
+		1,
+	);
+
+	expect(records[0]).toMatchObject({ surface: "messages", reason: "unchanged" });
+	expect(records[1]).toMatchObject({ surface: "messages", reason: "history_rewrite" });
+});
+
 it("reports cyclic messages as unavailable with a specific cause", () => {
 	const records: CacheOperationObservation[] = [];
 	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
@@ -437,6 +461,62 @@ it("sanitizes optional handler annotations and counts unsupported metadata as un
 	expect(records[1]).toMatchObject({ annotation: { reason: "unavailable" } });
 	expect(records[2]).toMatchObject({ annotation: { reason: "unavailable" } });
 	expect(getterCalls).toBe(0);
+});
+
+it("keeps the prompt and tool baselines when only the message list is unusable", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-cache-operations-surface-"));
+	const writer = await createLocalCacheTelemetryWriter(root);
+	try {
+		const saved: Array<Record<string, unknown>> = [];
+		const instrumentation = createCacheOperationInstrumentation((observation) => {
+			writer.appendOperation(
+				createCacheOperationRecord(observation, instrumentation.epoch, 1, "a".repeat(32), "b".repeat(32)),
+			);
+		});
+		const context = (list: unknown, prompt: string, tools: unknown[]) => ({
+			messages: list as AgentMessage[],
+			systemPrompt: prompt,
+			tools,
+		});
+		// Request 1: the message list carries a value the fingerprint walk cannot digest, while the
+		// prompt and tools are fine. That must not cost the other two surfaces their baseline.
+		const cyclic: Record<string, unknown> = { role: "user", content: "loop" };
+		cyclic.self = cyclic;
+		const unusable = [cyclic] as unknown as AgentMessage[];
+		instrumentation.observeFinal(context(unusable, "prompt", []), context(unusable, "prompt", []), 1, "stream_input");
+		// Request 2: everything is digestible, and the prompt is unchanged while the message
+		// surface has no predecessor. Report `prior_surface_unavailable` on that surface only.
+		instrumentation.observeFinal(
+			context(unusable, "prompt", []),
+			context(messages("only now readable"), "prompt", []),
+			1,
+			"stream_input",
+		);
+		await writer.flush();
+		const directory = join(root, "cache-telemetry");
+		for (const name of readdirSync(directory)) {
+			for (const line of readFileSync(join(directory, name), "utf8").split("\n")) {
+				if (line.trim()) saved.push(JSON.parse(line).data);
+			}
+		}
+		const messagesSurface = saved.filter(
+			(record) => record.surface === "messages" && record.comparisonScope === "across_requests",
+		);
+		const promptSurface = saved.filter(
+			(record) => record.surface === "system_prompt" && record.comparisonScope === "across_requests",
+		);
+		// The new cause must survive schema-v2 sanitization: it used to be rejected by the allowlist,
+		// which dropped the very record that explains a miss.
+		expect(messagesSurface.at(-1)).toMatchObject({
+			comparisonBasis: "prior_available",
+			reason: "unavailable",
+			unavailableCause: "prior_surface_unavailable",
+		});
+		expect(promptSurface.at(-1)).toMatchObject({ comparisonBasis: "prior_available", reason: "unchanged" });
+	} finally {
+		await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 it("persists only bounded private operation metadata in the dedicated telemetry sink", async () => {

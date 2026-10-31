@@ -156,6 +156,9 @@ function boundedFingerprint(
 		if (typeof item !== "object") return fail("unusable_message");
 		if (ancestors.has(item)) return fail("cyclic");
 		// Dates occur in provider/session metadata; normalize them independent of object identity.
+		// A Date deliberately fingerprints like the plain ISO string with the same text, because
+		// `JSON.stringify` sends both as that identical text: the fingerprint predicts the bytes the
+		// provider caches, so two values that serialize the same must not read as a change.
 		if (item instanceof Date) {
 			if (!Number.isFinite(item.getTime())) return fail("unusable_message");
 			return digest(key, item.toISOString());
@@ -686,6 +689,12 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 					systemPromptLength: afterPrompt === undefined ? null : after.systemPrompt.length,
 				};
 			}
+			// `comparisonBasis` describes the request, not the surface: it says a predecessor
+			// existed. Whether that predecessor kept a usable baseline for *this* surface is
+			// carried by `unavailableCause: prior_surface_unavailable` on the surface's own
+			// record, which is why the two can appear together without contradicting each
+			// other. Retaining one surface per request is what keeps the other surfaces
+			// comparable when a single one is unusable.
 			const comparisonBasis: CacheOperationComparisonBasis = prior !== undefined ? "prior_available" : "first_request";
 			const withinMessages = classifyMessages(beforeMessages, afterMessages);
 			const acrossMessages: MessageClassification =

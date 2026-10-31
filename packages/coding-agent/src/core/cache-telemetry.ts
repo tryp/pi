@@ -59,6 +59,9 @@ const OPERATION_UNAVAILABLE_CAUSES = new Set([
 	"no_before_context",
 	"no_after_context",
 	"no_prior_request",
+	// A previous request existed but this surface's baseline was unusable; distinct from
+	// `no_prior_request`, which means there was no previous request at all.
+	"prior_surface_unavailable",
 	"not_an_array",
 	"unusable_message",
 	"cyclic",
