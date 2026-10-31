@@ -851,7 +851,7 @@ export function createCacheTelemetrySession(
 						...(fellBackToFull !== undefined ? { fellBackToFull } : {}),
 						...(deltaEmptyReason !== undefined ? { deltaEmptyReason } : {}),
 						...(fallbackReason !== undefined ? { fallbackReason } : {}),
-						...(operationChanges ? { operationChanges } : {}),
+						...(operationChanges && fingerprintStatus !== "unavailable" ? { operationChanges } : {}),
 						...(postHookInputCardinality ? { postHookInputCardinality } : {}),
 					};
 					const pending = pendingRequestRecords.get(attemptId) ?? [];

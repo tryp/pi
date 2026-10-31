@@ -703,6 +703,7 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 			fingerprintStatus: "unavailable",
 			comparisonUnavailableCause: "fingerprint_unavailable",
 		});
+		expect(unavailable?.operationChanges).toBeUndefined();
 
 		// The predecessor existed but was never fingerprinted. `previousCommonPrefixSegments: 0`
 		// here means "unknown", not "the prefix broke", and the cause says which one it is.
