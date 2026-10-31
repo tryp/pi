@@ -1,5 +1,11 @@
 import { AzureOpenAI } from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import {
+	getCacheTelemetryDataProperty,
+	observeCacheOutcomeSafely,
+	observeCacheRequestSafely,
+	serializeWirePayload,
+} from "../cache-telemetry.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -77,6 +83,8 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 	// Start async processing
 	(async () => {
 		const deploymentName = resolveDeploymentName(model, options);
+		// Declared outside the try so the failure path can report a terminal outcome for the attempt.
+		let telemetryIds: { requestId: string; attemptId: string } | undefined;
 
 		const output: AssistantMessage = {
 			role: "assistant",
@@ -118,7 +126,38 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 				maxRetries: 0,
 			};
 			const { data: openaiStream, response } = await retryProviderRequest(
-				() => client.responses.create(params, requestOptions).withResponse(),
+				async () => {
+					// Azure serves the Responses API too, so it belongs in the same telemetry lanes as
+					// openai-responses; without a wire payload the row would carry no segments at all.
+					telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+						requestId: telemetryIds?.requestId,
+						provider: model.provider,
+						model: model.id,
+						phase: "final_wire_body",
+						transport: "sse",
+						payloadMode: "full",
+						cacheKeyPresent: getCacheTelemetryDataProperty(params, "prompt_cache_key") !== undefined,
+						sessionHeaderPresent: Boolean(options?.sessionId),
+						cacheIdentityMatch:
+							getCacheTelemetryDataProperty(params, "prompt_cache_key") === undefined || !options?.sessionId
+								? null
+								: getCacheTelemetryDataProperty(params, "prompt_cache_key") === options.sessionId,
+						payload: params,
+						wirePayload: serializeWirePayload(params),
+					});
+					const ids = telemetryIds;
+					return client.responses
+						.create(params, requestOptions)
+						.withResponse()
+						.catch((error: unknown) => {
+							if (ids)
+								observeCacheOutcomeSafely(options?.cacheTelemetry, {
+									...ids,
+									outcome: options?.signal?.aborted ? "aborted" : "failed",
+								});
+							throw error;
+						});
+				},
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
@@ -129,6 +168,12 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 			stream.push({ type: "start", partial: output });
 
 			await processResponsesStream(openaiStream, output, stream, model, { grammarToolInputProperties });
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: output.stopReason === "aborted" ? "aborted" : "success",
+					normalizedUsage: output.usage,
+				});
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -151,6 +196,13 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			// A request row is only written when its attempt reports a terminal outcome, so an adapter
+			// that observes the request and not the failure emits nothing at all.
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: output.stopReason === "aborted" ? "aborted" : "failed",
+				});
 			output.errorMessage = formatAzureOpenAIError(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();

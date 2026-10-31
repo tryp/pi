@@ -16,6 +16,7 @@ import {
 	getCacheTelemetryDataProperty,
 	observeCacheOutcomeSafely,
 	observeCacheRequestSafely,
+	serializeWirePayload,
 } from "../cache-telemetry.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
@@ -387,6 +388,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						sessionHeaderPresent: Boolean(cacheSessionId),
 						cacheIdentityMatch: null,
 						payload: params!,
+						wirePayload: serializeWirePayload(params),
 					});
 					const ids = telemetryIds;
 					return client.chat.completions

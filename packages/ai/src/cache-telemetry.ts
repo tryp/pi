@@ -194,6 +194,35 @@ export function observeCacheRequestSafely(
 	}
 }
 
+/**
+ * The bytes the provider will put on the wire, as a string telemetry can bound and parse.
+ *
+ * Every adapter hands an SDK (or `fetch`) a plain object, so the wire text only exists once that
+ * object is serialized. `observeRequest` treats a missing `wirePayload` as
+ * `fingerprintStatus: "unavailable"` and then emits a row with no segments at all -- an adapter
+ * that observes a request without one is therefore blind, not merely imprecise. That is why this
+ * helper exists rather than each adapter stringifying inline.
+ *
+ * Two rules are load-bearing:
+ *
+ * - Never throw. This runs inside a provider retry loop; a cycle, a `BigInt`, or a getter that
+ *   throws must not turn a working request into a failed one.
+ * - Return `undefined` rather than a partial string. A truncated `slice` would parse as broken
+ *   JSON and be reported as a corrupt request, and a silently shortened body would fingerprint
+ *   confidently against the wrong prefix. Absent is honest; wrong is not.
+ *
+ * `observeRequest` re-checks the byte budget and downgrades an oversized payload to
+ * `"unavailable"`, so an unbounded body here costs memory, never correctness.
+ */
+export function serializeWirePayload(payload: unknown): string | undefined {
+	try {
+		const text = JSON.stringify(payload);
+		return typeof text === "string" ? text : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export function observeCacheOutcomeSafely(
 	observer: CacheTelemetryObserver | undefined,
 	input: CacheTelemetryOutcomeInput,
