@@ -3901,7 +3901,12 @@ export class InteractiveMode {
 		if (!this.settingsManager.getShowCacheMissNotices()) return;
 
 		// Entries don't contain `message` yet: message_end fires before persistence.
-		const miss = detectCacheMiss(this.sessionManager.getEntries(), message, this.session.modelRuntime);
+		const miss = detectCacheMiss(
+			this.sessionManager.getEntries(),
+			message,
+			this.session.modelRuntime,
+			this.session.getCacheMissAttribution?.(),
+		);
 		if (!miss || !shouldShowCacheMissNotice(miss)) return;
 		const anchorPlacement = this.addCacheMissNotice(miss);
 		if (anchorPlacement) recordCacheMissDiagnostic(this.sessionManager, miss, anchorPlacement);

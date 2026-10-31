@@ -53,6 +53,7 @@ import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
+import type { CacheMissAttribution } from "./cache-telemetry.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -228,6 +229,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Optional per-session cache telemetry observer. */
 	cacheTelemetry?: CacheTelemetryObserver;
+	/** Latest completed request's content-free cache comparison, if recorded. */
+	getCacheMissAttribution?: () => CacheMissAttribution | undefined;
 	/** Drain and close the SDK-owned telemetry writer on disposal. */
 	disposeCacheTelemetry?: () => Promise<void>;
 	/** Private tool-result annotations are buffered until the next logical request is joined. */
@@ -359,6 +362,7 @@ export class AgentSession {
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
 	readonly cacheTelemetry?: CacheTelemetryObserver;
+	readonly getCacheMissAttribution?: () => CacheMissAttribution | undefined;
 	private readonly _disposeCacheTelemetry?: () => Promise<void>;
 	private _disposePromise?: Promise<void>;
 	private readonly _onCacheOperationAnnotation?: (
@@ -468,6 +472,7 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
 		this.cacheTelemetry = config.cacheTelemetry;
+		this.getCacheMissAttribution = config.getCacheMissAttribution;
 		this._disposeCacheTelemetry = config.disposeCacheTelemetry;
 		this._onCacheOperationAnnotation = config.onCacheOperationAnnotation;
 		this._scopedModels = config.scopedModels ?? [];

@@ -2,8 +2,133 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import type { CacheTelemetryRecord } from "@earendil-works/pi-ai";
-import type { CacheOperationRecord } from "./cache-operations.ts";
+import type { CacheTelemetryRecord, CacheTelemetryRequestRecord } from "@earendil-works/pi-ai";
+import type { CacheOperationObservation, CacheOperationRecord } from "./cache-operations.ts";
+
+export type CacheMissAttribution =
+	| { kind: "system_prompt_changed" }
+	| { kind: "tools_changed"; changedTools: number }
+	| { kind: "messages_rewritten"; reasons: readonly string[] }
+	| { kind: "prefix_identical_provider_side" }
+	| { kind: "unknown" };
+
+interface CacheMissComparison {
+	request?: CacheTelemetryRequestRecord;
+	operations: CacheOperationObservation[];
+}
+
+const MAX_MISS_COMPARISONS = 32;
+
+/**
+ * How long a completed request's comparison may still label a miss.
+ *
+ * The notice is emitted at `message_end`, which follows the request's own outcome
+ * observation in the provider stream; the gap is microseconds to a few seconds of
+ * extension hooks. Anything older belongs to a *different* request -- most visibly
+ * when the session moves to a provider that records no request telemetry at all, so
+ * no new completion ever arrives and the last instrumented one would otherwise label
+ * a miss it did not cause. Naming a surface that did not change is worse than the
+ * bare "Cache miss" this attribution exists to replace.
+ */
+const MAX_ATTRIBUTION_AGE_MS = 10_000;
+
+/**
+ * Keeps only the latest request comparisons needed to join provider telemetry to
+ * the just-completed assistant message. Request IDs are opaque and records are
+ * content-free; evicting the oldest entry bounds memory for long sessions.
+ */
+export class CacheMissAttributionTracker {
+	private readonly comparisons = new Map<string, CacheMissComparison>();
+	private latest: { requestId: string; completedAt: number } | undefined;
+
+	private ensure(requestId: string): CacheMissComparison {
+		let comparison = this.comparisons.get(requestId);
+		if (!comparison) {
+			comparison = { operations: [] };
+			this.comparisons.set(requestId, comparison);
+			// Keep a fixed window: a late outcome must not grow this per-session map.
+			while (this.comparisons.size > MAX_MISS_COMPARISONS) {
+				const oldest = this.comparisons.keys().next().value;
+				if (oldest === undefined) break;
+				this.comparisons.delete(oldest);
+			}
+		}
+		return comparison;
+	}
+
+	recordRequest(record: CacheTelemetryRecord): void {
+		// Prefix comparisons are computed for canonical_body records; final wire records
+		// do not compare request history and cannot explain a miss.
+		if (record.kind !== "cache_request" || record.phase !== "canonical_body") return;
+		this.ensure(record.requestId).request = record;
+	}
+
+	recordOperations(requestId: string, observations: readonly CacheOperationObservation[]): void {
+		this.ensure(requestId).operations.push(...observations);
+	}
+
+	complete(requestId: string, now: number = Date.now()): void {
+		this.latest = { requestId, completedAt: now };
+	}
+
+	getLatest(now: number = Date.now()): CacheMissAttribution {
+		const latest = this.latest;
+		if (!latest || now - latest.completedAt > MAX_ATTRIBUTION_AGE_MS) return { kind: "unknown" };
+		const comparison = this.comparisons.get(latest.requestId);
+		return comparison?.request
+			? classifyCacheMissComparison(comparison.request, comparison.operations)
+			: { kind: "unknown" };
+	}
+}
+
+export function classifyCacheMissComparison(
+	request: CacheTelemetryRequestRecord,
+	operations: readonly CacheOperationObservation[] = [],
+): CacheMissAttribution {
+	if (
+		!request.prefixComparable ||
+		request.fingerprintStatus === "unavailable" ||
+		request.comparisonUnavailableCause !== undefined ||
+		request.comparisonBasis === undefined
+	)
+		return { kind: "unknown" };
+	const segments = request.segments;
+	const common = request.previousCommonPrefixSegments;
+	const changedSegment = segments[common];
+	if (common === 0 && changedSegment?.name === "system") return { kind: "system_prompt_changed" };
+	const operationChanges = request.operationChanges;
+	const changedTools = segments.filter((segment, index) => segment.name === "tools" && index >= common).length;
+	if (
+		changedSegment?.name === "tools" ||
+		operationChanges?.tools === "changed" ||
+		operationChanges?.toolOrder === "changed"
+	) {
+		return { kind: "tools_changed", changedTools: Math.max(1, changedTools) };
+	}
+	const rewriteReasons = [
+		...new Set(
+			operations
+				.filter((operation) => operation.surface === "messages" && operation.reason === "history_rewrite")
+				.map((operation) => operation.annotation?.reason)
+				.filter((reason) => reason !== undefined && reason !== "unavailable"),
+		),
+	];
+	const inputWasRewritten =
+		operationChanges?.inputCount === "shrunk" ||
+		(operationChanges?.input === "changed" && operationChanges.inputCount === "same");
+	if (rewriteReasons.length || (changedSegment?.name === "message" && inputWasRewritten)) {
+		return { kind: "messages_rewritten", reasons: rewriteReasons };
+	}
+	if (
+		request.comparisonBasis === "complete" &&
+		request.truncatedSegmentCount === 0 &&
+		request.previousSegmentCount !== undefined &&
+		request.previousSegmentCount === segments.length &&
+		common === segments.length
+	)
+		return { kind: "prefix_identical_provider_side" };
+	return { kind: "unknown" };
+}
 
 export interface LocalCacheTelemetryWriter {
 	append(record: CacheTelemetryRecord): void;

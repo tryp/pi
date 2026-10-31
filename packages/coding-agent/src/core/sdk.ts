@@ -19,7 +19,7 @@ import {
 	createCacheOperationInstrumentation,
 	createCacheOperationRecord,
 } from "./cache-operations.ts";
-import { createLocalCacheTelemetryWriter } from "./cache-telemetry.ts";
+import { CacheMissAttributionTracker, createLocalCacheTelemetryWriter } from "./cache-telemetry.ts";
 import { estimateProviderContextTokens } from "./compaction/compaction.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
@@ -258,6 +258,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let cacheTelemetry: CacheTelemetryObserver | undefined;
+	let cacheMissAttributionTracker: CacheMissAttributionTracker | undefined;
 	let disposeCacheTelemetry: (() => Promise<void>) | undefined;
 	let cacheOperationInstrumentation: ReturnType<typeof createCacheOperationInstrumentation> | undefined;
 	let pendingCacheOperations: CacheOperationObservation[] = [];
@@ -279,8 +280,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	if (!cacheTelemetryDisabled) {
 		try {
 			const writer = await createLocalCacheTelemetryWriter(agentDir);
+			cacheMissAttributionTracker = new CacheMissAttributionTracker();
 			const observer = createCacheTelemetrySession(
-				(record: CacheTelemetryRecord) => writer.append(record),
+				(record: CacheTelemetryRecord) => {
+					cacheMissAttributionTracker?.recordRequest(record);
+					writer.append(record);
+				},
 				(records: Parameters<typeof writer.appendBatch>[0]) => writer.appendBatch(records),
 			);
 			disposeCacheTelemetry = async () => {
@@ -310,6 +315,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					pendingCacheOperations = [];
 					pendingCacheOperationsDropped = false;
 					const sequence = cacheOperationInstrumentation?.nextSequence() ?? 0;
+					cacheMissAttributionTracker?.recordOperations(ids.requestId, pending);
 					for (const observation of pending) {
 						writer.appendOperation(
 							createCacheOperationRecord(
@@ -325,6 +331,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				},
 				observeOutcome: (input: Parameters<CacheTelemetryObserver["observeOutcome"]>[0]) => {
 					if (input.outcome !== "success") cacheOperationInstrumentation?.resetFinal();
+					cacheMissAttributionTracker?.complete(input.requestId);
 					observer.observeOutcome(input);
 				},
 				flush: () => observer.flush(),
@@ -674,6 +681,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 		cacheTelemetry,
+		getCacheMissAttribution: () => cacheMissAttributionTracker?.getLatest(),
 		disposeCacheTelemetry,
 		onCacheOperationAnnotation: cacheOperationInstrumentation
 			? (annotation, handlerIndex, durationMs) =>

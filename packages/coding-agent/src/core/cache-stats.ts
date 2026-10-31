@@ -1,4 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { CacheMissAttribution } from "./cache-telemetry.ts";
 import type { SessionEntry } from "./session-manager.ts";
 
 /**
@@ -26,6 +27,8 @@ export interface CacheMiss {
 	reason: CacheMissReason;
 	/** Session entry that caused the miss, when a concrete boundary is available. */
 	anchorEntryId: string | undefined;
+	/** Content-free explanation derived from the request telemetry, when available. */
+	attribution?: CacheMissAttribution;
 	/** Compaction context size before summarization and at the billed request. */
 	contextBeforeTokens?: number;
 	contextAfterTokens?: number;
@@ -44,7 +47,20 @@ export function getCacheMissLabel(miss: CacheMiss): string {
 		case "idle":
 			return `Cache miss after ${Math.round(miss.idleMs / 60_000)}m idle`;
 		case "unexplained":
-			return "Cache miss";
+			switch (miss.attribution?.kind) {
+				case "system_prompt_changed":
+					return "Cache miss (system prompt changed)";
+				case "tools_changed":
+					return `Cache miss (tool definitions changed: ${miss.attribution.changedTools})`;
+				case "messages_rewritten":
+					return miss.attribution.reasons.length
+						? `Cache miss (history rewritten: ${miss.attribution.reasons.join(", ")})`
+						: "Cache miss (history rewritten)";
+				case "prefix_identical_provider_side":
+					return "Cache miss (prefix identical: provider eviction or routing)";
+				default:
+					return "Cache miss";
+			}
 	}
 }
 
@@ -71,6 +87,7 @@ export function recordCacheMissDiagnostic(
 		idleMs: Math.min(365 * 24 * 60 * 60 * 1000, Math.max(0, Number.isFinite(miss.idleMs) ? miss.idleMs : 0)),
 		modelChanged: miss.modelChanged,
 		anchorEntryId: miss.anchorEntryId,
+		attribution: miss.attribution ?? { kind: "unknown" },
 		anchorPlacement,
 		...(miss.contextBeforeTokens === undefined ? {} : { contextBeforeTokens: miss.contextBeforeTokens }),
 		...(miss.contextAfterTokens === undefined ? {} : { contextAfterTokens: miss.contextAfterTokens }),
@@ -114,6 +131,7 @@ function detectMiss(
 	models: ModelPriceSource,
 	compactionBoundary?: { entryId: string; tokensBefore: number },
 	modelChangeEntryId?: string,
+	attribution: CacheMissAttribution = { kind: "unknown" },
 ): CacheMiss | undefined {
 	const usage = message.usage;
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
@@ -153,6 +171,7 @@ function detectMiss(
 		idleMs,
 		modelChanged,
 		reason,
+		...(reason === "unexplained" ? { attribution } : {}),
 		anchorEntryId: compactionBoundary?.entryId ?? (reason === "model_switch" ? modelChangeEntryId : undefined),
 		...(compactionBoundary
 			? { contextBeforeTokens: compactionBoundary.tokensBefore, contextAfterTokens: promptTokens }
@@ -255,7 +274,15 @@ export function detectCacheMiss(
 	entries: SessionEntry[],
 	message: AssistantMessage,
 	models: ModelPriceSource,
+	attribution: CacheMissAttribution = { kind: "unknown" },
 ): CacheMiss | undefined {
 	const previous = scan(entries, models);
-	return detectMiss(previous.prev, message, models, previous.compactionBoundary, previous.modelChangeEntryId);
+	return detectMiss(
+		previous.prev,
+		message,
+		models,
+		previous.compactionBoundary,
+		previous.modelChangeEntryId,
+		attribution,
+	);
 }

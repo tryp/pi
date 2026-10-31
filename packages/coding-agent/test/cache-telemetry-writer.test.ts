@@ -1,17 +1,42 @@
-import { mkdir, mkdtemp, lutimes, readdir, readFile, rm, stat, symlink, truncate, utimes, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import {
+	lutimes,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	rm,
+	stat,
+	symlink,
+	truncate,
+	utimes,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CacheTelemetryRequestRecord } from "../../ai/src/cache-telemetry.ts";
-import type { CacheOperationRecord } from "../src/core/cache-operations.ts";
-import { createLocalCacheTelemetryWriter } from "../src/core/cache-telemetry.ts";
+import type { CacheOperationObservation, CacheOperationRecord } from "../src/core/cache-operations.ts";
+import {
+	CacheMissAttributionTracker,
+	classifyCacheMissComparison,
+	createLocalCacheTelemetryWriter,
+} from "../src/core/cache-telemetry.ts";
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
+
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
+function mutableRequestRecord(): Mutable<CacheTelemetryRequestRecord> {
+	const record = requestRecord() as Mutable<CacheTelemetryRequestRecord>;
+	record.phase = "canonical_body";
+	record.comparisonBasis = "complete";
+	return record;
+}
 
 function requestRecord(): CacheTelemetryRequestRecord {
 	return {
@@ -334,8 +359,7 @@ describe("local cache telemetry writer", () => {
 			pruneFailures: 0,
 		});
 		expect(Object.keys(saved[0]).sort()).toEqual(Object.keys(request).sort());
-		for (const [field, value] of Object.entries(optionalRequestFields))
-			expect(saved[0][field], field).toEqual(value);
+		for (const [field, value] of Object.entries(optionalRequestFields)) expect(saved[0][field], field).toEqual(value);
 		expect(Object.keys(saved[1]).sort()).toEqual(Object.keys(operation).sort());
 		for (const [field, value] of Object.entries(optionalOperationFields))
 			expect(saved[1][field], field).toEqual(value);
@@ -346,7 +370,10 @@ describe("local cache telemetry writer", () => {
 		tempDirs.push(root);
 		const writer = await createLocalCacheTelemetryWriter(root);
 		writer.append({ ...requestRecord(), comparisonBasis: "mostly" } as unknown as CacheTelemetryRequestRecord);
-		writer.append({ ...requestRecord(), operationChanges: { inputCount: "exploded" } } as unknown as CacheTelemetryRequestRecord);
+		writer.append({
+			...requestRecord(),
+			operationChanges: { inputCount: "exploded" },
+		} as unknown as CacheTelemetryRequestRecord);
 		writer.appendOperation({
 			...operationRecord(),
 			unavailableCause: "because",
@@ -450,5 +477,125 @@ describe("local cache telemetry writer", () => {
 		expect(remaining).toContain(basename(linked));
 		expect(await readFile(outside, "utf8")).toBe("keep me\n");
 		await writer.flush();
+	});
+});
+
+describe("cache miss attribution", () => {
+	it("classifies changed prompt segments and recorded message rewrites", () => {
+		const system = mutableRequestRecord();
+		system.segments = [
+			{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "b".repeat(64) },
+		];
+		system.prefixComparable = true;
+		system.previousCommonPrefixSegments = 0;
+		system.previousSegmentCount = 2;
+		expect(classifyCacheMissComparison(system)).toEqual({ kind: "system_prompt_changed" });
+
+		const tools = mutableRequestRecord();
+		tools.segments = [
+			{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
+			{ name: "tools", byteLength: 10, hmacSha256: "b".repeat(64) },
+			{ name: "tools", byteLength: 10, hmacSha256: "c".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "d".repeat(64) },
+		];
+		tools.prefixComparable = true;
+		tools.previousCommonPrefixSegments = 1;
+		expect(classifyCacheMissComparison(tools)).toEqual({ kind: "tools_changed", changedTools: 2 });
+
+		const rewritten = mutableRequestRecord();
+		rewritten.segments = [
+			{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "b".repeat(64) },
+		];
+		rewritten.prefixComparable = true;
+		rewritten.previousCommonPrefixSegments = 1;
+		const operation: CacheOperationObservation = {
+			surface: "messages",
+			operation: "handler",
+			reason: "history_rewrite",
+			durationMs: 0,
+			beforeCount: 1,
+			afterCount: 1,
+			annotation: { reason: "sidecar_gate" },
+		};
+		expect(classifyCacheMissComparison(rewritten, [operation])).toEqual({
+			kind: "messages_rewritten",
+			reasons: ["sidecar_gate"],
+		});
+	});
+
+	it("identifies identical comparable prefixes and leaves unavailable comparisons unknown", () => {
+		const identical = mutableRequestRecord();
+		identical.segments = [
+			{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "b".repeat(64) },
+		];
+		identical.prefixComparable = true;
+		identical.comparisonBasis = "complete";
+		identical.previousCommonPrefixSegments = 2;
+		identical.previousSegmentCount = 2;
+		expect(classifyCacheMissComparison(identical)).toEqual({ kind: "prefix_identical_provider_side" });
+		expect(classifyCacheMissComparison(requestRecord())).toEqual({ kind: "unknown" });
+		const noPredecessor = mutableRequestRecord();
+		noPredecessor.prefixComparable = true;
+		noPredecessor.comparisonUnavailableCause = "no_predecessor";
+		expect(classifyCacheMissComparison(noPredecessor)).toEqual({ kind: "unknown" });
+	});
+
+	it("joins the newest completed request's comparison to the notice, and expires it", () => {
+		const tracker = new CacheMissAttributionTracker();
+		const record = mutableRequestRecord();
+		record.segments = [{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) }];
+		record.prefixComparable = true;
+		record.previousCommonPrefixSegments = 0;
+		tracker.recordRequest(record);
+		// No completion yet: nothing has finished, so nothing may label a miss.
+		expect(tracker.getLatest()).toEqual({ kind: "unknown" });
+		tracker.complete(record.requestId, 1_000);
+		expect(tracker.getLatest(1_500)).toEqual({ kind: "system_prompt_changed" });
+		// A provider that records no request telemetry never completes, so the last
+		// instrumented request must not label a later message from a different one.
+		expect(tracker.getLatest(1_000 + 10_001)).toEqual({ kind: "unknown" });
+	});
+
+	it("joins the messages-surface rewrite reasons recorded for the completing request", () => {
+		const tracker = new CacheMissAttributionTracker();
+		const record = mutableRequestRecord();
+		record.segments = [
+			{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "b".repeat(64) },
+		];
+		record.prefixComparable = true;
+		record.previousCommonPrefixSegments = 2;
+		record.previousSegmentCount = 2;
+		record.truncatedSegmentCount = 0;
+		tracker.recordRequest(record);
+		// Operations for a different request must not be folded into this one.
+		tracker.recordOperations("c".repeat(32), [
+			{
+				surface: "messages",
+				operation: "handler",
+				reason: "history_rewrite",
+				durationMs: 0,
+				beforeCount: 1,
+				afterCount: 1,
+				annotation: { reason: "sidecar_gate" },
+			},
+		]);
+		tracker.complete(record.requestId, 5_000);
+		expect(tracker.getLatest(5_000)).toEqual({ kind: "prefix_identical_provider_side" });
+		tracker.recordOperations(record.requestId, [
+			{
+				surface: "messages",
+				operation: "handler",
+				reason: "history_rewrite",
+				durationMs: 0,
+				beforeCount: 1,
+				afterCount: 1,
+				annotation: { reason: "sidecar_gate" },
+			},
+		]);
+		expect(tracker.getLatest(5_000)).toEqual({ kind: "messages_rewritten", reasons: ["sidecar_gate"] });
 	});
 });

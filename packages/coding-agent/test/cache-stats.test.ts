@@ -227,6 +227,7 @@ describe("detectCacheMiss", () => {
 	it("keeps unexplained labels and suppresses sub-threshold notices", () => {
 		const miss = {
 			missedTokens: 19_999,
+			attribution: { kind: "unknown" as const },
 			missedCost: 0.099,
 			idleMs: 0,
 			modelChanged: false,
@@ -248,6 +249,7 @@ describe("detectCacheMiss", () => {
 			modelChanged: false,
 			reason: "compaction" as const,
 			anchorEntryId: "c",
+			attribution: { kind: "tools_changed" as const, changedTools: 2 },
 		};
 		recordCacheMissDiagnostic({ appendCustomEntry }, miss, "tail_fallback");
 		expect(appendCustomEntry).toHaveBeenCalledTimes(1);
@@ -261,7 +263,35 @@ describe("detectCacheMiss", () => {
 			idleMs: 60_000,
 			modelChanged: false,
 			anchorEntryId: "c",
+			attribution: { kind: "tools_changed", changedTools: 2 },
 			anchorPlacement: "tail_fallback",
 		});
+	});
+
+	it("labels unexplained misses with known telemetry attribution", () => {
+		const base = { cacheWrite: 110_000, cost: { cacheWrite: 0.4125 }, timestamp: 120_000 };
+		const labels = [
+			[{ kind: "system_prompt_changed" as const }, "Cache miss (system prompt changed)"],
+			[{ kind: "tools_changed" as const, changedTools: 2 }, "Cache miss (tool definitions changed: 2)"],
+			[
+				{ kind: "messages_rewritten" as const, reasons: ["auto_continue_filter"] },
+				"Cache miss (history rewritten: auto_continue_filter)",
+			],
+			[
+				{ kind: "prefix_identical_provider_side" as const },
+				"Cache miss (prefix identical: provider eviction or routing)",
+			],
+		] as const;
+		for (const [attribution, label] of labels) {
+			const miss = detectCacheMiss([entry(turn1), entry(turn2)], assistant(base), models, attribution);
+			expect(miss?.reason).toBe("unexplained");
+			expect(getCacheMissLabel(miss!)).toBe(label);
+		}
+	});
+
+	it("does not retain telemetry attribution for a miss below the noise floor", () => {
+		const belowFloor = assistant({ input: 1_000, cacheRead: 99_000, timestamp: 120_000 });
+		const miss = detectCacheMiss([entry(turn1), entry(turn2)], belowFloor, models, { kind: "system_prompt_changed" });
+		expect(miss).toBeUndefined();
 	});
 });
