@@ -3274,7 +3274,9 @@ export class InteractiveMode {
 					this.streamingComponent.updateContent(this.streamingMessage, true);
 					const latestModelChange = this.sessionManager
 						.getEntries()
-						.findLast((entry) => entry.type === "model_change");
+						.slice()
+						.reverse()
+						.find((entry) => entry.type === "model_change");
 					if (latestModelChange) {
 						this.renderedEntryComponents?.set(latestModelChange.id, this.streamingComponent);
 					}
