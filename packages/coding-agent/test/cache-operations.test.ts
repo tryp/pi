@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { expect, it } from "vitest";
 import {
+	type CacheOperationObservation,
 	cloneMessagesForObservation,
 	cloneToolsForObservation,
 	createCacheOperationInstrumentation,
@@ -45,6 +46,102 @@ it("classifies no-op, in-place edits, history rewrites, suffix growth, shrink, a
 		"failed",
 	]);
 	expect(records[2]).toMatchObject({ beforeCount: 1, afterCount: 2 });
+});
+
+it("fingerprints recorded message shapes containing usage, binary data, and Dates", () => {
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const recordedShape = [
+		{ role: "user", content: "inspect this image" },
+		{ role: "assistant", content: "done", usage: { input: 12, output: 2 } },
+		{
+			role: "toolResult",
+			toolCallId: "call-1",
+			content: [{ type: "image", data: new Uint8Array([1, 2, 3]) }],
+			createdAt: new Date("2025-01-01T00:00:00.000Z"),
+		},
+	] as unknown as AgentMessage[];
+	instrumentation.observeHandler(recordedShape, recordedShape, 0, 1);
+	expect(records[0]).toMatchObject({ surface: "messages", reason: "unchanged" });
+});
+
+it("fingerprints custom-prototype metadata by its own data properties", () => {
+	class ProviderMetadata {
+		constructor(public readonly providerId: string, public readonly date: Date) {}
+		label(): string {
+			return "provider metadata";
+		}
+	}
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const before = [{ role: "assistant", metadata: new ProviderMetadata("provider-1", new Date("2025-01-01T00:00:00.000Z")) }];
+	const after = [{ role: "assistant", metadata: new ProviderMetadata("provider-1", new Date("2025-01-01T00:00:00.000Z")) }];
+
+	instrumentation.observeHandler(before as unknown as AgentMessage[], after as unknown as AgentMessage[], 0, 1);
+
+	expect(records[0]).toMatchObject({ surface: "messages", reason: "unchanged" });
+});
+
+it("reports cyclic messages as unavailable with a specific cause", () => {
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const cyclic: Record<string, unknown> = { role: "user", content: "cycle" };
+	cyclic.self = cyclic;
+	instrumentation.observeHandler([cyclic] as unknown as AgentMessage[], [cyclic] as unknown as AgentMessage[], 0, 1);
+	expect(records[0]).toMatchObject({ reason: "unavailable", unavailableCause: "cyclic" });
+});
+
+it("reports bounded message snapshots as over_budget with content-free size counters", () => {
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const oversized = messages("x".repeat(128 * 1024 + 1));
+	instrumentation.observeHandler(messages("before"), oversized, 0, 1);
+
+	const record = records[0];
+	expect(record).toMatchObject({
+		surface: "messages",
+		operation: "handler",
+		reason: "over_budget",
+		unavailableCause: "over_budget",
+		snapshotNodes: expect.any(Number),
+		snapshotTextBytes: expect.any(Number),
+	});
+	expect(JSON.stringify(record)).not.toContain("x".repeat(32));
+});
+
+it("persists over-budget reason and size counters through telemetry validation", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-cache-operations-budget-"));
+	const writer = await createLocalCacheTelemetryWriter(root);
+	try {
+		const instrumentation = createCacheOperationInstrumentation((observation) => {
+			writer.appendOperation(
+				createCacheOperationRecord(observation, instrumentation.epoch, 1, "a".repeat(32), "b".repeat(32)),
+			);
+		});
+		instrumentation.observeHandler(messages("before"), messages("x".repeat(128 * 1024 + 1)), 0, 1);
+		await writer.flush();
+		const directory = join(root, "cache-telemetry");
+		const saved = JSON.parse(readFileSync(join(directory, readdirSync(directory)[0]!), "utf8")).data;
+		expect(saved).toMatchObject({ reason: "over_budget", unavailableCause: "over_budget" });
+		expect(saved.snapshotNodes).toEqual(expect.any(Number));
+		expect(saved.snapshotTextBytes).toBeGreaterThan(128 * 1024);
+	} finally {
+		await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+it("keeps tool-result annotations unavailable when no before/after result comparison exists", () => {
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	instrumentation.observeAnnotation("tool_result", { reason: "sidecar_gate", counters: { changed: 1 } }, 0, 1);
+
+	expect(records[0]).toMatchObject({
+		surface: "tool_result",
+		operation: "handler",
+		reason: "unavailable",
+		unavailableCause: "no_comparison",
+	});
 });
 
 it("records final history/system/tool surfaces without persisting their contents", () => {
@@ -118,13 +215,21 @@ it("projects realistic tool definitions while omitting runtime functions", () =>
 		{ messages: messages("same"), systemPrompt: "system", tools },
 		1,
 	);
-	const acrossTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "across_requests");
+	const acrossTools = records.filter(
+		(record) => record.surface === "tools" && record.comparisonScope === "across_requests",
+	);
 	expect(acrossTools.map((record) => record.reason)).toEqual(["unavailable", "unchanged"]);
 });
 
 it.each([
 	["description", (tool: Record<string, unknown>) => ({ ...tool, description: "Changed description" })],
-	["parameter name", (tool: Record<string, unknown>) => ({ ...tool, parameters: { type: "object", properties: { file: { type: "string" } } } })],
+	[
+		"parameter name",
+		(tool: Record<string, unknown>) => ({
+			...tool,
+			parameters: { type: "object", properties: { file: { type: "string" } } },
+		}),
+	],
 ] as const)("detects a changed tool %s in the provider projection", (_label, changeTool) => {
 	const tool = {
 		name: "read",
@@ -146,7 +251,9 @@ it.each([
 		1,
 	);
 
-	const acrossTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "across_requests");
+	const acrossTools = records.filter(
+		(record) => record.surface === "tools" && record.comparisonScope === "across_requests",
+	);
 	expect(acrossTools.map((record) => record.reason)).toEqual(["unavailable", "history_rewrite"]);
 	expect(acrossTools[1]?.unavailableCause).toBeUndefined();
 });
@@ -168,7 +275,9 @@ it("treats tool order as part of the cacheable provider schema", () => {
 		1,
 	);
 
-	const acrossTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "across_requests");
+	const acrossTools = records.filter(
+		(record) => record.surface === "tools" && record.comparisonScope === "across_requests",
+	);
 	expect(acrossTools.map((record) => record.reason)).toEqual(["unavailable", "history_rewrite"]);
 });
 
@@ -206,7 +315,9 @@ it("gives structurally identical tools the same digest when only their runtime c
 		{ messages: messages("same"), systemPrompt: "system", tools: second },
 		1,
 	);
-	const acrossTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "across_requests");
+	const acrossTools = records.filter(
+		(record) => record.surface === "tools" && record.comparisonScope === "across_requests",
+	);
 	expect(acrossTools.map((record) => record.reason)).toEqual(["unavailable", "unchanged"]);
 });
 
@@ -234,7 +345,9 @@ it("reports cyclic and oversized tool schemas unavailable without throwing", () 
 		{ messages: messages("same"), systemPrompt: "system", tools: [invalidTools[0]!] },
 		1,
 	);
-	const withinTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "within_request");
+	const withinTools = records.filter(
+		(record) => record.surface === "tools" && record.comparisonScope === "within_request",
+	);
 	expect(withinTools[1]).toMatchObject({ reason: "unavailable", unavailableCause: "unusable_tools" });
 });
 
@@ -268,7 +381,7 @@ it("compares each finalized context to the previous request, separately from wit
 });
 
 it("marks accessor, unserializable, and oversized paths unavailable without invoking getters", () => {
-	const records: Array<{ reason: string }> = [];
+	const records: Array<{ reason: string; unavailableCause?: string }> = [];
 	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
 	let getterCalls = 0;
 	const accessorMessage = { content: [{ type: "text", text: "secret" }] };
@@ -295,7 +408,9 @@ it("marks accessor, unserializable, and oversized paths unavailable without invo
 	});
 	expect(cloneMessagesForObservation(hostile)).toBeUndefined();
 	expect(getterCalls).toBe(0);
-	expect(records.map((record) => record.reason)).toEqual(["unavailable", "unavailable"]);
+	expect(records.map((record) => record.reason)).toEqual(["unavailable", "over_budget"]);
+	expect(records[0]?.unavailableCause).toBe("accessor_property");
+	expect(records[1]?.unavailableCause).toBe("too_many_messages");
 });
 
 it("sanitizes optional handler annotations and counts unsupported metadata as unavailable", () => {
@@ -361,7 +476,13 @@ it("persists tool comparisons without tool names, descriptions, schemas, or dige
 	try {
 		const instrumentation = createCacheOperationInstrumentation((observation) => {
 			writer.appendOperation(
-				createCacheOperationRecord(observation, instrumentation.epoch, instrumentation.nextSequence(), "a".repeat(32), "b".repeat(32)),
+				createCacheOperationRecord(
+					observation,
+					instrumentation.epoch,
+					instrumentation.nextSequence(),
+					"a".repeat(32),
+					"b".repeat(32),
+				),
 			);
 		});
 		const tools = [

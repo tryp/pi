@@ -61,6 +61,9 @@ const OPERATION_UNAVAILABLE_CAUSES = new Set([
 	"no_prior_request",
 	"not_an_array",
 	"unusable_message",
+	"cyclic",
+	"accessor_property",
+	"over_budget",
 	"too_many_messages",
 	"oversized_message",
 	"snapshot_budget_exhausted",
@@ -303,6 +306,8 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 		const beforeCount = data(source, "beforeCount");
 		const afterCount = data(source, "afterCount");
 		const handlerIndex = data(source, "handlerIndex");
+		const snapshotNodes = data(source, "snapshotNodes");
+		const snapshotTextBytes = data(source, "snapshotTextBytes");
 		const annotation = data(source, "annotation");
 		if (
 			typeof epoch !== "string" ||
@@ -313,11 +318,15 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 			typeof operation !== "string" ||
 			!new Set(["handler", "final_context"]).has(operation) ||
 			typeof reason !== "string" ||
-			!new Set(["unchanged", "history_rewrite", "append", "shrink", "unavailable", "failed"]).has(reason) ||
+			!new Set(["unchanged", "history_rewrite", "append", "shrink", "over_budget", "unavailable", "failed"]).has(
+				reason,
+			) ||
 			!boundedDuration(durationMs) ||
 			(beforeCount !== null && !boundedCount(beforeCount, 1_000_000)) ||
 			(afterCount !== null && !boundedCount(afterCount, 1_000_000)) ||
-			(handlerIndex !== undefined && !boundedCount(handlerIndex, 1_000_000))
+			(handlerIndex !== undefined && !boundedCount(handlerIndex, 1_000_000)) ||
+			(snapshotNodes !== undefined && !boundedCount(snapshotNodes, 10_000_000)) ||
+			(snapshotTextBytes !== undefined && !boundedCount(snapshotTextBytes, 10_000_000))
 		)
 			return undefined;
 		const output: Record<string, unknown> = {
@@ -334,6 +343,8 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 			beforeCount,
 			afterCount,
 			...(handlerIndex === undefined ? {} : { handlerIndex }),
+			...(snapshotNodes === undefined ? {} : { snapshotNodes }),
+			...(snapshotTextBytes === undefined ? {} : { snapshotTextBytes }),
 		};
 		if (annotation !== undefined) {
 			const sourceAnnotation = plain(annotation);
@@ -461,9 +472,7 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
  * lost silently, which is worse than the disk it saves). Every removal and every
  * failure is counted: a prune that could not run must not read as "nothing to prune".
  */
-async function pruneTelemetryDirectory(
-	directory: string,
-): Promise<{ files: number; bytes: number; failures: number }> {
+async function pruneTelemetryDirectory(directory: string): Promise<{ files: number; bytes: number; failures: number }> {
 	const outcome = { files: 0, bytes: 0, failures: 0 };
 	let names: string[];
 	try {

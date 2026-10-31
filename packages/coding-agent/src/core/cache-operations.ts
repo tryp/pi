@@ -2,7 +2,14 @@ import { createHmac, randomBytes } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 export type CacheOperationKind = "handler" | "final_context";
-export type CacheOperationReason = "unchanged" | "history_rewrite" | "append" | "shrink" | "unavailable" | "failed";
+export type CacheOperationReason =
+	| "unchanged"
+	| "history_rewrite"
+	| "append"
+	| "shrink"
+	| "over_budget"
+	| "unavailable"
+	| "failed";
 
 /**
  * Every `unavailable` observation names its cause. Without this field the single
@@ -20,9 +27,13 @@ export type CacheOperationUnavailableCause =
 	| "no_after_context"
 	/** No usable predecessor snapshot exists for this lane. */
 	| "no_prior_request"
+	| "prior_surface_unavailable"
 	/** The snapshot walk stopped; `observedCount` says how much it managed to digest. */
 	| "not_an_array"
 	| "unusable_message"
+	| "cyclic"
+	| "accessor_property"
+	| "over_budget"
 	| "too_many_messages"
 	| "oversized_message"
 	| "snapshot_budget_exhausted"
@@ -62,6 +73,8 @@ export interface CacheOperationRecord {
 	stopReasonCounts?: Record<string, number> | null;
 	unavailableCause?: CacheOperationUnavailableCause;
 	observedCount?: number;
+	snapshotNodes?: number;
+	snapshotTextBytes?: number;
 	comparisonBasis?: CacheOperationComparisonBasis;
 }
 
@@ -81,6 +94,8 @@ export interface CacheOperationObservation {
 	stopReasonCounts?: Record<string, number> | null;
 	unavailableCause?: CacheOperationUnavailableCause;
 	observedCount?: number;
+	snapshotNodes?: number;
+	snapshotTextBytes?: number;
 	comparisonBasis?: CacheOperationComparisonBasis;
 }
 
@@ -88,11 +103,6 @@ export interface CacheOperationContextSnapshot {
 	messages: AgentMessage[] | undefined;
 	systemPrompt: string;
 	tools: readonly unknown[] | undefined;
-}
-
-interface MessageSnapshot {
-	count: number;
-	digests: string[];
 }
 
 const MAX_MESSAGES = 4096;
@@ -113,6 +123,7 @@ interface FingerprintBudget {
 	textBytes: number;
 	nodeCap: number;
 	textCap: number;
+	failureCause?: CacheOperationUnavailableCause;
 }
 
 function newBudget(nodeCap = MAX_MESSAGE_NODES, textCap = MAX_MESSAGE_TEXT_BYTES): FingerprintBudget {
@@ -129,45 +140,68 @@ function boundedFingerprint(
 	budget: FingerprintBudget = newBudget(),
 ): string | undefined {
 	const state = budget;
+	const ancestors = new WeakSet<object>();
+	const fail = (cause: CacheOperationUnavailableCause): undefined => {
+		state.failureCause = cause;
+		return undefined;
+	};
 	const visit = (item: unknown, depth: number): string | undefined => {
-		if (++state.nodes > state.nodeCap || depth > MAX_DEPTH) return undefined;
+		if (++state.nodes > state.nodeCap || depth > MAX_DEPTH) return fail("over_budget");
 		if (item === null || typeof item === "boolean" || typeof item === "number") return String(item);
 		if (typeof item === "string") {
 			state.textBytes += Buffer.byteLength(item, "utf8");
-			if (state.textBytes > state.textCap) return undefined;
+			if (state.textBytes > state.textCap) return fail("over_budget");
 			return digest(key, item);
 		}
-		if (typeof item !== "object") return undefined;
-		if (Array.isArray(item)) {
-			if (item.length > MAX_CONTENT_PARTS) return undefined;
+		if (typeof item !== "object") return fail("unusable_message");
+		if (ancestors.has(item)) return fail("cyclic");
+		// Dates occur in provider/session metadata; normalize them independent of object identity.
+		if (item instanceof Date) {
+			if (!Number.isFinite(item.getTime())) return fail("unusable_message");
+			return digest(key, item.toISOString());
+		}
+		// Images may carry binary data as Buffer/Uint8Array. Hash bytes, never serialize them.
+		if (item instanceof Uint8Array) {
+			state.textBytes += item.byteLength;
+			if (state.textBytes > state.textCap) return fail("over_budget");
+			return createHmac("sha256", key).update(item).digest("hex");
+		}
+		ancestors.add(item);
+		try {
+			if (Array.isArray(item)) {
+				if (item.length > MAX_CONTENT_PARTS) return fail("over_budget");
+				const parts: string[] = [];
+				for (let index = 0; index < item.length; index++) {
+					const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
+					if (!descriptor || !("value" in descriptor)) return fail("accessor_property");
+					const part = visit(descriptor.value, depth + 1);
+					if (part === undefined) return undefined;
+					parts.push(part);
+				}
+				return digest(key, parts.join("|"));
+			}
+			// Custom-prototype metadata is common in runtime messages. Observe its own enumerable
+			// data properties like a plain object; methods are excluded, accessors remain unsafe.
+			const names = Object.keys(item);
+			if (names.length > 256) return fail("over_budget");
 			const parts: string[] = [];
-			for (let index = 0; index < item.length; index++) {
-				const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
-				if (!descriptor || !("value" in descriptor)) return undefined;
-				const part = visit(descriptor.value, depth + 1);
-				if (part === undefined) return undefined;
-				parts.push(part);
+			for (const name of names.sort()) {
+				const descriptor = Object.getOwnPropertyDescriptor(item, name);
+				if (!descriptor || !("value" in descriptor)) return fail("accessor_property");
+				if (typeof descriptor.value === "function") continue;
+				const child = visit(descriptor.value, depth + 1);
+				if (child === undefined) return undefined;
+				parts.push(`${digest(key, name)}=${child}`);
 			}
 			return digest(key, parts.join("|"));
+		} finally {
+			ancestors.delete(item);
 		}
-		const prototype = Object.getPrototypeOf(item);
-		if (prototype !== Object.prototype && prototype !== null) return undefined;
-		const names = Object.keys(item);
-		if (names.length > 256) return undefined;
-		const parts: string[] = [];
-		for (const name of names.sort()) {
-			const descriptor = Object.getOwnPropertyDescriptor(item, name);
-			if (!descriptor || !("value" in descriptor)) return undefined;
-			const child = visit(descriptor.value, depth + 1);
-			if (child === undefined) return undefined;
-			parts.push(`${digest(key, name)}=${child}`);
-		}
-		return digest(key, parts.join("|"));
 	};
 	try {
 		return visit(value, 0);
 	} catch {
-		return undefined;
+		return fail("unusable_message");
 	}
 }
 
@@ -197,6 +231,8 @@ interface MessageSnapshot {
 	digests: string[];
 	/** How many messages were actually digested; equals `count` when `cause` is undefined. */
 	observed: number;
+	nodes: number;
+	textBytes: number;
 	cause?: CacheOperationUnavailableCause;
 }
 
@@ -204,10 +240,12 @@ interface MessageClassification {
 	reason: CacheOperationReason;
 	cause?: CacheOperationUnavailableCause;
 	observedCount?: number;
+	snapshotNodes?: number;
+	snapshotTextBytes?: number;
 }
 
 function emptySnapshot(cause: CacheOperationUnavailableCause, count = 0): MessageSnapshot {
-	return { count, digests: [], observed: 0, cause };
+	return { count, digests: [], observed: 0, nodes: 0, textBytes: 0, cause };
 }
 
 /**
@@ -224,7 +262,14 @@ function messageSnapshot(messages: unknown, key: Uint8Array): MessageSnapshot {
 		const descriptor = Object.getOwnPropertyDescriptor(messages, String(index));
 		const item = descriptor && "value" in descriptor ? descriptor.value : undefined;
 		if (item === undefined || typeof item !== "object" || item === null) {
-			return { count: messages.length, digests, observed: index, cause: "unusable_message" };
+			return {
+				count: messages.length,
+				digests,
+				observed: index,
+				nodes: total.nodes,
+				textBytes: total.textBytes,
+				cause: "unusable_message",
+			};
 		}
 		const budget = newBudget();
 		const messageDigest = boundedFingerprint(item, key, budget);
@@ -233,20 +278,36 @@ function messageSnapshot(messages: unknown, key: Uint8Array): MessageSnapshot {
 				count: messages.length,
 				digests,
 				observed: index,
+				nodes: total.nodes + budget.nodes,
+				textBytes: total.textBytes + budget.textBytes,
 				cause:
-					budget.nodes > budget.nodeCap || budget.textBytes > budget.textCap
-						? "oversized_message"
-						: "unusable_message",
+					budget.failureCause ??
+					(budget.nodes > budget.nodeCap || budget.textBytes > budget.textCap
+						? "over_budget"
+						: "unusable_message"),
 			};
 		}
 		total.nodes += budget.nodes;
 		total.textBytes += budget.textBytes;
 		if (total.nodes > MAX_SNAPSHOT_NODES || total.textBytes > MAX_SNAPSHOT_TEXT_BYTES) {
-			return { count: messages.length, digests, observed: index, cause: "snapshot_budget_exhausted" };
+			return {
+				count: messages.length,
+				digests,
+				observed: index,
+				nodes: total.nodes,
+				textBytes: total.textBytes,
+				cause: "snapshot_budget_exhausted",
+			};
 		}
 		digests.push(messageDigest);
 	}
-	return { count: messages.length, digests, observed: messages.length };
+	return {
+		count: messages.length,
+		digests,
+		observed: messages.length,
+		nodes: total.nodes,
+		textBytes: total.textBytes,
+	};
 }
 
 function cloneBounded(value: unknown, depth: number, budget: FingerprintBudget): unknown {
@@ -258,6 +319,13 @@ function cloneBounded(value: unknown, depth: number, budget: FingerprintBudget):
 		return value;
 	}
 	if (typeof value !== "object") throw new Error("unavailable");
+	// Preserve canonicalizable runtime values in snapshots: Date metadata and image bytes.
+	if (value instanceof Date) return new Date(value.getTime());
+	if (value instanceof Uint8Array) {
+		budget.textBytes += value.byteLength;
+		if (budget.textBytes > budget.textCap) throw new Error("over_budget");
+		return new Uint8Array(value);
+	}
 	if (Array.isArray(value)) {
 		if (value.length > MAX_CONTENT_PARTS) throw new Error("unavailable");
 		const result: unknown[] = [];
@@ -268,14 +336,15 @@ function cloneBounded(value: unknown, depth: number, budget: FingerprintBudget):
 		}
 		return result;
 	}
-	const prototype = Object.getPrototypeOf(value);
-	if (prototype !== Object.prototype && prototype !== null) throw new Error("unavailable");
+	// Runtime message wrappers may have custom prototypes; the own enumerable data is what
+	// the request observes. Omit methods and reject accessors without invoking them.
 	const names = Object.keys(value);
 	if (names.length > 256) throw new Error("unavailable");
 	const result: Record<string, unknown> = {};
 	for (const name of names) {
 		const descriptor = Object.getOwnPropertyDescriptor(value, name);
-		if (!descriptor || !("value" in descriptor)) throw new Error("unavailable");
+		if (!descriptor || !("value" in descriptor)) throw new Error("accessor_property");
+		if (typeof descriptor.value === "function") continue;
 		result[name] = cloneBounded(descriptor.value, depth + 1, budget);
 	}
 	return result;
@@ -318,8 +387,8 @@ function cloneToolData(
 			}
 			return result;
 		}
-		const prototype = Object.getPrototypeOf(value);
-		if (prototype !== Object.prototype && prototype !== null) throw new Error("unavailable");
+		// Tool schema wrappers can also have custom prototypes; their own enumerable
+		// data is the provider-facing shape, while functions remain omitted above.
 		const names = Object.keys(value);
 		if (names.length > 256) throw new Error("unavailable");
 		const result: Record<string, unknown> = {};
@@ -349,7 +418,12 @@ export function cloneToolsForObservation(tools: readonly unknown[]): readonly un
 		const total = { nodes: 0, textBytes: 0 };
 		for (let index = 0; index < tools.length; index++) {
 			const descriptor = Object.getOwnPropertyDescriptor(tools, String(index));
-			if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "object" || descriptor.value === null) {
+			if (
+				!descriptor ||
+				!("value" in descriptor) ||
+				typeof descriptor.value !== "object" ||
+				descriptor.value === null
+			) {
 				return undefined;
 			}
 			const tool = descriptor.value as object;
@@ -368,12 +442,22 @@ export function cloneToolsForObservation(tools: readonly unknown[]): readonly un
 				projected.description = description;
 				budget.textBytes += Buffer.byteLength(description, "utf8");
 				budget.nodes++;
-			} else if (description !== OMIT_TOOL_VALUE && description !== undefined && typeof description !== "function" && typeof description !== "symbol") {
+			} else if (
+				description !== OMIT_TOOL_VALUE &&
+				description !== undefined &&
+				typeof description !== "function" &&
+				typeof description !== "symbol"
+			) {
 				return undefined;
 			}
 
 			const parameters = toolField(tool, "parameters");
-			if (parameters !== OMIT_TOOL_VALUE && parameters !== undefined && typeof parameters !== "function" && typeof parameters !== "symbol") {
+			if (
+				parameters !== OMIT_TOOL_VALUE &&
+				parameters !== undefined &&
+				typeof parameters !== "function" &&
+				typeof parameters !== "symbol"
+			) {
 				const cloned = cloneToolData(parameters, 0, budget, new WeakSet());
 				if (cloned === OMIT_TOOL_VALUE) return undefined;
 				projected.parameters = cloned;
@@ -403,10 +487,20 @@ function toolFingerprint(tools: readonly unknown[], key: Uint8Array): string | u
 
 function classifyMessages(before: MessageSnapshot, after: MessageSnapshot): MessageClassification {
 	if (before.cause !== undefined || after.cause !== undefined) {
+		// Prefer the current (after) snapshot's failure: an absent baseline must not hide
+		// a specific unsafe shape or budget limit in the context being diagnosed.
+		const cause = after.cause ?? before.cause;
+		const overBudget =
+			cause === "too_many_messages" ||
+			cause === "oversized_message" ||
+			cause === "snapshot_budget_exhausted" ||
+			cause === "over_budget";
 		return {
-			reason: "unavailable",
-			cause: before.cause ?? after.cause,
+			reason: overBudget ? "over_budget" : "unavailable",
+			cause,
 			observedCount: Math.min(before.observed, after.observed),
+			snapshotNodes: Math.max(before.nodes, after.nodes),
+			snapshotTextBytes: Math.max(before.textBytes, after.textBytes),
 		};
 	}
 	const commonLength = Math.min(before.count, after.count);
@@ -465,16 +559,14 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 	const key = randomBytes(32);
 	let sequence = 0;
 	let dropped = 0;
-	// True when a request happened but its snapshot was too incomplete to become a baseline.
-	let priorUnavailable = false;
 	let previousFinal:
 		| {
-				messages: MessageSnapshot;
-				systemPrompt: string;
-				tools: string;
+				messages?: MessageSnapshot;
+				systemPrompt?: string;
+				tools?: string;
 				messageCount: number | null;
 				toolCount: number | null;
-				systemPromptLength: number;
+				systemPromptLength: number | null;
 		  }
 		| undefined;
 	return {
@@ -496,9 +588,7 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 				before = emptySnapshot("not_an_array");
 				after = emptySnapshot("not_an_array");
 			}
-			const classification: MessageClassification = failed
-				? { reason: "failed" }
-				: classifyMessages(before, after);
+			const classification: MessageClassification = failed ? { reason: "failed" } : classifyMessages(before, after);
 			const safeAnnotation = sanitizeAnnotation(annotation);
 			try {
 				onObservation({
@@ -511,6 +601,10 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 					afterCount: afterMessages === undefined ? null : after.count,
 					...(classification.cause === undefined ? {} : { unavailableCause: classification.cause }),
 					...(classification.observedCount === undefined ? {} : { observedCount: classification.observedCount }),
+					...(classification.snapshotNodes === undefined ? {} : { snapshotNodes: classification.snapshotNodes }),
+					...(classification.snapshotTextBytes === undefined
+						? {}
+						: { snapshotTextBytes: classification.snapshotTextBytes }),
 					...(safeAnnotation === undefined ? {} : { annotation: safeAnnotation }),
 				});
 			} catch {
@@ -581,32 +675,25 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 			};
 			const prior = previousFinal;
 			if (contextStage === "stream_input") {
-				// Only a complete snapshot may become the next request's baseline. Advancing on a
-				// partial one makes the following comparison compare against a truncated history and
-				// report the difference as "unchanged".
-				if (afterMessages.cause === undefined && afterTools !== undefined && afterPrompt !== undefined) {
-					// Rebuilt inside the guard: a narrowed `let` does not narrow the object built from it
-					// before the check.
-					previousFinal = {
-						messages: afterMessages,
-						systemPrompt: afterPrompt,
-						tools: afterTools,
-						messageCount: afterMessages.count,
-						toolCount: after.tools?.length ?? 0,
-						systemPromptLength: after.systemPrompt.length,
-					};
-				} else {
-					previousFinal = undefined;
-					priorUnavailable = true;
-				}
+				// Keep each surface's immediate predecessor independently. A malformed/oversized
+				// message list must not erase a valid prompt or tool baseline for this request.
+				previousFinal = {
+					...(afterMessages.cause === undefined ? { messages: afterMessages } : {}),
+					...(afterPrompt === undefined ? {} : { systemPrompt: afterPrompt }),
+					...(afterTools === undefined ? {} : { tools: afterTools }),
+					messageCount: afterMessages.cause === undefined ? afterMessages.count : null,
+					toolCount: afterTools === undefined ? (after.tools === undefined ? null : after.tools.length) : (after.tools?.length ?? 0),
+					systemPromptLength: afterPrompt === undefined ? null : after.systemPrompt.length,
+				};
 			}
-			const comparisonBasis: CacheOperationComparisonBasis =
-				prior !== undefined ? "prior_available" : priorUnavailable ? "prior_unavailable" : "first_request";
+			const comparisonBasis: CacheOperationComparisonBasis = prior !== undefined ? "prior_available" : "first_request";
 			const withinMessages = classifyMessages(beforeMessages, afterMessages);
 			const acrossMessages: MessageClassification =
 				prior === undefined
 					? { reason: "unavailable", cause: "no_prior_request", observedCount: afterMessages.observed }
-					: classifyMessages(prior.messages, afterMessages);
+					: prior.messages === undefined
+						? { reason: "unavailable", cause: "prior_surface_unavailable", observedCount: afterMessages.observed }
+						: classifyMessages(prior.messages, afterMessages);
 			const surfaces: Array<CacheOperationObservation> = [
 				{
 					surface: "messages",
@@ -669,16 +756,18 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 					surface: "system_prompt",
 					operation: "final_context",
 					reason:
-						prior === undefined || afterPrompt === undefined
+						prior === undefined || prior.systemPrompt === undefined || afterPrompt === undefined
 							? "unavailable"
 							: prior.systemPrompt === afterPrompt
 								? "unchanged"
 								: "history_rewrite",
 					...(prior === undefined
 						? { unavailableCause: "no_prior_request" as const }
-						: afterPrompt === undefined
-							? { unavailableCause: "unusable_system_prompt" as const }
-							: {}),
+						: prior.systemPrompt === undefined
+							? { unavailableCause: "prior_surface_unavailable" as const }
+							: afterPrompt === undefined
+								? { unavailableCause: "unusable_system_prompt" as const }
+								: {}),
 					beforeCount: prior?.systemPromptLength ?? null,
 					afterCount: currentFinal.systemPromptLength,
 					durationMs,
@@ -696,9 +785,11 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 								: "history_rewrite",
 					...(prior === undefined
 						? { unavailableCause: "no_prior_request" as const }
-						: prior.tools === undefined || afterTools === undefined
-							? { unavailableCause: "unusable_tools" as const }
-							: {}),
+						: prior.tools === undefined
+							? { unavailableCause: "prior_surface_unavailable" as const }
+							: afterTools === undefined
+								? { unavailableCause: "unusable_tools" as const }
+								: {}),
 					beforeCount: prior?.toolCount ?? null,
 					afterCount: currentFinal.toolCount,
 					durationMs,
@@ -722,7 +813,6 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 			}
 		},
 		resetFinal(): void {
-			priorUnavailable = false;
 			previousFinal = undefined;
 		},
 		nextSequence(): number {
