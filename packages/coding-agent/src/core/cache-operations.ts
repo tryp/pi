@@ -281,14 +281,108 @@ function cloneBounded(value: unknown, depth: number, budget: FingerprintBudget):
 	return result;
 }
 
+const OMIT_TOOL_VALUE = Symbol("omit tool value");
+
+/**
+ * Copy only the JSON-shaped data that contributes to a provider tool definition.
+ * Runtime fields such as execute/format/render functions are deliberately omitted:
+ * they are not part of the wire schema and must not make ordinary tools unobservable.
+ */
+function cloneToolData(
+	value: unknown,
+	depth: number,
+	budget: FingerprintBudget,
+	ancestors: WeakSet<object>,
+): unknown | typeof OMIT_TOOL_VALUE {
+	if (value === undefined || typeof value === "function" || typeof value === "symbol") return OMIT_TOOL_VALUE;
+	if (++budget.nodes > budget.nodeCap || depth > MAX_DEPTH) throw new Error("unavailable");
+	if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+	if (typeof value === "string") {
+		budget.textBytes += Buffer.byteLength(value, "utf8");
+		if (budget.textBytes > budget.textCap) throw new Error("unavailable");
+		return value;
+	}
+	if (typeof value !== "object") throw new Error("unavailable");
+	if (ancestors.has(value)) throw new Error("cyclic tool schema");
+	ancestors.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (value.length > MAX_CONTENT_PARTS) throw new Error("unavailable");
+			const result: unknown[] = [];
+			for (let index = 0; index < value.length; index++) {
+				const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+				if (!descriptor || !("value" in descriptor)) throw new Error("unavailable");
+				const child = cloneToolData(descriptor.value, depth + 1, budget, ancestors);
+				// Match JSON array serialization: unsupported entries occupy their position as null.
+				result.push(child === OMIT_TOOL_VALUE ? null : child);
+			}
+			return result;
+		}
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) throw new Error("unavailable");
+		const names = Object.keys(value);
+		if (names.length > 256) throw new Error("unavailable");
+		const result: Record<string, unknown> = {};
+		for (const name of names) {
+			const descriptor = Object.getOwnPropertyDescriptor(value, name);
+			if (!descriptor || !("value" in descriptor)) throw new Error("unavailable");
+			const child = cloneToolData(descriptor.value, depth + 1, budget, ancestors);
+			if (child !== OMIT_TOOL_VALUE) result[name] = child;
+		}
+		return result;
+	} finally {
+		ancestors.delete(value);
+	}
+}
+
+function toolField(tool: object, name: string): unknown | typeof OMIT_TOOL_VALUE {
+	const descriptor = Object.getOwnPropertyDescriptor(tool, name);
+	if (!descriptor) return OMIT_TOOL_VALUE;
+	if (!("value" in descriptor)) throw new Error("unavailable");
+	return descriptor.value;
+}
+
 export function cloneToolsForObservation(tools: readonly unknown[]): readonly unknown[] | undefined {
 	try {
 		if (!Array.isArray(tools) || tools.length > 256) return undefined;
 		const copy: unknown[] = [];
+		const total = { nodes: 0, textBytes: 0 };
 		for (let index = 0; index < tools.length; index++) {
 			const descriptor = Object.getOwnPropertyDescriptor(tools, String(index));
-			if (!descriptor || !("value" in descriptor)) return undefined;
-			copy.push(cloneBounded(descriptor.value, 0, newBudget()));
+			if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "object" || descriptor.value === null) {
+				return undefined;
+			}
+			const tool = descriptor.value as object;
+			const prototype = Object.getPrototypeOf(tool);
+			if (prototype !== Object.prototype && prototype !== null) return undefined;
+			const budget = newBudget();
+			const projected: Record<string, unknown> = {};
+			const name = toolField(tool, "name");
+			if (typeof name !== "string") return undefined;
+			projected.name = name;
+			budget.textBytes += Buffer.byteLength(name, "utf8");
+			budget.nodes++;
+
+			const description = toolField(tool, "description");
+			if (typeof description === "string") {
+				projected.description = description;
+				budget.textBytes += Buffer.byteLength(description, "utf8");
+				budget.nodes++;
+			} else if (description !== OMIT_TOOL_VALUE && description !== undefined && typeof description !== "function" && typeof description !== "symbol") {
+				return undefined;
+			}
+
+			const parameters = toolField(tool, "parameters");
+			if (parameters !== OMIT_TOOL_VALUE && parameters !== undefined && typeof parameters !== "function" && typeof parameters !== "symbol") {
+				const cloned = cloneToolData(parameters, 0, budget, new WeakSet());
+				if (cloned === OMIT_TOOL_VALUE) return undefined;
+				projected.parameters = cloned;
+			}
+			if (budget.nodes > budget.nodeCap || budget.textBytes > budget.textCap) return undefined;
+			total.nodes += budget.nodes;
+			total.textBytes += budget.textBytes;
+			if (total.nodes > MAX_SNAPSHOT_NODES || total.textBytes > MAX_SNAPSHOT_TEXT_BYTES) return undefined;
+			copy.push(projected);
 		}
 		return copy;
 	} catch {
@@ -296,9 +390,15 @@ export function cloneToolsForObservation(tools: readonly unknown[]): readonly un
 	}
 }
 
+/**
+ * The tool array is ordered in the provider request. Keep that order significant: both a
+ * membership change and a reorder change the request body's tool block and therefore the
+ * provider's cached prefix.
+ */
 function toolFingerprint(tools: readonly unknown[], key: Uint8Array): string | undefined {
-	if (!Array.isArray(tools) || tools.length > 256) return undefined;
-	return boundedFingerprint(tools, key);
+	const projection = cloneToolsForObservation(tools);
+	if (projection === undefined) return undefined;
+	return boundedFingerprint(projection, key);
 }
 
 function classifyMessages(before: MessageSnapshot, after: MessageSnapshot): MessageClassification {

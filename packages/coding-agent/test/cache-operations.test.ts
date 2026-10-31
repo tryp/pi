@@ -5,6 +5,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { expect, it } from "vitest";
 import {
 	cloneMessagesForObservation,
+	cloneToolsForObservation,
 	createCacheOperationInstrumentation,
 	createCacheOperationRecord,
 } from "../src/core/cache-operations.ts";
@@ -83,6 +84,120 @@ it("records final history/system/tool surfaces without persisting their contents
 	expect(serialized).not.toContain("PRIVATE");
 	expect(serialized).not.toContain("private_tool");
 	expect(serialized).not.toContain("private schema details");
+});
+
+it("projects realistic tool definitions while omitting runtime functions", () => {
+	const execute = async () => ({ content: [] });
+	const tools = [
+		{
+			name: "read",
+			description: "Read a file",
+			parameters: { type: "object", properties: { path: { type: "string" } } },
+			execute,
+			formatCall: () => "read",
+		},
+	];
+
+	expect(cloneToolsForObservation(tools)).toEqual([
+		{
+			name: "read",
+			description: "Read a file",
+			parameters: { type: "object", properties: { path: { type: "string" } } },
+		},
+	]);
+
+	const records: Array<{ surface: string; reason: string; comparisonScope?: string }> = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools },
+		{ messages: messages("same"), systemPrompt: "system", tools },
+		1,
+	);
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools },
+		{ messages: messages("same"), systemPrompt: "system", tools },
+		1,
+	);
+	const acrossTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "across_requests");
+	expect(acrossTools.map((record) => record.reason)).toEqual(["unavailable", "unchanged"]);
+});
+
+it.each([
+	["description", (tool: Record<string, unknown>) => ({ ...tool, description: "Changed description" })],
+	["parameter name", (tool: Record<string, unknown>) => ({ ...tool, parameters: { type: "object", properties: { file: { type: "string" } } } })],
+] as const)("detects a changed tool %s in the provider projection", (_label, changeTool) => {
+	const tool = {
+		name: "read",
+		description: "Read a file",
+		parameters: { type: "object", properties: { path: { type: "string" } } },
+		execute: async () => ({ content: [] }),
+	};
+	const records: Array<{ surface: string; reason: string; comparisonScope?: string; unavailableCause?: string }> = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const previousTools = [tool];
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools: previousTools },
+		{ messages: messages("same"), systemPrompt: "system", tools: previousTools },
+		1,
+	);
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools: previousTools },
+		{ messages: messages("same"), systemPrompt: "system", tools: [changeTool(tool)] },
+		1,
+	);
+
+	const acrossTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "across_requests");
+	expect(acrossTools.map((record) => record.reason)).toEqual(["unavailable", "history_rewrite"]);
+	expect(acrossTools[1]?.unavailableCause).toBeUndefined();
+});
+
+it("treats tool order as part of the cacheable provider schema", () => {
+	const first = { name: "first", description: "First", parameters: { type: "object" }, execute: () => {} };
+	const second = { name: "second", description: "Second", parameters: { type: "object" }, execute: () => {} };
+	const records: Array<{ surface: string; reason: string; comparisonScope?: string }> = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const initial = [first, second];
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools: initial },
+		{ messages: messages("same"), systemPrompt: "system", tools: initial },
+		1,
+	);
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools: initial },
+		{ messages: messages("same"), systemPrompt: "system", tools: [second, first] },
+		1,
+	);
+
+	const acrossTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "across_requests");
+	expect(acrossTools.map((record) => record.reason)).toEqual(["unavailable", "history_rewrite"]);
+});
+
+it("reports cyclic and oversized tool schemas unavailable without throwing", () => {
+	const cyclic: Record<string, unknown> = { type: "object" };
+	cyclic["self"] = cyclic;
+	const tooLarge = "x".repeat(128 * 1024 + 1);
+	const invalidTools = [
+		{ name: "cyclic", parameters: cyclic, execute: () => {} },
+		{ name: "oversized", description: tooLarge, parameters: { type: "object" }, execute: () => {} },
+	];
+	expect(cloneToolsForObservation(invalidTools)).toBeUndefined();
+	expect(cloneToolsForObservation([invalidTools[1]!])).toBeUndefined();
+
+	const records: Array<{ surface: string; reason: string; comparisonScope?: string; unavailableCause?: string }> = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const validTools = [{ name: "read", parameters: { type: "object" }, execute: () => {} }];
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools: validTools },
+		{ messages: messages("same"), systemPrompt: "system", tools: validTools },
+		1,
+	);
+	instrumentation.observeFinal(
+		{ messages: messages("same"), systemPrompt: "system", tools: validTools },
+		{ messages: messages("same"), systemPrompt: "system", tools: [invalidTools[0]!] },
+		1,
+	);
+	const withinTools = records.filter((record) => record.surface === "tools" && record.comparisonScope === "within_request");
+	expect(withinTools[1]).toMatchObject({ reason: "unavailable", unavailableCause: "unusable_tools" });
 });
 
 it("compares each finalized context to the previous request, separately from within-request changes", () => {
