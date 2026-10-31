@@ -11,6 +11,8 @@ export const CACHE_TTL_MS = 5 * 60 * 1000;
 const NOISE_FLOOR_TOKENS = 1024;
 
 /** A counted cache miss on a single assistant message. */
+export type CacheMissReason = "compaction" | "model_switch" | "idle" | "unexplained";
+
 export interface CacheMiss {
 	/** Prompt tokens that were in the previous turn's prompt but not read from cache. */
 	missedTokens: number;
@@ -20,6 +22,59 @@ export interface CacheMiss {
 	idleMs: number;
 	/** True when the model changed relative to the previous request. */
 	modelChanged: boolean;
+	/** Best observable explanation, with compaction taking precedence. */
+	reason: CacheMissReason;
+	/** Session entry that caused the miss, when a concrete boundary is available. */
+	anchorEntryId: string | undefined;
+	/** Compaction context size before summarization and at the billed request. */
+	contextBeforeTokens?: number;
+	contextAfterTokens?: number;
+}
+
+export function shouldShowCacheMissNotice(miss: CacheMiss): boolean {
+	return miss.missedTokens >= 20_000 || miss.missedCost >= 0.1;
+}
+
+export function getCacheMissLabel(miss: CacheMiss): string {
+	switch (miss.reason) {
+		case "compaction":
+			return "Cache miss after compaction";
+		case "model_switch":
+			return "Cache miss after model switch";
+		case "idle":
+			return `Cache miss after ${Math.round(miss.idleMs / 60_000)}m idle`;
+		case "unexplained":
+			return "Cache miss";
+	}
+}
+
+export interface CacheMissDiagnosticSink {
+	appendCustomEntry(customType: string, data?: unknown): unknown;
+}
+
+/** Persist bounded, content-free details for an emitted cache-miss notice. */
+export function recordCacheMissDiagnostic(
+	sink: CacheMissDiagnosticSink,
+	miss: CacheMiss,
+	anchorPlacement: "adjacent" | "tail_fallback",
+): void {
+	sink.appendCustomEntry("pi.session_diagnostic", {
+		timestamp: Date.now(),
+		schemaVersion: 1,
+		kind: "cache_miss_notice",
+		reason: miss.reason,
+		missedTokens: Math.min(
+			Number.MAX_SAFE_INTEGER,
+			Math.max(0, Number.isFinite(miss.missedTokens) ? Math.floor(miss.missedTokens) : 0),
+		),
+		missedCost: Math.min(1_000_000_000, Math.max(0, Number.isFinite(miss.missedCost) ? miss.missedCost : 0)),
+		idleMs: Math.min(365 * 24 * 60 * 60 * 1000, Math.max(0, Number.isFinite(miss.idleMs) ? miss.idleMs : 0)),
+		modelChanged: miss.modelChanged,
+		anchorEntryId: miss.anchorEntryId,
+		anchorPlacement,
+		...(miss.contextBeforeTokens === undefined ? {} : { contextBeforeTokens: miss.contextBeforeTokens }),
+		...(miss.contextAfterTokens === undefined ? {} : { contextAfterTokens: miss.contextAfterTokens }),
+	});
 }
 
 export interface CacheWasteTotals {
@@ -50,13 +105,15 @@ interface PreviousRequest {
 /**
  * Compute the cache miss for one assistant message relative to the previous
  * request. Returns undefined when nothing is counted: first turn, after a
- * reset, no cache activity ever reported (provider without cache support), or
+ * branch-summary reset, no cache activity ever reported (provider without cache support), or
  * miss below the noise floor.
  */
 function detectMiss(
 	prev: PreviousRequest | undefined,
 	message: AssistantMessage,
 	models: ModelPriceSource,
+	compactionBoundary?: { entryId: string; tokensBefore: number },
+	modelChangeEntryId?: string,
 ): CacheMiss | undefined {
 	const usage = message.usage;
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
@@ -81,11 +138,25 @@ function detectMiss(
 			? usage.cost.cacheRead / usage.cacheRead
 			: (models.getModel(message.provider, message.model)?.cost.cacheRead ?? 0) / 1_000_000;
 
+	const idleMs = Math.max(0, message.timestamp - prev.timestamp);
+	const modelChanged = `${message.provider}/${message.model}` !== prev.modelKey;
+	const reason = compactionBoundary
+		? "compaction"
+		: modelChanged
+			? "model_switch"
+			: idleMs >= CACHE_TTL_MS
+				? "idle"
+				: "unexplained";
 	return {
 		missedTokens,
 		missedCost: missedTokens * Math.max(0, paidPerToken - readPerToken),
-		idleMs: Math.max(0, message.timestamp - prev.timestamp),
-		modelChanged: `${message.provider}/${message.model}` !== prev.modelKey,
+		idleMs,
+		modelChanged,
+		reason,
+		anchorEntryId: compactionBoundary?.entryId ?? (reason === "model_switch" ? modelChangeEntryId : undefined),
+		...(compactionBoundary
+			? { contextBeforeTokens: compactionBoundary.tokensBefore, contextAfterTokens: promptTokens }
+			: {}),
 	};
 }
 
@@ -104,17 +175,33 @@ function asPreviousRequest(message: AssistantMessage, reportedCache: boolean): P
 function scan(
 	entries: SessionEntry[],
 	models: ModelPriceSource,
-): { prev: PreviousRequest | undefined; totals: CacheWasteTotals; misses: Map<AssistantMessage, CacheMiss> } {
+): {
+	prev: PreviousRequest | undefined;
+	totals: CacheWasteTotals;
+	misses: Map<AssistantMessage, CacheMiss>;
+	compactionBoundary: { entryId: string; tokensBefore: number } | undefined;
+	modelChangeEntryId: string | undefined;
+} {
 	let prev: PreviousRequest | undefined;
 	const totals: CacheWasteTotals = { missedTokens: 0, missedCost: 0, missCount: 0 };
 	const misses = new Map<AssistantMessage, CacheMiss>();
+	let compactionBoundary: { entryId: string; tokensBefore: number } | undefined;
+	let modelChangeEntryId: string | undefined;
 
 	for (const entry of entries) {
-		if (entry.type === "compaction" || entry.type === "branch_summary") {
-			// The context legitimately changed; the next turn's prompt is new content,
-			// not re-billed content. Model switches are NOT exempt: they re-bill the
-			// full prompt and should be counted.
+		if (entry.type === "compaction") {
+			// Retain the real boundary and its size for the first post-compaction request.
+			compactionBoundary = { entryId: entry.id, tokensBefore: entry.tokensBefore };
+			continue;
+		}
+		if (entry.type === "model_change") {
+			modelChangeEntryId = entry.id;
+			continue;
+		}
+		if (entry.type === "branch_summary") {
 			prev = undefined;
+			compactionBoundary = undefined;
+			modelChangeEntryId = undefined;
 			continue;
 		}
 		if (
@@ -123,7 +210,7 @@ function scan(
 			entry.message.stopReason !== "error" &&
 			entry.message.stopReason !== "aborted"
 		) {
-			const miss = detectMiss(prev, entry.message, models);
+			const miss = detectMiss(prev, entry.message, models, compactionBoundary, modelChangeEntryId);
 			if (miss) {
 				totals.missedTokens += miss.missedTokens;
 				totals.missedCost += miss.missedCost;
@@ -131,9 +218,11 @@ function scan(
 				misses.set(entry.message, miss);
 			}
 			prev = asPreviousRequest(entry.message, prev?.reportedCache ?? false) ?? prev;
+			compactionBoundary = undefined;
+			modelChangeEntryId = undefined;
 		}
 	}
-	return { prev, totals, misses };
+	return { prev, totals, misses, compactionBoundary, modelChangeEntryId };
 }
 
 /**
@@ -167,5 +256,6 @@ export function detectCacheMiss(
 	message: AssistantMessage,
 	models: ModelPriceSource,
 ): CacheMiss | undefined {
-	return detectMiss(scan(entries, models).prev, message, models);
+	const previous = scan(entries, models);
+	return detectMiss(previous.prev, message, models, previous.compactionBoundary, previous.modelChangeEntryId);
 }

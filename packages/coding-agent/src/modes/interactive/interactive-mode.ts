@@ -60,11 +60,13 @@ import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../.
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
-	CACHE_TTL_MS,
 	type CacheMiss,
 	collectCacheMisses,
 	computeCacheWaste,
 	detectCacheMiss,
+	getCacheMissLabel,
+	recordCacheMissDiagnostic,
+	shouldShowCacheMissNotice,
 } from "../../core/cache-stats.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "../../core/defaults.ts";
 import type {
@@ -214,6 +216,12 @@ type CompactionCostNotice = {
 	type: "compaction_cost";
 	kind: "compaction" | "branch_summary";
 	usage: Usage;
+};
+
+type RenderSessionOptions = {
+	updateFooter?: boolean;
+	populateHistory?: boolean;
+	entryIdsByMessage?: Map<AgentMessage, string[]>;
 };
 
 type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }> | CompactionCostNotice;
@@ -478,6 +486,7 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+	private renderedEntryComponents = new Map<string, Component>();
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -3263,6 +3272,12 @@ export class InteractiveMode {
 					this.streamingMessage = event.message;
 					this.chatContainer.addChild(this.streamingComponent);
 					this.streamingComponent.updateContent(this.streamingMessage, true);
+					const latestModelChange = this.sessionManager
+						.getEntries()
+						.findLast((entry) => entry.type === "model_change");
+					if (latestModelChange) {
+						this.renderedEntryComponents?.set(latestModelChange.id, this.streamingComponent);
+					}
 					this.ui.requestRender();
 				}
 				break;
@@ -3456,13 +3471,14 @@ export class InteractiveMode {
 					this.chatContainer.clear();
 					// The latest compaction is prepended for model context; append it below at its chronological position.
 					this.renderSessionEntries(entries.slice(1));
-					this.addMessageToChat(
-						createCompactionSummaryMessage(
-							event.result.summary,
-							event.result.tokensBefore,
-							new Date().toISOString(),
-						),
+					const compactionSummary = createCompactionSummaryMessage(
+						event.result.summary,
+						event.result.tokensBefore,
+						new Date().toISOString(),
 					);
+					this.addMessageToChat(compactionSummary);
+					const summaryComponent = this.chatContainer.children?.at(-1);
+					if (summaryComponent) this.renderedEntryComponents?.set(entries[0].id, summaryComponent);
 					if (event.result.usage) {
 						this.addCompactionCostNotice({
 							type: "compaction_cost",
@@ -3724,12 +3740,19 @@ export class InteractiveMode {
 		}
 	}
 
-	private renderSessionItems(
-		items: readonly RenderSessionItem[],
-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
-	): void {
+	private renderSessionItems(items: readonly RenderSessionItem[], options: RenderSessionOptions = {}): void {
 		this.pendingTools.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
+		const addMessageAndMapEntryIds = (message: AgentMessage) => {
+			const before = this.chatContainer.children.length;
+			this.addMessageToChat(message, options);
+			const component = this.chatContainer.children[before];
+			if (component) {
+				for (const id of options.entryIdsByMessage?.get(message) ?? []) {
+					this.renderedEntryComponents?.set(id, component);
+				}
+			}
+		};
 		// Cache-miss notices are not persisted; re-derive them from the full entry
 		// list and re-inject them after the assistant messages that paid for them.
 		const cacheMisses = this.settingsManager.getShowCacheMissNotices()
@@ -3754,7 +3777,7 @@ export class InteractiveMode {
 			const message = item;
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
-				this.addMessageToChat(message);
+				addMessageAndMapEntryIds(message);
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
@@ -3803,7 +3826,7 @@ export class InteractiveMode {
 				}
 			} else {
 				// All other messages use standard rendering
-				this.addMessageToChat(message, options);
+				addMessageAndMapEntryIds(message);
 			}
 		}
 
@@ -3819,21 +3842,35 @@ export class InteractiveMode {
 	 * @param options.updateFooter Update footer state
 	 * @param options.populateHistory Add user messages to editor history
 	 */
-	private renderSessionEntries(
-		entries: SessionEntry[],
-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
-	): void {
+	private renderSessionEntries(entries: SessionEntry[], options: RenderSessionOptions = {}): void {
+		this.renderedEntryComponents ??= new Map();
+		this.renderedEntryComponents.clear();
+		const entryIdsByMessage = new Map<AgentMessage, string[]>();
+		let pendingModelChangeIds: string[] = [];
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
+			if (entry.type === "model_change") {
+				pendingModelChangeIds.push(entry.id);
+				return [];
+			}
 			if (entry.type === "custom") {
 				return [entry];
 			}
 			const messages = sessionEntryToContextMessages(entry);
+			for (const message of messages) {
+				const ids = entryIdsByMessage.get(message) ?? [];
+				ids.push(entry.id);
+				if (message.role === "assistant" && pendingModelChangeIds.length > 0) {
+					ids.push(...pendingModelChangeIds);
+					pendingModelChangeIds = [];
+				}
+				entryIdsByMessage.set(message, ids);
+			}
 			if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage && messages.length > 0) {
 				return [...messages, { type: "compaction_cost", kind: entry.type, usage: entry.usage }];
 			}
 			return messages;
 		});
-		this.renderSessionItems(items, options);
+		this.renderSessionItems(items, { ...options, entryIdsByMessage });
 	}
 
 	/**
@@ -3855,31 +3892,53 @@ export class InteractiveMode {
 
 	/**
 	 * Show a transcript notice when a completed assistant message paid for a
-	 * significant cache miss. Only states observable facts: the miss itself,
-	 * a model switch, or an idle gap past the cache TTL.
+	 * significant cache miss. The reason is classified as compaction, model
+	 * switch, idle expiry, or unexplained from the available session history.
 	 */
 	private maybeShowCacheMissNotice(message: AssistantMessage): void {
 		if (!this.settingsManager.getShowCacheMissNotices()) return;
 
 		// Entries don't contain `message` yet: message_end fires before persistence.
 		const miss = detectCacheMiss(this.sessionManager.getEntries(), message, this.session.modelRuntime);
-		if (miss) this.addCacheMissNotice(miss);
+		if (!miss || !shouldShowCacheMissNotice(miss)) return;
+		const anchorPlacement = this.addCacheMissNotice(miss);
+		if (anchorPlacement) recordCacheMissDiagnostic(this.sessionManager, miss, anchorPlacement);
 	}
 
-	private addCacheMissNotice(miss: CacheMiss): void {
-		if (miss.missedTokens < 20_000 && miss.missedCost < 0.1) return;
+	private addCacheMissNotice(miss: CacheMiss): "adjacent" | "tail_fallback" | undefined {
+		if (!shouldShowCacheMissNotice(miss)) return undefined;
 
 		const cost = miss.missedCost >= 0.01 ? ` (~$${miss.missedCost.toFixed(2)})` : "";
-		const reBilled = `${formatTokens(miss.missedTokens)} tokens re-billed${cost}`;
-		let label = "Cache miss";
-		if (miss.modelChanged) {
-			label = "Cache miss after model switch";
-		} else if (miss.idleMs >= CACHE_TTL_MS) {
-			label = `Cache miss after ${Math.round(miss.idleMs / 60_000)}m idle`;
+		const label = getCacheMissLabel(miss);
+		const components: Component[] = [
+			new Spacer(1),
+			new Text(theme.fg("warning", `${label}: ${formatTokens(miss.missedTokens)} tokens re-billed${cost}`), 1, 0),
+		];
+		if (
+			miss.reason === "compaction" &&
+			miss.contextBeforeTokens !== undefined &&
+			miss.contextAfterTokens !== undefined
+		) {
+			components.push(
+				new Text(
+					theme.fg(
+						"warning",
+						`Context after compaction: ${formatTokens(miss.contextBeforeTokens)} -> ${formatTokens(miss.contextAfterTokens)} tokens`,
+					),
+					1,
+					0,
+				),
+			);
 		}
-		const text = theme.fg("warning", `${label}: ${reBilled}`);
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(text, 1, 0));
+
+		const anchor = miss.anchorEntryId ? this.renderedEntryComponents.get(miss.anchorEntryId) : undefined;
+		const anchorIndex = anchor ? this.chatContainer.children.indexOf(anchor) : -1;
+		if (anchorIndex >= 0) {
+			this.chatContainer.children.splice(anchorIndex + 1, 0, ...components);
+			return "adjacent";
+		}
+		for (const component of components) this.chatContainer.addChild(component);
+		return "tail_fallback";
 	}
 
 	renderInitialMessages(): void {

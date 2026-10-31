@@ -102,7 +102,7 @@ describe("InteractiveMode compaction events", () => {
 				expect.objectContaining({ role: "compactionSummary", summary: "previous summary" }),
 				{ type: "compaction_cost", kind: "compaction", usage: previousUsage },
 			],
-			{},
+			expect.objectContaining({ entryIdsByMessage: expect.any(Map) }),
 		);
 	});
 

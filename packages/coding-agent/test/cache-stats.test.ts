@@ -1,10 +1,14 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+	CACHE_TTL_MS,
 	collectCacheMisses,
 	computeCacheWaste,
 	detectCacheMiss,
+	getCacheMissLabel,
 	type ModelPriceSource,
+	recordCacheMissDiagnostic,
+	shouldShowCacheMissNotice,
 } from "../src/core/cache-stats.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";
 
@@ -43,8 +47,8 @@ function assistant(options: {
 	} as AssistantMessage;
 }
 
-function entry(message: AssistantMessage): SessionEntry {
-	return { type: "message", id: "x", parentId: null, timestamp: "", message } as SessionEntry;
+function entry(message: AssistantMessage, id = "x"): SessionEntry {
+	return { type: "message", id, parentId: null, timestamp: "", message } as SessionEntry;
 }
 
 // Turn 1: fresh 100k cache write at $3.75/M
@@ -73,16 +77,41 @@ describe("computeCacheWaste", () => {
 		expect(totals.missedCost).toBe(0);
 	});
 
-	it("skips the turn after a compaction reset", () => {
-		const reset = { type: "compaction", id: "c", parentId: null, timestamp: "" } as SessionEntry;
-		const afterReset = assistant({ cacheWrite: 20_000, cost: { cacheWrite: 0.075 } });
-		const totals = computeCacheWaste([entry(turn1), reset, entry(afterReset)], models);
-		expect(totals.missedTokens).toBe(0);
+	it("classifies a post-compaction miss without changing the notice threshold", () => {
+		const compaction = {
+			type: "compaction",
+			id: "c",
+			parentId: null,
+			timestamp: "",
+			tokensBefore: 148_000,
+		} as SessionEntry;
+		const afterCompaction = assistant({ cacheWrite: 51_000, cost: { cacheWrite: 0.19125 }, timestamp: 600_000 });
+		const entries = [entry(turn1), entry(turn2), compaction, entry(afterCompaction, "after-compaction")];
+		const miss = collectCacheMisses(entries, models).get(afterCompaction);
+		expect(detectCacheMiss(entries.slice(0, -1), afterCompaction, models)?.reason).toBe("compaction");
+		expect(miss?.modelChanged).toBe(false);
+		expect(miss?.idleMs).toBeGreaterThan(CACHE_TTL_MS);
+		expect(miss?.reason).toBe("compaction");
+		expect(miss?.anchorEntryId).toBe("c");
+		expect(miss?.missedTokens).toBe(51_000);
+		expect(miss?.contextBeforeTokens).toBe(148_000);
+		expect(miss?.contextAfterTokens).toBe(51_000);
+		expect(getCacheMissLabel(miss!)).toBe("Cache miss after compaction");
+		expect(computeCacheWaste(entries, models).missCount).toBe(1);
+		expect(shouldShowCacheMissNotice(miss!)).toBe(true);
 	});
 
 	it("counts misses caused by model switches", () => {
 		const otherModel = assistant({ cacheWrite: 100_000, cost: { cacheWrite: 0.375 }, model: "other-model" });
-		const totals = computeCacheWaste([entry(turn1), entry(otherModel)], models);
+		const modelChange = {
+			type: "model_change",
+			id: "model-change",
+			provider: "test",
+			modelId: "other-model",
+		} as SessionEntry;
+		const entries = [entry(turn1), modelChange, entry(otherModel, "after-model-change")];
+		const totals = computeCacheWaste(entries, models);
+		expect(collectCacheMisses(entries, models).get(otherModel)?.anchorEntryId).toBe("model-change");
 		expect(totals.missedTokens).toBe(100_000);
 		expect(totals.missCount).toBe(1);
 	});
@@ -153,6 +182,8 @@ describe("detectCacheMiss", () => {
 		// 600s - 60s since the previous request
 		expect(miss?.idleMs).toBe(540_000);
 		expect(miss?.modelChanged).toBe(false);
+		expect(miss?.reason).toBe("idle");
+		expect(getCacheMissLabel(miss!)).toBe("Cache miss after 9m idle");
 	});
 
 	it("flags model switches on detected misses", () => {
@@ -165,6 +196,8 @@ describe("detectCacheMiss", () => {
 		const miss = detectCacheMiss([entry(turn1), entry(turn2)], otherModel, models);
 		expect(miss?.missedTokens).toBe(105_000);
 		expect(miss?.modelChanged).toBe(true);
+		expect(miss?.reason).toBe("model_switch");
+		expect(getCacheMissLabel(miss!)).toBe("Cache miss after model switch");
 	});
 
 	it("evaluates direct error targets as supplied", () => {
@@ -189,5 +222,46 @@ describe("detectCacheMiss", () => {
 
 	it("returns undefined for the first turn of a session", () => {
 		expect(detectCacheMiss([], turn1, models)).toBeUndefined();
+	});
+
+	it("keeps unexplained labels and suppresses sub-threshold notices", () => {
+		const miss = {
+			missedTokens: 19_999,
+			missedCost: 0.099,
+			idleMs: 0,
+			modelChanged: false,
+			reason: "unexplained" as const,
+			anchorEntryId: undefined,
+		};
+		expect(getCacheMissLabel(miss)).toBe("Cache miss");
+		expect(shouldShowCacheMissNotice(miss)).toBe(false);
+		expect(shouldShowCacheMissNotice({ ...miss, missedCost: 0.1 })).toBe(true);
+		expect(shouldShowCacheMissNotice({ ...miss, missedTokens: 20_000 })).toBe(true);
+	});
+
+	it("writes exactly one bounded, content-free diagnostic per notice", () => {
+		const appendCustomEntry = vi.fn();
+		const miss = {
+			missedTokens: 105_000,
+			missedCost: 0.36225,
+			idleMs: 60_000,
+			modelChanged: false,
+			reason: "compaction" as const,
+			anchorEntryId: "c",
+		};
+		recordCacheMissDiagnostic({ appendCustomEntry }, miss, "tail_fallback");
+		expect(appendCustomEntry).toHaveBeenCalledTimes(1);
+		expect(appendCustomEntry).toHaveBeenCalledWith("pi.session_diagnostic", {
+			timestamp: expect.any(Number),
+			schemaVersion: 1,
+			kind: "cache_miss_notice",
+			reason: "compaction",
+			missedTokens: 105_000,
+			missedCost: 0.36225,
+			idleMs: 60_000,
+			modelChanged: false,
+			anchorEntryId: "c",
+			anchorPlacement: "tail_fallback",
+		});
 	});
 });
