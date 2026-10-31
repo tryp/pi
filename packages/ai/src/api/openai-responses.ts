@@ -5,6 +5,7 @@ import {
 	getCacheTelemetryDataProperty,
 	observeCacheOutcomeSafely,
 	observeCacheRequestSafely,
+	serializeWirePayload,
 } from "../cache-telemetry.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
@@ -173,6 +174,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 								? null
 								: getCacheTelemetryDataProperty(params, "prompt_cache_key") === cacheSessionId,
 						payload: params,
+						wirePayload: serializeWirePayload(params),
 					});
 					try {
 						return await client.responses.create(params, requestOptions).withResponse();

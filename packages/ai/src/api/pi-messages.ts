@@ -22,6 +22,10 @@ import type {
 	ThinkingLevel,
 	ToolCall,
 } from "../types.ts";
+import {
+	observeCacheOutcomeSafely,
+	observeCacheRequestSafely,
+} from "../cache-telemetry.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
@@ -379,6 +383,21 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 				payload = nextPayload;
 			}
 
+			const body = JSON.stringify(payload);
+			// The body is serialized once and both observed and sent, so telemetry describes the exact
+			// bytes on the wire instead of a second, independently built string.
+			const telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+				provider: model.provider,
+				model: model.id,
+				phase: "final_wire_body",
+				transport: "sse",
+				payloadMode: "full",
+				cacheRetention: resolveCacheRetention(options?.cacheRetention, options?.env),
+				sessionHeaderPresent: Boolean(options?.sessionId),
+				payload,
+				wirePayload: body,
+			});
+
 			const response = await (options?.fetch ?? globalThis.fetch)(url, {
 				method: "POST",
 				headers: {
@@ -387,14 +406,23 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 					"content-type": "application/json",
 					...providerHeadersToRecord(options?.headers),
 				},
-				body: JSON.stringify(payload),
+				body,
 				signal: options?.signal,
+			}).catch((error: unknown) => {
+				if (telemetryIds)
+					observeCacheOutcomeSafely(options?.cacheTelemetry, {
+						...telemetryIds,
+						outcome: options?.signal?.aborted ? "aborted" : "failed",
+					});
+				throw error;
 			});
 
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 
 			if (!response.ok) {
 				const body = await response.text();
+				if (telemetryIds)
+					observeCacheOutcomeSafely(options?.cacheTelemetry, { ...telemetryIds, outcome: "failed" });
 				throw createPiMessagesResponseError(model, url, response, body);
 			}
 			if (!response.body) {
@@ -403,6 +431,19 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			for await (const piEvent of readPiMessagesEvents(response.body)) {
 				const event = convertEvent(piEvent);
+				// A request row is only written once its attempt reports a terminal outcome, so success
+				// has to be recorded here; otherwise the adapter observes requests that never appear.
+				if (event.type === "done" && telemetryIds)
+					observeCacheOutcomeSafely(options?.cacheTelemetry, {
+						...telemetryIds,
+						outcome: "success",
+						normalizedUsage: event.message.usage,
+					});
+				else if (event.type === "error" && telemetryIds)
+					observeCacheOutcomeSafely(options?.cacheTelemetry, {
+						...telemetryIds,
+						outcome: event.reason === "aborted" ? "aborted" : "failed",
+					});
 				eventStream.push(event);
 				if (event.type === "done" || event.type === "error") {
 					return;

@@ -12,6 +12,7 @@ import {
 	classifyCacheTelemetryRawField,
 	observeCacheOutcomeSafely,
 	observeCacheRequestSafely,
+	serializeWirePayload,
 } from "../cache-telemetry.ts";
 import { calculateCost } from "../models.ts";
 import type {
@@ -579,6 +580,9 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
+			// Built once, outside the retry loop: telemetry must describe the bytes actually sent
+			// (`stream: true` included), and every retry resends the same request.
+			const wireBody = { ...params, stream: true };
 			const response = await retryProviderRequest(
 				async () => {
 					telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
@@ -591,10 +595,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						cacheRetention: resolveCacheRetention(options?.cacheRetention, options?.env),
 						cacheKeyPresent: false,
 						sessionHeaderPresent: Boolean(options?.sessionId),
-						payload: params,
+						payload: wireBody,
+						wirePayload: serializeWirePayload(wireBody),
 					});
 					try {
-						return await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
+						return await client.messages.create(wireBody, requestOptions).asResponse();
 					} catch (error) {
 						if (telemetryIds)
 							observeCacheOutcomeSafely(options?.cacheTelemetry, {

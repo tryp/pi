@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { MODELS } from "./models.generated.ts";
+
 export type CacheTelemetrySegmentName = "system" | "tools" | "message" | "other";
 export type CacheTelemetryPhase = "canonical_body" | "final_wire_body";
 export type CacheTelemetryTransport = "sse" | "websocket" | "unknown";
@@ -72,6 +75,8 @@ export interface CacheTelemetryRequestRecord {
 	readonly fingerprintStatus: "ok" | "truncated" | "unavailable";
 	readonly segments: readonly CacheTelemetrySegment[];
 	readonly prefixComparable: boolean;
+	/** Present when bounded telemetry labels hide a provider or model id; otherwise absent. */
+	readonly labelsSuppressed?: Readonly<{ provider: boolean; model: boolean }>;
 	readonly previousCommonPrefixSegments: number;
 	readonly truncatedSegmentCount: number;
 	readonly continuationPresent?: boolean;
@@ -194,6 +199,35 @@ export function observeCacheRequestSafely(
 	}
 }
 
+/**
+ * The bytes the provider will put on the wire, as a string telemetry can bound and parse.
+ *
+ * Every adapter hands an SDK (or `fetch`) a plain object, so the wire text only exists once that
+ * object is serialized. `observeRequest` treats a missing `wirePayload` as
+ * `fingerprintStatus: "unavailable"` and then emits a row with no segments at all -- an adapter
+ * that observes a request without one is therefore blind, not merely imprecise. That is why this
+ * helper exists rather than each adapter stringifying inline.
+ *
+ * Two rules are load-bearing:
+ *
+ * - Never throw. This runs inside a provider retry loop; a cycle, a `BigInt`, or a getter that
+ *   throws must not turn a working request into a failed one.
+ * - Return `undefined` rather than a partial string. A truncated `slice` would parse as broken
+ *   JSON and be reported as a corrupt request, and a silently shortened body would fingerprint
+ *   confidently against the wrong prefix. Absent is honest; wrong is not.
+ *
+ * `observeRequest` re-checks the byte budget and downgrades an oversized payload to
+ * `"unavailable"`, so an unbounded body here costs memory, never correctness.
+ */
+export function serializeWirePayload(payload: unknown): string | undefined {
+	try {
+		const text = JSON.stringify(payload);
+		return typeof text === "string" ? text : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export function observeCacheOutcomeSafely(
 	observer: CacheTelemetryObserver | undefined,
 	input: CacheTelemetryOutcomeInput,
@@ -213,7 +247,9 @@ const MAX_NODES = 8192;
 const MAX_PROPERTIES = 256;
 const MAX_LANES = 32;
 const USAGE_FIELDS = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h"] as const;
-const providerAllowlist = new Set(["anthropic", "openai", "openai-codex", "gemini", "opencode", "opencode-go", "zai"]);
+// The generated provider catalog is the source of truth for static providers supported by API
+// adapters. These dynamic providers do not have catalog entries and are named explicitly.
+const providerAllowlist = new Set<string>([...Object.keys(MODELS), "radius", "ollama-cloud"]);
 const modelAllowlist = new Set([
 	"deepseek-v4-flash",
 	"deepseek-v4.1-flash",
@@ -239,14 +275,35 @@ function opaqueId(): string {
 	return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function safeLabels(provider: unknown, model: unknown): { provider: string; model: string } {
-	const safeProvider =
-		typeof provider === "string" && provider.length <= 40 && providerAllowlist.has(provider) ? provider : "custom";
-	const safeModel =
-		safeProvider !== "custom" && typeof model === "string" && model.length <= 80 && modelAllowlist.has(model)
+function stableLabelHash(kind: "provider" | "model", value: string): string {
+	// These identifiers may be user-defined. A domain-separated stable digest keeps a bounded,
+	// process-independent lane key without persisting an arbitrary literal identifier.
+	return `${kind}-sha256:${createHash("sha256").update(`pi-cache-telemetry:${kind}:v1:${value}`).digest("hex")}`;
+}
+
+function safeLabels(
+	provider: unknown,
+	model: unknown,
+): { provider: string; model: string; providerSuppressed: boolean; modelSuppressed: boolean } {
+	const providerValid = typeof provider === "string" && provider.length > 0;
+	const providerAllowed = providerValid && providerAllowlist.has(provider);
+	const safeProvider = providerAllowed
+		? provider
+		: providerValid
+			? stableLabelHash("provider", provider)
+			: "custom";
+	const modelValid = typeof model === "string" && model.length > 0;
+	const safeModel = modelValid
+		? modelAllowlist.has(model)
 			? model
-			: "unknown";
-	return { provider: safeProvider, model: safeModel };
+			: stableLabelHash("model", model)
+		: "unknown";
+	return {
+		provider: safeProvider,
+		model: safeModel,
+		providerSuppressed: !providerAllowed,
+		modelSuppressed: !modelValid || !modelAllowlist.has(model as string),
+	};
 }
 
 function utf8Length(value: string, cap: number): number {
@@ -839,6 +896,9 @@ export function createCacheTelemetrySession(
 						fingerprintStatus,
 						segments,
 						prefixComparable,
+						...((labels.providerSuppressed || labels.modelSuppressed)
+							? { labelsSuppressed: { provider: labels.providerSuppressed, model: labels.modelSuppressed } }
+							: {}),
 						previousCommonPrefixSegments,
 						truncatedSegmentCount,
 						...(comparisonUnavailableCause === undefined ? {} : { comparisonUnavailableCause }),
@@ -851,7 +911,7 @@ export function createCacheTelemetrySession(
 						...(fellBackToFull !== undefined ? { fellBackToFull } : {}),
 						...(deltaEmptyReason !== undefined ? { deltaEmptyReason } : {}),
 						...(fallbackReason !== undefined ? { fallbackReason } : {}),
-						...(operationChanges ? { operationChanges } : {}),
+						...(operationChanges && fingerprintStatus !== "unavailable" ? { operationChanges } : {}),
 						...(postHookInputCardinality ? { postHookInputCardinality } : {}),
 					};
 					const pending = pendingRequestRecords.get(attemptId) ?? [];

@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
@@ -7,9 +8,13 @@ import { zstdDecompressSync } from "node:zlib";
 import type Anthropic from "@anthropic-ai/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
+import { stream as streamAzure } from "../src/api/azure-openai-responses.ts";
 import { closeOpenAICodexWebSocketSessions, stream as streamCodex } from "../src/api/openai-codex-responses.ts";
+import { stream as streamGoogle } from "../src/api/google-generative-ai.ts";
+import { stream as streamVertex } from "../src/api/google-vertex.ts";
 import { stream as streamCompletions } from "../src/api/openai-completions.ts";
 import { stream as streamResponses, streamSimple as streamSimpleResponses } from "../src/api/openai-responses.ts";
+import { stream as streamPiMessages } from "../src/api/pi-messages.ts";
 import {
 	type CacheTelemetryObserver,
 	type CacheTelemetryRawField,
@@ -18,7 +23,7 @@ import {
 	createCacheTelemetrySession,
 	getCacheTelemetryDataProperty,
 } from "../src/cache-telemetry.ts";
-import { getBuiltinModel } from "../src/providers/all.ts";
+import { getBuiltinModel, getBuiltinProviders } from "../src/providers/all.ts";
 import type { Context, Model } from "../src/types.ts";
 
 const captured = vi.hoisted(() => ({
@@ -97,7 +102,7 @@ vi.mock("openai", () => {
 			},
 		};
 	}
-	return { default: FakeOpenAI };
+	return { default: FakeOpenAI, AzureOpenAI: FakeOpenAI };
 });
 
 const privacySentinel = "PRIVATE_PROMPT_SENTINEL_v2";
@@ -138,6 +143,9 @@ const tempDirs: string[] = [];
 const codexRequests: Array<{ url: string; body: unknown; headers: Headers | undefined }> = [];
 const codexWebSocketRequests: Array<Record<string, unknown>> = [];
 const codexFetchUrls: string[] = [];
+// The exact bytes the codex transport posts. `codexRequests` keeps the parsed body, which cannot
+// distinguish "the adapter sent this" from "the adapter sent something that parses to this".
+const codexWireBodies: string[] = [];
 let codexHttpFailuresRemaining = 0;
 let codexWsResponseId: string | null = "resp_ws";
 let codexWsFailBeforeStart = false;
@@ -272,6 +280,13 @@ function stubCodexAuxiliaryFetch(): void {
 				return new Response("static offline codex prompt", { status: 200, headers: { etag: '"offline"' } });
 			}
 			if (url === "https://chatgpt.com/backend-api/codex/responses") {
+				codexWireBodies.push(
+					typeof init?.body === "string"
+						? init.body
+						: input instanceof Request
+							? await input.clone().text()
+							: "",
+				);
 				codexRequests.push({
 					url,
 					body: await capturedBody(input, init),
@@ -703,6 +718,7 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 			fingerprintStatus: "unavailable",
 			comparisonUnavailableCause: "fingerprint_unavailable",
 		});
+		expect(unavailable?.operationChanges).toBeUndefined();
 
 		// The predecessor existed but was never fingerprinted. `previousCommonPrefixSegments: 0`
 		// here means "unknown", not "the prefix broke", and the cause says which one it is.
@@ -1037,8 +1053,12 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 		expect(JSON.stringify(responseRequests[0]?.body)).toContain(finalHookSentinel);
 		expect(responseRequests[0]?.headers?.has("authorization")).toBe(true);
 		const observedWire = requestRecords(telemetry.records).find((record) => record.phase === "final_wire_body");
-		expect(observedWire?.fingerprintStatus).toBe("unavailable");
-		expect(observedWire?.segments).toEqual([]);
+		// This used to assert the opposite: `"unavailable"` with zero segments, because the adapter
+		// observed `params` for metadata but never handed the observer a serialized body. The
+		// blindness was real and this expectation was pinning it, so a provider could be reported as
+		// "no cache telemetry" while the adapter was in fact being called on every request.
+		expect(observedWire?.fingerprintStatus).toBe("ok");
+		expect(observedWire?.segments.length ?? 0).toBeGreaterThan(0);
 	});
 
 	it("keeps OpenAI Responses raw body bytes and headers identical with telemetry off versus on", async () => {
@@ -1633,13 +1653,128 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 		} as never);
 		telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
 		await telemetry.observer.flush();
-		expect(requestRecords(telemetry.records)[0]).toMatchObject({
-			provider: "custom",
-			model: "unknown",
+		const request = requestRecords(telemetry.records)[0];
+		expect(request).toMatchObject({
+			provider: expect.stringMatching(/^provider-sha256:[a-f0-9]{64}$/),
+			model: expect.stringMatching(/^model-sha256:[a-f0-9]{64}$/),
+			labelsSuppressed: { provider: true, model: true },
 			phase: "final_wire_body",
 			transport: "unknown",
 		});
 		assertTelemetryPrivacy(telemetry.records);
+	});
+
+	it("keeps each telemetry API adapter tied to provider IDs in the catalog or explicit dynamic set", () => {
+		const apiDirectory = new URL("../src/api/", import.meta.url);
+		const adapterFiles = readdirSync(apiDirectory)
+			.filter((file) => file.endsWith(".ts") && !file.endsWith(".lazy.ts"))
+			.filter((file) => readFileSync(new URL(file, apiDirectory), "utf8").includes("observeCacheRequestSafely"));
+		expect(adapterFiles.sort()).toEqual([
+			"anthropic-messages.ts",
+			"azure-openai-responses.ts",
+			"google-generative-ai.ts",
+			"google-vertex.ts",
+			"openai-codex-responses.ts",
+			"openai-completions.ts",
+			"openai-responses.ts",
+			"pi-messages.ts",
+		].sort());
+		for (const file of adapterFiles) {
+			const source = readFileSync(new URL(file, apiDirectory), "utf8");
+			expect(source).toMatch(/provider:\s*model\.provider/);
+		}
+	});
+
+	it("derives accepted provider labels from every generated built-in provider and explicit dynamic provider", async () => {
+		for (const provider of [...getBuiltinProviders(), "radius", "ollama-cloud"]) {
+			const telemetry = createTelemetryCollector();
+			const ids = telemetry.observer.observeRequest({
+				provider,
+				model: "gpt-6-luna",
+				phase: "canonical_body",
+				transport: "sse",
+				payload: {},
+				wirePayload: "{}",
+			});
+			telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
+			await telemetry.observer.flush();
+			const request = requestRecords(telemetry.records)[0];
+			expect(request?.provider).toBe(provider);
+			expect(request).not.toHaveProperty("labelsSuppressed");
+		}
+	});
+
+	it("emits label suppression flags on request records and omits them for ordinary labels", async () => {
+		const recordFor = async (provider: string, model: string) => {
+			const telemetry = createTelemetryCollector();
+			const ids = telemetry.observer.observeRequest({
+				provider,
+				model,
+				phase: "canonical_body",
+				transport: "sse",
+				payload: {},
+				wirePayload: "{}",
+			});
+			telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
+			await telemetry.observer.flush();
+			return requestRecords(telemetry.records)[0]!;
+		};
+
+		expect(await recordFor("openai", "gpt-6-luna")).not.toHaveProperty("labelsSuppressed");
+		expect(await recordFor("local-provider", "gpt-6-luna")).toMatchObject({
+			labelsSuppressed: { provider: true, model: false },
+		});
+		expect(await recordFor("openai", "my-private-model")).toMatchObject({
+			labelsSuppressed: { provider: false, model: true },
+		});
+	});
+
+	it("keeps unknown model lanes distinct and hashes them stably across processes", async () => {
+		const telemetry = createTelemetryCollector();
+		const modelLabel = async (model: string) => {
+			const ids = telemetry.observer.observeRequest({
+				provider: "openai",
+				model,
+				phase: "canonical_body",
+				transport: "sse",
+				payload: { input: [{ role: "user", content: "same" }] },
+				wirePayload: JSON.stringify({ input: [{ role: "user", content: "same" }] }),
+			});
+			telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
+			await telemetry.observer.flush();
+			return requestRecords(telemetry.records).at(-1)!;
+		};
+		const first = await modelLabel("private-model-alpha");
+		const different = await modelLabel("private-model-beta");
+		const longModel = await modelLabel("x".repeat(512));
+		const telemetryModuleUrl = new URL("../src/cache-telemetry.ts", import.meta.url).href;
+		const otherProcessScript = `
+			import { createCacheTelemetrySession } from ${JSON.stringify(telemetryModuleUrl)};
+			const records = [];
+			const observer = createCacheTelemetrySession((record) => records.push(record));
+			const ids = observer.observeRequest({
+				provider: "openai", model: "private-model-alpha", phase: "canonical_body",
+				transport: "sse", payload: {}, wirePayload: "{}",
+			});
+			observer.observeOutcome({ ...ids, outcome: "success" });
+			await observer.flush();
+			process.stdout.write(records.find((record) => record.kind === "cache_request").model);
+		`;
+		const otherProcessLabel = execFileSync(
+			process.execPath,
+			["--experimental-strip-types", "--input-type=module", "-e", otherProcessScript],
+			{ encoding: "utf8" },
+		);
+		const second = requestRecords(telemetry.records)[1]!;
+
+		expect(first.model).toMatch(/^model-sha256:[a-f0-9]{64}$/);
+		expect(first.model).not.toBe(different.model);
+		expect(first.model).toBe(otherProcessLabel);
+		expect(longModel.model).toMatch(/^model-sha256:[a-f0-9]{64}$/);
+		expect(longModel.prefixComparable).toBe(true);
+		expect(second.comparisonUnavailableCause).toBe("no_predecessor");
+		expect(first.prefixComparable).toBe(true);
+		expect(second.prefixComparable).toBe(true);
 	});
 
 	it("reserves terminal admission and writes each admitted attempt as one bounded batch", async () => {
@@ -1721,5 +1856,283 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 		release?.();
 		await observer.flush();
 		expect(records.filter((record) => record.kind === "cache_request_outcome")).toHaveLength(0);
+	});
+});
+
+/**
+ * Fidelity of `wirePayload`: the field telemetry uses to fingerprint a request.
+ *
+ * Two claims are checked per adapter, and both are load-bearing:
+ *
+ * 1. The recorded payload is the byte sequence the transport actually received. A serialization
+ *    built from an earlier object (pre-`onPayload`, or without the `stream: true` the SDK adds)
+ *    fingerprints a request that was never sent, so every "unchanged" verdict would describe a
+ *    fiction. This is asserted as string equality against the transport's own bytes, so a
+ *    reordering of keys is a failure too.
+ * 2. Enabling telemetry does not change those bytes. `wirePayload` is an extra property on the
+ *    observer input; if it ever reaches the request body, headers, or query string, a debug
+ *    feature silently becomes a provider-visible change and an unannounced cache miss.
+ */
+describe("cache telemetry wire payload fidelity", () => {
+	const azureModel: Model<"azure-openai-responses"> = {
+		id: "offline-azure",
+		name: "Offline Azure",
+		api: "azure-openai-responses",
+		provider: "azure-openai-responses",
+		baseUrl: "https://offline.openai.azure.com/openai/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000,
+		maxTokens: 100,
+	};
+	const piMessagesModel: Model<"pi-messages"> = {
+		id: "auto",
+		name: "Offline Pi Messages",
+		api: "pi-messages",
+		provider: "radius",
+		baseUrl: "https://offline.invalid/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000,
+		maxTokens: 100,
+	};
+
+
+	async function withAndWithout(
+		run: (observer: CacheTelemetryObserver | undefined) => Promise<string>,
+	): Promise<{ off: string; on: string; records: CacheTelemetryRecord[] }> {
+		const off = await run(undefined);
+		const telemetry = createTelemetryCollector();
+		const on = await run(telemetry.observer);
+		await telemetry.observer.flush();
+		expect(on).toBe(off);
+		expect(on).not.toContain("wirePayload");
+		// The record deliberately does not retain the payload -- it is the whole prompt. What it
+		// retains is the verdict the payload produced: `"unavailable"` means the observer never
+		// received a parseable body, which is exactly the state this suite exists to end. `"ok"`
+		// with non-empty segments is only reachable if the adapter handed over a body, so it is the
+		// observable half of "the recorded payload is the one that was sent".
+		const wireRecord = requestRecords(telemetry.records)
+			.filter((record) => record.phase === "final_wire_body")
+			.at(-1);
+		expect(wireRecord?.fingerprintStatus).toBe("ok");
+		expect(wireRecord?.segments.length ?? 0).toBeGreaterThan(0);
+		return { off, on, records: telemetry.records };
+	}
+
+	it("openai-completions records the params object the SDK serializes", async () => {
+		await withAndWithout(async (observer) => {
+			captured.completionParams.length = 0;
+			await consume(
+				streamCompletions(completionsModel, context, {
+					apiKey: "offline-key",
+					...(observer ? { cacheTelemetry: observer } : {}),
+				}),
+			);
+			return JSON.stringify(captured.completionParams.at(-1));
+		});
+	});
+
+	it("anthropic-messages records the body handed to the client, stream flag included", async () => {
+		const { on } = await withAndWithout(async (observer) => {
+			anthropicRequests.length = 0;
+			await consume(
+				streamAnthropic(getBuiltinModel("anthropic", "claude-sonnet-4-5"), context, {
+					apiKey: "offline-key",
+					client: createFakeAnthropicClient(),
+					...(observer ? { cacheTelemetry: observer } : {}),
+				}),
+			);
+			return JSON.stringify(anthropicRequests.at(-1));
+		});
+		// The adapter used to hand the SDK `{ ...params, stream: true }` while observing `params`,
+		// so the fingerprint omitted the one field that changes the request's shape.
+		expect(JSON.parse(on)).toMatchObject({ stream: true });
+	});
+
+	it("openai-responses records the bytes the SDK posts", async () => {
+		const wireBodies: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+				wireBodies.push(
+					typeof init?.body === "string" ? init.body : input instanceof Request ? await input.clone().text() : "",
+				);
+				return sseResponse(
+					`data: ${JSON.stringify({
+						type: "response.completed",
+						response: { id: "resp_wire", status: "completed", output: [] },
+					})}\n\n`,
+				);
+			}),
+		);
+		await withAndWithout(async (observer) => {
+			wireBodies.length = 0;
+			await consume(
+				streamResponses(getBuiltinModel("openai", "gpt-5.4"), context, {
+					apiKey: "offline-key",
+					...(observer ? { cacheTelemetry: observer } : {}),
+				}),
+			);
+			return wireBodies.at(-1) ?? "";
+		});
+	});
+
+	it("azure-openai-responses records the bytes the SDK posts", async () => {
+		const wireBodies: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+				wireBodies.push(
+					typeof init?.body === "string" ? init.body : input instanceof Request ? await input.clone().text() : "",
+				);
+				return sseResponse(
+					`data: ${JSON.stringify({
+						type: "response.completed",
+						response: { id: "resp_azure", status: "completed", output: [] },
+					})}\n\n`,
+				);
+			}),
+		);
+		await withAndWithout(async (observer) => {
+			wireBodies.length = 0;
+			await consume(
+				streamAzure(azureModel, context, {
+					apiKey: "offline-key",
+					azureBaseUrl: azureModel.baseUrl,
+					...(observer ? { cacheTelemetry: observer } : {}),
+				}),
+			);
+			return wireBodies.at(-1) ?? "";
+		});
+	});
+
+	it("openai-codex-responses records the bytes the transport posts", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-cache-telemetry-wire-codex-"));
+		tempDirs.push(tempDir);
+		process.env.PI_CODING_AGENT_DIR = tempDir;
+		stubCodexAuxiliaryFetch();
+		await withAndWithout(async (observer) => {
+			codexWireBodies.length = 0;
+			await consume(
+				streamCodex(codexModel, context, {
+					apiKey: mockToken(),
+					sessionId: "offline-wire-session",
+					headers: { session_id: "offline-wire-session" },
+					transport: "sse",
+					...(observer ? { cacheTelemetry: observer } : {}),
+				}),
+			);
+			return codexWireBodies.at(-1) ?? "";
+		});
+	});
+
+	it("pi-messages records the body it posts", async () => {
+		const wireBodies: string[] = [];
+		const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+			wireBodies.push(typeof init?.body === "string" ? init.body : "");
+			return sseResponse(`data: ${JSON.stringify({ type: "done", reason: "stop" })}\n\n`);
+		}) as unknown as typeof globalThis.fetch;
+		await withAndWithout(async (observer) => {
+			wireBodies.length = 0;
+			await consume(
+				streamPiMessages(piMessagesModel, context, {
+					apiKey: "offline-key",
+					fetch: fetchImpl,
+					...(observer ? { cacheTelemetry: observer } : {}),
+				}),
+			);
+			return wireBodies.at(-1) ?? "";
+		});
+	});
+});
+
+// The Google adapters build the request object and hand it to `@google/genai`, which serializes it
+// itself (the model id moves into the URL path, `contents` is rewritten). There is therefore no
+// HTTP body to observe from the adapter's side, and the seam these two tests use is the SDK call
+// itself: they are proving the adapter hands the observer the same object the SDK receives and
+// that observing does not mutate it, not that the object is the provider's exact wire bytes.
+vi.mock("@google/genai", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("@google/genai")>();
+	const googleParams: unknown[] = [];
+	(globalThis as { __googleParams?: unknown[] }).__googleParams = googleParams;
+	class FakeGoogleGenAI {
+		constructor(_options: unknown) {}
+		models = {
+			generateContentStream: async (params: unknown) => {
+				googleParams.push(params);
+				return {
+					async *[Symbol.asyncIterator]() {
+						yield {
+							candidates: [{ content: { parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+							usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2 },
+						};
+					},
+				};
+			},
+		};
+	}
+	return { ...actual, GoogleGenAI: FakeGoogleGenAI };
+});
+
+describe("cache telemetry wire payload fidelity for SDK-serialized adapters", () => {
+	const googleParams = (): unknown[] => (globalThis as { __googleParams?: unknown[] }).__googleParams ?? [];
+	const googleModel = (api: "google-generative-ai" | "google-vertex"): Model<"google-generative-ai"> => ({
+		id: "offline-gemini",
+		name: "Offline Gemini",
+		api,
+		provider: api === "google-vertex" ? "google-vertex" : "google",
+		baseUrl: "https://offline.invalid",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1000,
+		maxTokens: 100,
+	}) as Model<"google-generative-ai">;
+
+	async function toggle(
+		run: (observer: CacheTelemetryObserver | undefined) => Promise<string>,
+	): Promise<{ on: string; records: CacheTelemetryRecord[] }> {
+		const off = await run(undefined);
+		const telemetry = createTelemetryCollector();
+		const on = await run(telemetry.observer);
+		await telemetry.observer.flush();
+		expect(on).toBe(off);
+		const wireRecord = requestRecords(telemetry.records)
+			.filter((record) => record.phase === "final_wire_body")
+			.at(-1);
+		expect(wireRecord?.fingerprintStatus).toBe("ok");
+		expect(wireRecord?.segments.length ?? 0).toBeGreaterThan(0);
+		return { on, records: telemetry.records };
+	}
+
+	it("google-generative-ai observes the params object and hands the SDK the same one", async () => {
+		const { on } = await toggle(async (observer) => {
+			googleParams().length = 0;
+			await consume(
+				streamGoogle(googleModel("google-generative-ai"), context, {
+					apiKey: "offline-key",
+					...(observer ? { cacheTelemetry: observer } : {}),
+				}),
+			);
+			return JSON.stringify(googleParams().at(-1));
+		});
+		expect(on).not.toContain("wirePayload");
+	});
+
+	it("google-vertex observes the params object and hands the SDK the same one", async () => {
+		const { on } = await toggle(async (observer) => {
+			googleParams().length = 0;
+			await consume(
+				streamVertex(googleModel("google-vertex"), context, {
+					apiKey: "offline-key",
+					...(observer ? { cacheTelemetry: observer } : {}),
+				}),
+			);
+			return JSON.stringify(googleParams().at(-1));
+		});
+		expect(on).not.toContain("wirePayload");
 	});
 });

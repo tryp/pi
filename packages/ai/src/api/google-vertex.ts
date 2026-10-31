@@ -24,6 +24,11 @@ import type {
 	ToolCall,
 } from "../types.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import {
+	observeCacheOutcomeSafely,
+	observeCacheRequestSafely,
+	serializeWirePayload,
+} from "../cache-telemetry.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
@@ -76,6 +81,8 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
+		// Declared outside the try so the failure path can report a terminal outcome.
+		let telemetryIds: { requestId: string; attemptId: string } | undefined;
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
@@ -108,6 +115,15 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 			if (nextParams !== undefined) {
 				params = nextParams as GenerateContentParameters;
 			}
+			telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+				provider: model.provider,
+				model: model.id,
+				phase: "final_wire_body",
+				transport: "sse",
+				payloadMode: "full",
+				payload: params,
+				wirePayload: serializeWirePayload(params),
+			});
 			const googleStream = await retryGoogleRequest(() => client.models.generateContentStream(params), options);
 
 			stream.push({ type: "start", partial: output });
@@ -292,6 +308,12 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 				throw new Error(errorMessage);
 			}
 
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: "success",
+					normalizedUsage: output.usage,
+				});
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
@@ -302,6 +324,11 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			if (telemetryIds)
+				observeCacheOutcomeSafely(options?.cacheTelemetry, {
+					...telemetryIds,
+					outcome: output.stopReason === "aborted" ? "aborted" : "failed",
+				});
 			output.errorMessage = formatProviderError(normalizeProviderError(error));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
