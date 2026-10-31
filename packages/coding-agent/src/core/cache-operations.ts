@@ -163,11 +163,14 @@ function boundedFingerprint(
 			if (!Number.isFinite(item.getTime())) return fail("unusable_message");
 			return digest(key, item.toISOString());
 		}
-		// Images may carry binary data as Buffer/Uint8Array. Hash bytes, never serialize them.
+		// Images may carry binary data as Buffer/Uint8Array. Hash bytes, never serialize them, and
+		// tag the digest: `JSON.stringify` sends a Uint8Array as `{"0":97,...}` and a string as
+		// `"abc"`, so hashing the raw bytes without a tag would report those two different payloads
+		// as the same cacheable content and hide a real change.
 		if (item instanceof Uint8Array) {
 			state.textBytes += item.byteLength;
 			if (state.textBytes > state.textCap) return fail("over_budget");
-			return createHmac("sha256", key).update(item).digest("hex");
+			return digest(key, `u8:${createHmac("sha256", key).update(item).digest("hex")}`);
 		}
 		ancestors.add(item);
 		try {
@@ -685,7 +688,9 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 					...(afterPrompt === undefined ? {} : { systemPrompt: afterPrompt }),
 					...(afterTools === undefined ? {} : { tools: afterTools }),
 					messageCount: afterMessages.cause === undefined ? afterMessages.count : null,
-					toolCount: afterTools === undefined ? (after.tools === undefined ? null : after.tools.length) : (after.tools?.length ?? 0),
+					// A count beside an unusable fingerprint would be read as a comparable baseline:
+					// null it for the same reason `messageCount` and `systemPromptLength` are nulled.
+					toolCount: afterTools === undefined ? null : (after.tools?.length ?? 0),
 					systemPromptLength: afterPrompt === undefined ? null : after.systemPrompt.length,
 				};
 			}
@@ -695,7 +700,14 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 			// record, which is why the two can appear together without contradicting each
 			// other. Retaining one surface per request is what keeps the other surfaces
 			// comparable when a single one is unusable.
-			const comparisonBasis: CacheOperationComparisonBasis = prior !== undefined ? "prior_available" : "first_request";
+			// A predecessor that kept no usable surface is not an available baseline: every
+			// surface would report `prior_surface_unavailable`, so a basis of `prior_available`
+			// would claim a comparison that nothing can make.
+			const priorHasUsableSurface =
+				prior !== undefined &&
+				(prior.messages !== undefined || prior.systemPrompt !== undefined || prior.tools !== undefined);
+			const comparisonBasis: CacheOperationComparisonBasis =
+				prior === undefined ? "first_request" : priorHasUsableSurface ? "prior_available" : "prior_unavailable";
 			const withinMessages = classifyMessages(beforeMessages, afterMessages);
 			const acrossMessages: MessageClassification =
 				prior === undefined

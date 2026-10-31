@@ -519,6 +519,68 @@ it("keeps the prompt and tool baselines when only the message list is unusable",
 	}
 });
 
+it("reports prior_unavailable when the previous request kept no usable surface", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-cache-operations-prior-unavailable-"));
+	const writer = await createLocalCacheTelemetryWriter(root);
+	try {
+		const saved: Array<Record<string, unknown>> = [];
+		const instrumentation = createCacheOperationInstrumentation((observation) => {
+			writer.appendOperation(
+				createCacheOperationRecord(observation, instrumentation.epoch, 1, "a".repeat(32), "b".repeat(32)),
+			);
+		});
+		const context = (list: unknown, prompt: unknown, tools: unknown[]) => ({
+			messages: list as AgentMessage[],
+			systemPrompt: prompt as string,
+			tools,
+		});
+		// Request 1: nothing is digestible. The message list is cyclic, the prompt exceeds the text
+		// budget, and there are more tool descriptors than the projection accepts.
+		const cyclic: Record<string, unknown> = { role: "user", content: "loop" };
+		cyclic.self = cyclic;
+		const tooManyTools = Array.from({ length: 257 }, () => ({ name: "bash" }));
+		instrumentation.observeFinal(
+			context([cyclic], "x".repeat(200 * 1024), tooManyTools),
+			context([cyclic], "x".repeat(200 * 1024), tooManyTools),
+			1,
+			"stream_input",
+		);
+		// Request 2: everything is digestible, but there is no prior baseline to compare with, so a
+		// `prior_available` basis would claim a comparison that no surface can make.
+		instrumentation.observeFinal(
+			context(messages("only now readable"), "prompt", []),
+			context(messages("only now readable"), "prompt", []),
+			1,
+			"stream_input",
+		);
+		await writer.flush();
+		const directory = join(root, "cache-telemetry");
+		for (const name of readdirSync(directory)) {
+			for (const line of readFileSync(join(directory, name), "utf8").split("\n")) {
+				if (line.trim()) saved.push(JSON.parse(line).data);
+			}
+		}
+		const acrossRequests = saved.filter((record) => record.comparisonScope === "across_requests");
+		// The second request emits three across_requests surfaces: one per surface, all comparing
+		// against a predecessor that kept nothing usable.
+		const secondRequest = acrossRequests.slice(-3);
+		expect(secondRequest.map((record) => record.surface).sort()).toEqual(["messages", "system_prompt", "tools"]);
+		expect(secondRequest.map((record) => record.comparisonBasis)).toEqual([
+			"prior_unavailable",
+			"prior_unavailable",
+			"prior_unavailable",
+		]);
+		expect(secondRequest.map((record) => record.unavailableCause)).toEqual([
+			"prior_surface_unavailable",
+			"prior_surface_unavailable",
+			"prior_surface_unavailable",
+		]);
+	} finally {
+		await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 it("persists only bounded private operation metadata in the dedicated telemetry sink", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-cache-operations-"));
 	const writer = await createLocalCacheTelemetryWriter(root);
