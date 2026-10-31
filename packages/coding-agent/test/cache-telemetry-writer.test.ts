@@ -536,6 +536,44 @@ describe("cache miss attribution", () => {
 		identical.previousCommonPrefixSegments = 2;
 		identical.previousSegmentCount = 2;
 		expect(classifyCacheMissComparison(identical)).toEqual({ kind: "prefix_identical_provider_side" });
+		// A request that appends messages still has an identical prefix; requiring the common prefix to
+		// cover the whole current request made this branch unreachable for every ordinary request.
+		const grown = mutableRequestRecord();
+		grown.segments = [
+			{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "b".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "c".repeat(64) },
+		];
+		grown.prefixComparable = true;
+		grown.previousCommonPrefixSegments = 2;
+		grown.previousSegmentCount = 2;
+		grown.truncatedSegmentCount = 0;
+		expect(classifyCacheMissComparison(grown)).toEqual({ kind: "prefix_identical_provider_side" });
+		// A truncated window compared only the head, so an identical head cannot rule out a change
+		// further in: report the truncation instead of blaming the provider.
+		const truncated = mutableRequestRecord();
+		truncated.segments = [
+			{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "b".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "c".repeat(64) },
+		];
+		truncated.prefixComparable = true;
+		truncated.comparisonBasis = "bounded_truncated";
+		truncated.previousCommonPrefixSegments = 2;
+		truncated.previousSegmentCount = 2;
+		truncated.truncatedSegmentCount = 37;
+		expect(classifyCacheMissComparison(truncated)).toEqual({ kind: "comparison_truncated" });
+		// A request that kept fewer segments than its predecessor has a changed prefix somewhere the
+		// comparison stopped before reaching, so nothing may be claimed.
+		const shrunk = mutableRequestRecord();
+		shrunk.segments = [
+			{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
+			{ name: "message", byteLength: 10, hmacSha256: "b".repeat(64) },
+		];
+		shrunk.prefixComparable = true;
+		shrunk.previousCommonPrefixSegments = 2;
+		shrunk.previousSegmentCount = 3;
+		expect(classifyCacheMissComparison(shrunk)).toEqual({ kind: "unknown" });
 		expect(classifyCacheMissComparison(requestRecord())).toEqual({ kind: "unknown" });
 		const noPredecessor = mutableRequestRecord();
 		noPredecessor.prefixComparable = true;

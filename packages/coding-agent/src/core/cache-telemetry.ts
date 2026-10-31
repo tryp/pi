@@ -10,6 +10,7 @@ export type CacheMissAttribution =
 	| { kind: "tools_changed"; changedTools: number }
 	| { kind: "messages_rewritten"; reasons: readonly string[] }
 	| { kind: "prefix_identical_provider_side" }
+	| { kind: "comparison_truncated" }
 	| { kind: "unknown" };
 
 interface CacheMissComparison {
@@ -119,14 +120,22 @@ export function classifyCacheMissComparison(
 	if (rewriteReasons.length || (changedSegment?.name === "message" && inputWasRewritten)) {
 		return { kind: "messages_rewritten", reasons: rewriteReasons };
 	}
-	if (
-		request.comparisonBasis === "complete" &&
-		request.truncatedSegmentCount === 0 &&
-		request.previousSegmentCount !== undefined &&
-		request.previousSegmentCount === segments.length &&
-		common === segments.length
-	)
-		return { kind: "prefix_identical_provider_side" };
+	// Every request that appends a message grows its segment list, so requiring the common
+	// prefix to cover the *current* request made this branch unreachable for anything but a
+	// re-sent identical request. What explains a miss with an unchanged prefix is the prefix
+	// being unchanged: everything the predecessor sent was still identical at the front, and
+	// the extra segments are new content appended after it.
+	const previousSegmentCount = request.previousSegmentCount;
+	const prefixIdentical =
+		typeof previousSegmentCount === "number" && previousSegmentCount > 0 && common >= previousSegmentCount;
+	if (prefixIdentical) {
+		// `complete` means both sides were compared in full. A truncated window compares only the
+		// head, so an identical head does not rule out a change further in: say that instead of
+		// claiming the provider evicted the prefix.
+		if (request.comparisonBasis === "complete" && request.truncatedSegmentCount === 0)
+			return { kind: "prefix_identical_provider_side" };
+		return { kind: "comparison_truncated" };
+	}
 	return { kind: "unknown" };
 }
 

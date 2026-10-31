@@ -281,6 +281,10 @@ describe("detectCacheMiss", () => {
 				{ kind: "prefix_identical_provider_side" as const },
 				"Cache miss (prefix identical: provider eviction or routing)",
 			],
+			[
+				{ kind: "comparison_truncated" as const },
+				"Cache miss (prefix identical in the compared window; remainder truncated)",
+			],
 		] as const;
 		for (const [attribution, label] of labels) {
 			const miss = detectCacheMiss([entry(turn1), entry(turn2)], assistant(base), models, attribution);
