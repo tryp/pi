@@ -159,7 +159,11 @@ describe("buildSystemPrompt", () => {
 		test("protects the most-local file and truncates lower-priority ones", () => {
 			const prompt = buildSystemPrompt({
 				contextFiles: [
-					{ path: "/global.md", content: "g".repeat(400) },
+					// Multi-line on purpose: a file whose only line cannot fit is
+					// reported as dropped, which the dedicated test below covers. This
+					// one has to leave whole lines inside the remaining budget, or it
+					// stops exercising the truncation branch at all.
+					{ path: "/global.md", content: bigFile(20) },
 					{ path: "/project.md", content: "p".repeat(400) },
 				],
 				skills: [],
@@ -170,8 +174,9 @@ describe("buildSystemPrompt", () => {
 
 			// Most-local file (last in load order) is kept whole.
 			expect(prompt).toContain('<project_instructions path="/project.md">');
-			// Lower-priority file is truncated and reported.
-			expect(prompt).toContain("truncated /global.md");
+			// Lower-priority file is truncated and reported, with a way back in.
+			expect(prompt).toMatch(/truncated \/global\.md \(head [1-9]\d* of 20 lines/);
+			expect(prompt).toContain("read /global.md offset=");
 			expect(prompt).toContain("[context files truncated:");
 		});
 
