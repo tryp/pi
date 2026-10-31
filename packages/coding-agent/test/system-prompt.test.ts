@@ -152,6 +152,7 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt).toContain("truncated /big.md");
+			expect(prompt).toMatch(/truncated \/big\.md \(head \d+ of 200 lines, \d+ of \d+ KiB; read \/big\.md offset=\d+\)/);
 			expect(prompt).toContain("[context files truncated:");
 		});
 
@@ -191,10 +192,10 @@ describe("buildSystemPrompt", () => {
 			expect(prompt).toContain('<project_instructions path="/project.md">');
 			expect(prompt).toContain('<project_instructions path="/mid.md">');
 			expect(prompt).not.toContain('<project_instructions path="/global.md">');
-			expect(prompt).toContain("dropped /global.md");
+			expect(prompt).toContain("dropped /global.md (read /global.md)");
 		});
 
-		test("respects the line budget", () => {
+		test("respects the line budget and gives the continuation offset", () => {
 			const prompt = buildSystemPrompt({
 				contextFiles: [{ path: "/many.md", content: bigFile(500) }],
 				skills: [],
@@ -204,7 +205,21 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt).toContain("truncated /many.md");
-			expect(prompt).toContain("50 of 500 lines");
+			expect(prompt).toContain("head 50 of 500 lines");
+			expect(prompt).toContain("read /many.md offset=51");
+		});
+
+		test("reports a file as dropped when no whole line fits and keeps its path actionable", () => {
+			const prompt = buildSystemPrompt({
+				contextFiles: [{ path: "/large-line.md", content: "x".repeat(100) }],
+				skills: [],
+				cwd: process.cwd(),
+				contextFilesMaxBytes: 10,
+				contextFilesMaxLines: 10,
+			});
+
+			expect(prompt).not.toContain('<project_instructions path="/large-line.md">');
+			expect(prompt).toContain("dropped /large-line.md (read /large-line.md)");
 		});
 	});
 });

@@ -336,15 +336,11 @@ function _countOccurrences(content: string, oldText: string): number {
 }
 
 function getNotFoundError(path: string, editIndex: number, totalEdits: number, closestLineHint?: string): Error {
-	const hint = closestLineHint ? `\n${closestLineHint}` : "";
-	if (totalEdits === 1) {
-		return new Error(
-			`Could not find the exact text in ${path}. Include the surrounding newline and preserve the target block's indentation. Unique tab/space indentation differences are normalized automatically.${hint}`,
-		);
-	}
-	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. Include the surrounding newline and preserve the target block's indentation. Unique tab/space indentation differences are normalized automatically.${hint}`,
-	);
+	const notFound =
+		totalEdits === 1 ? `Could not find the exact text in ${path}.` : `Could not find edits[${editIndex}] in ${path}.`;
+	const matchGuidance =
+		"Match the surrounding newline and target indentation; unique tab/space indentation differences are normalized automatically.";
+	return new Error([closestLineHint, notFound, matchGuidance].filter(Boolean).join("\n"));
 }
 
 /**

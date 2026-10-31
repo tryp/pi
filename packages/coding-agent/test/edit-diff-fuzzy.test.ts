@@ -220,6 +220,29 @@ describe("applyEditsToNormalizedContent not-found closest-line hint", () => {
 		expect(err).toMatch(
 			/Closest matching file line \(line 1\): "def process\(items\):" — the file content may differ from oldText; re-read the file if unsure\./u,
 		);
+		expect(err.indexOf("Closest matching file line")).toBeLessThan(err.indexOf("Could not find the exact text"));
+		expect(err).toContain("Match the surrounding newline and target indentation");
+	});
+
+	it("puts the closest-line pointer before a missing multi-edit index", () => {
+		const err = (() => {
+			try {
+				applyEditsToNormalizedContent(
+					"def process(items):\n    result = process_items(items)\n    return result\n",
+					[
+						{ oldText: "result = process_items(items)", newText: "result = process_all(items)" },
+						{ oldText: "def process(items):\n    return None\n", newText: "def process(items):\n    return []\n" },
+					],
+					"svc.py",
+				);
+			} catch (error) {
+				return (error as Error).message;
+			}
+			return "";
+		})();
+
+		expect(err.indexOf("Closest matching file line")).toBeLessThan(err.indexOf("Could not find edits[1]"));
+		expect(err).toContain("Match the surrounding newline and target indentation");
 	});
 
 	it("omits the hint when no line is similar", () => {
@@ -237,6 +260,7 @@ describe("applyEditsToNormalizedContent not-found closest-line hint", () => {
 		})();
 		expect(err).toMatch(/Could not find the exact text in f\.txt\./u);
 		expect(err).not.toMatch(/Closest matching file line/u);
+		expect(err).toContain("Match the surrounding newline and target indentation");
 	});
 
 	it("skips the hint for tiny oldText without significant tokens", () => {

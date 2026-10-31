@@ -63,7 +63,7 @@ export function applyContextFileBudget(
 	for (let i = sized.length - 1; i >= 0; i--) {
 		const file = sized[i]!;
 		if (remainingBytes <= 0 || remainingLines <= 0) {
-			notices.push(`dropped ${file.path}`);
+			notices.push(`dropped ${file.path} (read ${file.path})`);
 			continue;
 		}
 		const bytesBudget = Math.min(remainingBytes, file.byteLength);
@@ -84,9 +84,13 @@ export function applyContextFileBudget(
 				remainingBytes -= keptBytes;
 				remainingLines -= kept.length;
 			}
-			notices.push(
-				`truncated ${file.path} (${kept.length} of ${file.lineCount} lines, ${Math.round(keptBytes / 1024)} of ${Math.round(file.byteLength / 1024)} KiB)`,
-			);
+			if (kept.length > 0) {
+				notices.push(
+					`truncated ${file.path} (head ${kept.length} of ${file.lineCount} lines, ${Math.round(keptBytes / 1024)} of ${Math.round(file.byteLength / 1024)} KiB; read ${file.path} offset=${kept.length + 1})`,
+				);
+			} else {
+				notices.push(`dropped ${file.path} (read ${file.path})`);
+			}
 		} else {
 			budgeted[i] = file;
 			remainingBytes -= file.byteLength;

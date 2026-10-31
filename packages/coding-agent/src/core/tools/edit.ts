@@ -36,7 +36,7 @@ const replaceEditSchema = Type.Object(
 	{
 		oldText: Type.String({
 			description:
-				"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.",
+				"Exact text for one targeted replacement. It must be unique in the original file and must not overlap other edits[].oldText in this call. Match the surrounding newline and target indentation; unique tab/space indentation differences are normalized.",
 		}),
 		newText: Type.Optional(
 			Type.String({ description: "Replacement text for this targeted edit. Omit to delete oldText." }),
@@ -377,7 +377,7 @@ export function createEditToolDefinition(
 		name: "edit",
 		label: "edit",
 		description:
-			"Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+			"Edit one file using exact, unique, non-overlapping text replacements. Match the surrounding newline and target indentation; unique tab/space indentation differences are normalized. Merge nearby edits; avoid large unchanged regions.",
 		promptSnippet: editToolSystemPromptContribution.snippet,
 		promptGuidelines: [...editToolSystemPromptContribution.guidelines],
 		parameters: editSchema,
