@@ -16,6 +16,61 @@ function messages(...texts: string[]): AgentMessage[] {
 	return texts.map((text) => ({ role: "user", content: [{ type: "text", text }] }) as AgentMessage);
 }
 
+it("reports the failing message index, runtime type, constructor, path, and cause counts", () => {
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const baseline = messages("baseline");
+	const observeBad = (bad: unknown[]) =>
+		instrumentation.observeHandler(baseline, bad as unknown as AgentMessage[], records.length, 1);
+
+	observeBad([baseline[0], undefined]);
+	observeBad([baseline[0], () => undefined]);
+	const accessor = { role: "user" };
+	Object.defineProperty(accessor, "content", { enumerable: true, get: () => "hidden" });
+	observeBad([accessor]);
+	observeBad([{ role: "user", content: [1n] }]);
+
+	expect(
+		records.map(({ failureIndex, failureType, failureConstructor, failurePath, unavailableCause }) => ({
+			failureIndex,
+			failureType,
+			failureConstructor,
+			failurePath,
+			unavailableCause,
+		})),
+	).toEqual([
+		{
+			failureIndex: 1,
+			failureType: "undefined",
+			failureConstructor: null,
+			failurePath: "$",
+			unavailableCause: "unusable_message",
+		},
+		{
+			failureIndex: 1,
+			failureType: "function",
+			failureConstructor: null,
+			failurePath: "$",
+			unavailableCause: "unusable_message",
+		},
+		{
+			failureIndex: 0,
+			failureType: "object",
+			failureConstructor: "Object",
+			failurePath: '$["content"]',
+			unavailableCause: "accessor_property",
+		},
+		{
+			failureIndex: 0,
+			failureType: "object",
+			failureConstructor: "Object",
+			failurePath: '$["content"][0]',
+			unavailableCause: "unusable_message",
+		},
+	]);
+	expect(instrumentation.getFailureCounts()).toEqual({ unusable_message: 3, accessor_property: 1 });
+});
+
 it("classifies no-op, in-place edits, history rewrites, suffix growth, shrink, and failures", () => {
 	const records: Array<{ reason: string; beforeCount: number | null; afterCount: number | null }> = [];
 	const observer = createCacheOperationInstrumentation((record) => records.push(record));
@@ -197,6 +252,33 @@ it("keeps snapshots over the whole-snapshot text budget incomplete", () => {
 		snapshotTextBytes: expect.any(Number),
 	});
 	expect(JSON.stringify(record)).not.toContain("x".repeat(32));
+});
+
+it("persists failure diagnostics through schema v2 telemetry validation", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-cache-operations-diagnostic-"));
+	const writer = await createLocalCacheTelemetryWriter(root);
+	try {
+		const instrumentation = createCacheOperationInstrumentation((observation) => {
+			writer.appendOperation(
+				createCacheOperationRecord(observation, instrumentation.epoch, 1, "a".repeat(32), "b".repeat(32)),
+			);
+		});
+		instrumentation.observeHandler(messages("baseline"), [undefined] as unknown as AgentMessage[], 0, 1);
+		await writer.flush();
+		const directory = join(root, "cache-telemetry");
+		const saved = JSON.parse(readFileSync(join(directory, readdirSync(directory)[0]!), "utf8")).data;
+		expect(saved).toMatchObject({
+			schemaVersion: 2,
+			unavailableCause: "unusable_message",
+			failureIndex: 0,
+			failureType: "undefined",
+			failureConstructor: null,
+			failurePath: "$",
+		});
+	} finally {
+		await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 it("persists over-budget reason and size counters through telemetry validation", async () => {

@@ -73,6 +73,10 @@ export interface CacheOperationRecord {
 	stopReasonCounts?: Record<string, number> | null;
 	unavailableCause?: CacheOperationUnavailableCause;
 	observedCount?: number;
+	failureIndex?: number;
+	failureType?: string;
+	failureConstructor?: string | null;
+	failurePath?: string;
 	snapshotNodes?: number;
 	snapshotTextBytes?: number;
 	comparisonBasis?: CacheOperationComparisonBasis;
@@ -94,6 +98,10 @@ export interface CacheOperationObservation {
 	stopReasonCounts?: Record<string, number> | null;
 	unavailableCause?: CacheOperationUnavailableCause;
 	observedCount?: number;
+	failureIndex?: number;
+	failureType?: string;
+	failureConstructor?: string | null;
+	failurePath?: string;
 	snapshotNodes?: number;
 	snapshotTextBytes?: number;
 	comparisonBasis?: CacheOperationComparisonBasis;
@@ -124,6 +132,7 @@ interface FingerprintBudget {
 	nodeCap: number;
 	textCap: number;
 	failureCause?: CacheOperationUnavailableCause;
+	failurePath?: string;
 }
 
 function newBudget(nodeCap = MAX_MESSAGE_NODES, textCap = MAX_MESSAGE_TEXT_BYTES): FingerprintBudget {
@@ -141,11 +150,14 @@ function boundedFingerprint(
 ): string | undefined {
 	const state = budget;
 	const ancestors = new WeakSet<object>();
-	const fail = (cause: CacheOperationUnavailableCause): undefined => {
+	let activePath = "$";
+	const fail = (cause: CacheOperationUnavailableCause, path = activePath): undefined => {
 		state.failureCause = cause;
+		state.failurePath = path.slice(0, 512);
 		return undefined;
 	};
-	const visit = (item: unknown, depth: number): string | undefined => {
+	const visit = (item: unknown, depth: number, path = "$"): string | undefined => {
+		activePath = path;
 		if (++state.nodes > state.nodeCap || depth > MAX_DEPTH) return fail("over_budget");
 		if (item === null || typeof item === "boolean" || typeof item === "number") return String(item);
 		if (typeof item === "string") {
@@ -183,12 +195,13 @@ function boundedFingerprint(
 				const parts: string[] = [];
 				for (let index = 0; index < item.length; index++) {
 					const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
-					if (!descriptor || !("value" in descriptor)) return fail("accessor_property");
+					if (!descriptor || !("value" in descriptor)) return fail("accessor_property", `${path}[${index}]`);
 					const value = descriptor.value;
 					// JSON.stringify renders undefined, functions, and symbols in arrays as null.
 					const part = visit(
 						value === undefined || typeof value === "function" || typeof value === "symbol" ? null : value,
 						depth + 1,
+						`${path}[${index}]`,
 					);
 					if (part === undefined) return undefined;
 					parts.push(part);
@@ -202,7 +215,8 @@ function boundedFingerprint(
 			const parts: string[] = [];
 			for (const name of names.sort()) {
 				const descriptor = Object.getOwnPropertyDescriptor(item, name);
-				if (!descriptor || !("value" in descriptor)) return fail("accessor_property");
+				if (!descriptor || !("value" in descriptor))
+					return fail("accessor_property", `${path}[${JSON.stringify(name)}]`);
 				// JSON.stringify omits these object properties; they must not affect the fingerprint.
 				if (
 					descriptor.value === undefined ||
@@ -211,7 +225,7 @@ function boundedFingerprint(
 				) {
 					continue;
 				}
-				const child = visit(descriptor.value, depth + 1);
+				const child = visit(descriptor.value, depth + 1, `${path}[${JSON.stringify(name)}]`);
 				if (child === undefined) return undefined;
 				parts.push(`${digest(key, name)}=${child}`);
 			}
@@ -223,7 +237,7 @@ function boundedFingerprint(
 	try {
 		return visit(value, 0);
 	} catch {
-		return fail("unusable_message");
+		return fail("unusable_message", activePath);
 	}
 }
 
@@ -256,14 +270,35 @@ interface MessageSnapshot {
 	nodes: number;
 	textBytes: number;
 	cause?: CacheOperationUnavailableCause;
+	failureIndex?: number;
+	failureType?: string;
+	failureConstructor?: string | null;
+	failurePath?: string;
 }
 
 interface MessageClassification {
 	reason: CacheOperationReason;
 	cause?: CacheOperationUnavailableCause;
 	observedCount?: number;
+	failureIndex?: number;
+	failureType?: string;
+	failureConstructor?: string | null;
+	failurePath?: string;
 	snapshotNodes?: number;
 	snapshotTextBytes?: number;
+}
+
+function failureConstructor(item: unknown): string | null {
+	if (typeof item !== "object" || item === null) return null;
+	try {
+		const prototype = Object.getPrototypeOf(item);
+		const descriptor = prototype && Object.getOwnPropertyDescriptor(prototype, "constructor");
+		if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "function") return null;
+		const name = Object.getOwnPropertyDescriptor(descriptor.value, "name");
+		return name && "value" in name && typeof name.value === "string" ? name.value.slice(0, 128) : null;
+	} catch {
+		return null;
+	}
 }
 
 function emptySnapshot(cause: CacheOperationUnavailableCause, count = 0): MessageSnapshot {
@@ -291,6 +326,10 @@ function messageSnapshot(messages: unknown, key: Uint8Array): MessageSnapshot {
 				nodes: total.nodes,
 				textBytes: total.textBytes,
 				cause: "unusable_message",
+				failureIndex: index,
+				failureType: typeof item,
+				failureConstructor: failureConstructor(item),
+				failurePath: "$",
 			};
 		}
 		const budget = newBudget();
@@ -307,6 +346,10 @@ function messageSnapshot(messages: unknown, key: Uint8Array): MessageSnapshot {
 					(budget.nodes > budget.nodeCap || budget.textBytes > budget.textCap
 						? "over_budget"
 						: "unusable_message"),
+				failureIndex: index,
+				failureType: typeof item,
+				failureConstructor: failureConstructor(item),
+				failurePath: budget.failurePath ?? "$",
 			};
 		}
 		total.nodes += budget.nodes;
@@ -524,6 +567,7 @@ function classifyMessages(before: MessageSnapshot, after: MessageSnapshot): Mess
 	if (before.cause !== undefined || after.cause !== undefined) {
 		// Prefer the current (after) snapshot's failure: an absent baseline must not hide
 		// a specific unsafe shape or budget limit in the context being diagnosed.
+		const failed = after.cause !== undefined ? after : before;
 		const cause = after.cause ?? before.cause;
 		const overBudget =
 			cause === "too_many_messages" ||
@@ -534,6 +578,10 @@ function classifyMessages(before: MessageSnapshot, after: MessageSnapshot): Mess
 			reason: overBudget ? "over_budget" : "unavailable",
 			cause,
 			observedCount: Math.min(before.observed, after.observed),
+			...(failed.failureIndex === undefined ? {} : { failureIndex: failed.failureIndex }),
+			...(failed.failureType === undefined ? {} : { failureType: failed.failureType }),
+			...(failed.failureConstructor === undefined ? {} : { failureConstructor: failed.failureConstructor }),
+			...(failed.failurePath === undefined ? {} : { failurePath: failed.failurePath }),
 			snapshotNodes: Math.max(before.nodes, after.nodes),
 			snapshotTextBytes: Math.max(before.textBytes, after.textBytes),
 		};
@@ -594,6 +642,11 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 	const key = randomBytes(32);
 	let sequence = 0;
 	let dropped = 0;
+	const failureCounts: Record<string, number> = {};
+	const countFailure = (snapshot: MessageSnapshot): void => {
+		if (snapshot.cause !== undefined)
+			failureCounts[snapshot.cause] = Math.min(1_000_000, (failureCounts[snapshot.cause] ?? 0) + 1);
+	};
 	let previousFinal:
 		| {
 				messages?: MessageSnapshot;
@@ -623,6 +676,8 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 				before = emptySnapshot("not_an_array");
 				after = emptySnapshot("not_an_array");
 			}
+			if (beforeMessages !== undefined && before.cause !== undefined) countFailure(before);
+			if (after.cause !== undefined) countFailure(after);
 			const classification: MessageClassification = failed ? { reason: "failed" } : classifyMessages(before, after);
 			const safeAnnotation = sanitizeAnnotation(annotation);
 			try {
@@ -640,6 +695,12 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 					...(classification.snapshotTextBytes === undefined
 						? {}
 						: { snapshotTextBytes: classification.snapshotTextBytes }),
+					...(classification.failureIndex === undefined ? {} : { failureIndex: classification.failureIndex }),
+					...(classification.failureType === undefined ? {} : { failureType: classification.failureType }),
+					...(classification.failureConstructor === undefined
+						? {}
+						: { failureConstructor: classification.failureConstructor }),
+					...(classification.failurePath === undefined ? {} : { failurePath: classification.failurePath }),
 					...(safeAnnotation === undefined ? {} : { annotation: safeAnnotation }),
 				});
 			} catch {
@@ -700,6 +761,8 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 				beforePrompt = undefined;
 				afterPrompt = undefined;
 			}
+			if (before.messages !== undefined && beforeMessages.cause !== undefined) countFailure(beforeMessages);
+			if (after.messages !== undefined && afterMessages.cause !== undefined) countFailure(afterMessages);
 			const currentFinal = {
 				messages: afterMessages,
 				systemPrompt: afterPrompt,
@@ -755,6 +818,12 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 					comparisonScope: "within_request",
 					...(withinMessages.cause === undefined ? {} : { unavailableCause: withinMessages.cause }),
 					...(withinMessages.observedCount === undefined ? {} : { observedCount: withinMessages.observedCount }),
+					...(withinMessages.failureIndex === undefined ? {} : { failureIndex: withinMessages.failureIndex }),
+					...(withinMessages.failureType === undefined ? {} : { failureType: withinMessages.failureType }),
+					...(withinMessages.failureConstructor === undefined
+						? {}
+						: { failureConstructor: withinMessages.failureConstructor }),
+					...(withinMessages.failurePath === undefined ? {} : { failurePath: withinMessages.failurePath }),
 				},
 				{
 					surface: "system_prompt",
@@ -801,6 +870,12 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 					comparisonBasis,
 					...(acrossMessages.cause === undefined ? {} : { unavailableCause: acrossMessages.cause }),
 					...(acrossMessages.observedCount === undefined ? {} : { observedCount: acrossMessages.observedCount }),
+					...(acrossMessages.failureIndex === undefined ? {} : { failureIndex: acrossMessages.failureIndex }),
+					...(acrossMessages.failureType === undefined ? {} : { failureType: acrossMessages.failureType }),
+					...(acrossMessages.failureConstructor === undefined
+						? {}
+						: { failureConstructor: acrossMessages.failureConstructor }),
+					...(acrossMessages.failurePath === undefined ? {} : { failurePath: acrossMessages.failurePath }),
 				},
 				{
 					surface: "system_prompt",
@@ -871,6 +946,9 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 		},
 		getDroppedCount(): number {
 			return dropped;
+		},
+		getFailureCounts(): Record<string, number> {
+			return { ...failureCounts };
 		},
 	};
 }

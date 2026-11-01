@@ -565,6 +565,27 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 			if (!boundedCount(observedCount, 1_000_000)) return undefined;
 			output.observedCount = observedCount;
 		}
+		const failureIndex = data(source, "failureIndex");
+		if (failureIndex !== undefined) {
+			if (!boundedCount(failureIndex, 1_000_000)) return undefined;
+			output.failureIndex = failureIndex;
+		}
+		const failureType = data(source, "failureType");
+		if (failureType !== undefined) {
+			if (typeof failureType !== "string" || failureType.length > 32) return undefined;
+			output.failureType = failureType;
+		}
+		const failureConstructor = data(source, "failureConstructor");
+		if (failureConstructor !== undefined) {
+			if (failureConstructor !== null && (typeof failureConstructor !== "string" || failureConstructor.length > 128))
+				return undefined;
+			output.failureConstructor = failureConstructor;
+		}
+		const failurePath = data(source, "failurePath");
+		if (failurePath !== undefined) {
+			if (typeof failurePath !== "string" || failurePath.length > 512) return undefined;
+			output.failurePath = failurePath;
+		}
 		for (const [name, keys] of Object.entries({
 			roleCounts: ["user", "assistant", "toolResult", "other"],
 			stopReasonCounts: ["stop", "length", "toolUse", "error", "aborted", "unknown"],
