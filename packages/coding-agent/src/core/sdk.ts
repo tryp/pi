@@ -330,7 +330,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return ids;
 				},
 				observeOutcome: (input: Parameters<CacheTelemetryObserver["observeOutcome"]>[0]) => {
-					if (input.outcome !== "success") cacheOperationInstrumentation?.resetFinal();
+					// A failed attempt may be retried in the same session; keep its last final context as the baseline.
 					cacheMissAttributionTracker?.complete(input.requestId);
 					observer.observeOutcome(input);
 				},

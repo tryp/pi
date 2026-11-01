@@ -168,6 +168,182 @@ async function createOfflineCodexSession(
 	return { session, token };
 }
 
+function cacheOperationRecords(agentDir: string): Array<Record<string, unknown>> {
+	const directory = join(agentDir, "cache-telemetry");
+	const filename = readdirSync(directory).find((name) => name.endsWith(".jsonl"));
+	if (!filename) throw new Error("Cache telemetry sidecar was not written");
+	return readFileSync(join(directory, filename), "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line).data as Record<string, unknown>);
+}
+
+function recordFailedCacheAttempt(session: Awaited<ReturnType<typeof createOfflineCodexSession>>["session"]): void {
+	const observer = session.cacheTelemetry;
+	if (!observer) throw new Error("Cache telemetry observer is unavailable");
+	const ids = observer.observeRequest({
+		provider: "openai-codex",
+		model: codexModel.id,
+		phase: "canonical_body",
+		transport: "sse",
+		payload: {},
+		wirePayload: "{}",
+	});
+	observer.observeOutcome({ ...ids, outcome: "error" });
+}
+
+it("compares the first retry request with the failed attempt's final context", async () => {
+	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
+	process.env.PI_CACHE_TELEMETRY = "1";
+	const root = mkdtempSync(join(tmpdir(), "pi-sdk-codex-retry-"));
+	const agentDir = join(root, "agent");
+	const cwd = join(root, "project");
+	vi.stubGlobal("fetch", offlineCodexFetch([]));
+	let session: Awaited<ReturnType<typeof createOfflineCodexSession>>["session"] | undefined;
+	try {
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(cwd, { recursive: true });
+		({ session } = await createOfflineCodexSession(agentDir, cwd, 390_000));
+		session.agent.transport = "sse";
+		const identicalContext = [
+			{ role: "user", content: [{ type: "text", text: "same retry content" }] },
+		] as AgentMessage[];
+		session.agent.transformContext = async () => identicalContext;
+		await session.prompt("same retry content");
+		recordFailedCacheAttempt(session);
+		await session.prompt("same retry content");
+		await session.dispose();
+		const operations = cacheOperationRecords(agentDir).filter(
+			(record) =>
+				record.kind === "cache_context_operation" &&
+				record.contextStage === "stream_input" &&
+				record.surface === "messages" &&
+				record.comparisonScope === "across_requests",
+		);
+		expect(operations).toHaveLength(2);
+		expect(operations[0]).toMatchObject({ reason: "unavailable", unavailableCause: "no_prior_request" });
+		expect(["append", "unchanged"]).toContain(operations[1]!.reason);
+	} finally {
+		await session?.dispose();
+		vi.unstubAllGlobals();
+		if (previousTelemetry === undefined) delete process.env.PI_CACHE_TELEMETRY;
+		else process.env.PI_CACHE_TELEMETRY = previousTelemetry;
+		for (const writer of capturedWriters.values) await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+it("reports a changed retry against the prior attempt instead of losing its baseline", async () => {
+	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
+	process.env.PI_CACHE_TELEMETRY = "1";
+	const root = mkdtempSync(join(tmpdir(), "pi-sdk-codex-retry-changed-"));
+	const agentDir = join(root, "agent");
+	const cwd = join(root, "project");
+	vi.stubGlobal("fetch", offlineCodexFetch([]));
+	let session: Awaited<ReturnType<typeof createOfflineCodexSession>>["session"] | undefined;
+	try {
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(cwd, { recursive: true });
+		({ session } = await createOfflineCodexSession(agentDir, cwd, 390_000));
+		session.agent.transport = "sse";
+		await session.prompt("original attempt content");
+		recordFailedCacheAttempt(session);
+		await session.prompt("changed retry content");
+		await session.dispose();
+		const operation = cacheOperationRecords(agentDir)
+			.filter(
+				(record) =>
+					record.kind === "cache_context_operation" &&
+					record.contextStage === "stream_input" &&
+					record.surface === "messages" &&
+					record.comparisonScope === "across_requests",
+			)
+			.at(-1);
+		expect(operation?.reason).toBe("history_rewrite");
+	} finally {
+		await session?.dispose();
+		vi.unstubAllGlobals();
+		if (previousTelemetry === undefined) delete process.env.PI_CACHE_TELEMETRY;
+		else process.env.PI_CACHE_TELEMETRY = previousTelemetry;
+		for (const writer of capturedWriters.values) await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+it("retains no-prior-request after compaction and model changes", async () => {
+	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
+	process.env.PI_CACHE_TELEMETRY = "1";
+	const root = mkdtempSync(join(tmpdir(), "pi-sdk-codex-reset-controls-"));
+	const agentDir = join(root, "agent");
+	const cwd = join(root, "project");
+	vi.stubGlobal("fetch", offlineCodexFetch([]));
+	let session: Awaited<ReturnType<typeof createOfflineCodexSession>>["session"] | undefined;
+	try {
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(cwd, { recursive: true });
+		({ session } = await createOfflineCodexSession(agentDir, cwd, 390_000));
+		session.agent.transport = "sse";
+		await session.prompt("before compaction");
+		const compaction = vi.spyOn(session, "compactBeforeSubmit").mockResolvedValue([...session.agent.state.messages]);
+		await session.prompt("after compaction");
+		compaction.mockRestore();
+		const switchedModel = { ...codexModel, id: "gpt-5.4-switched" };
+		session.agent.state.model = switchedModel;
+		await session.prompt("after model switch");
+		await session.dispose();
+		const operations = cacheOperationRecords(agentDir).filter(
+			(record) =>
+				record.kind === "cache_context_operation" &&
+				record.contextStage === "stream_input" &&
+				record.surface === "messages" &&
+				record.comparisonScope === "across_requests",
+		);
+		expect(operations[0]).toMatchObject({ reason: "unavailable", unavailableCause: "no_prior_request" });
+		expect(operations[1]).toMatchObject({ reason: "unavailable", unavailableCause: "no_prior_request" });
+		expect(operations[2]).toMatchObject({ reason: "unavailable", unavailableCause: "no_prior_request" });
+	} finally {
+		await session?.dispose();
+		vi.unstubAllGlobals();
+		if (previousTelemetry === undefined) delete process.env.PI_CACHE_TELEMETRY;
+		else process.env.PI_CACHE_TELEMETRY = previousTelemetry;
+		for (const writer of capturedWriters.values) await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+it("keeps a genuinely fresh session unavailable until it has a prior request", async () => {
+	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
+	process.env.PI_CACHE_TELEMETRY = "1";
+	const root = mkdtempSync(join(tmpdir(), "pi-sdk-codex-fresh-"));
+	const agentDir = join(root, "agent");
+	const cwd = join(root, "project");
+	vi.stubGlobal("fetch", offlineCodexFetch([]));
+	let session: Awaited<ReturnType<typeof createOfflineCodexSession>>["session"] | undefined;
+	try {
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(cwd, { recursive: true });
+		({ session } = await createOfflineCodexSession(agentDir, cwd, 390_000));
+		session.agent.transport = "sse";
+		await session.prompt("fresh session first request");
+		await session.dispose();
+		const operation = cacheOperationRecords(agentDir).find(
+			(record) =>
+				record.kind === "cache_context_operation" &&
+				record.contextStage === "stream_input" &&
+				record.surface === "messages" &&
+				record.comparisonScope === "across_requests",
+		);
+		expect(operation).toMatchObject({ reason: "unavailable", unavailableCause: "no_prior_request" });
+	} finally {
+		await session?.dispose();
+		vi.unstubAllGlobals();
+		if (previousTelemetry === undefined) delete process.env.PI_CACHE_TELEMETRY;
+		else process.env.PI_CACHE_TELEMETRY = previousTelemetry;
+		for (const writer of capturedWriters.values) await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 it("runs full selected fixture graphs through the real SDK transform, conversion, streamFn, and offline Codex API", async () => {
 	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
 	process.env.PI_CACHE_TELEMETRY = "1";
