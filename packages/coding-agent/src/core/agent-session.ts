@@ -103,7 +103,13 @@ import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	ModelChangeReason,
+	SessionEntry,
+	SessionManager,
+} from "./session-manager.ts";
 import { getLatestCompactionEntry, REASONING_REJECTED_ENTRY } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -266,6 +272,8 @@ export interface PromptOptions {
 export interface ModelMutationOptions {
 	/** Persist the new value to global defaults. Defaults to session-only. */
 	persist?: boolean;
+	/** Why this model was selected. Callers that do not know should leave it unset. */
+	reason?: ModelChangeReason;
 }
 
 /** Result from cycleModel() */
@@ -2214,14 +2222,30 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
+		const previousModel = this.model;
+		if (modelsAreEqual(previousModel, model)) {
+			if (options.persist) {
+				this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+				this._addPersistedDefaultToNonEmptyScope(model);
+			}
+			this.setThinkingLevel(this._getThinkingLevelForModelSwitch(model));
+			return;
+		}
 		if (!(await this._modelRuntime.checkAuth(model.provider))) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
-		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
 		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
+		if (previousModel) {
+			this.sessionManager.appendModelChange(model.provider, model.id, {
+				fromProvider: previousModel.provider,
+				fromModelId: previousModel.id,
+				reason: options.reason ?? "unknown",
+			});
+		} else {
+			this.sessionManager.appendModelChange(model.provider, model.id);
+		}
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 			this._addPersistedDefaultToNonEmptyScope(model);
@@ -2288,7 +2312,15 @@ export class AgentSession {
 
 		// Apply model
 		this.agent.state.model = next.model;
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+		if (currentModel) {
+			this.sessionManager.appendModelChange(next.model.provider, next.model.id, {
+				fromProvider: currentModel.provider,
+				fromModelId: currentModel.id,
+				reason: options.reason ?? "manual",
+			});
+		} else {
+			this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+		}
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 			this._addPersistedDefaultToNonEmptyScope(next.model);
@@ -2323,7 +2355,15 @@ export class AgentSession {
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
 		this.agent.state.model = nextModel;
-		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+		if (currentModel) {
+			this.sessionManager.appendModelChange(nextModel.provider, nextModel.id, {
+				fromProvider: currentModel.provider,
+				fromModelId: currentModel.id,
+				reason: options.reason ?? "manual",
+			});
+		} else {
+			this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+		}
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 			this._addPersistedDefaultToNonEmptyScope(nextModel);
@@ -3303,9 +3343,9 @@ export class AgentSession {
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
-				setModel: async (model) => {
+				setModel: async (model, options) => {
 					if (!this._modelRuntime.hasConfiguredAuth(model.provider)) return false;
-					await this.setModel(model);
+					await this.setModel(model, options);
 					return true;
 				},
 				getThinkingLevel: () => this.thinkingLevel,

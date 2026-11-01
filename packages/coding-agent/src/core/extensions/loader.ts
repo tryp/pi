@@ -426,9 +426,9 @@ function createExtensionAPI(
 			return runtime.getCommands();
 		},
 
-		setModel(model) {
+		setModel(model, options) {
 			assertActive();
-			return runtime.setModel(model);
+			return runtime.setModel(model, options);
 		},
 
 		getThinkingLevel() {

@@ -59,6 +59,7 @@ import type {
 	BranchSummaryEntry,
 	CompactionEntry,
 	CustomEntry,
+	ModelChangeReason,
 	ReadonlySessionManager,
 	SessionEntry,
 	SessionManager,
@@ -1457,7 +1458,7 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/** Set the current model. Returns false if no API key available. */
-	setModel(model: Model<any>): Promise<boolean>;
+	setModel(model: Model<any>, options?: { reason?: ModelChangeReason }): Promise<boolean>;
 
 	/** Get current thinking level. */
 	getThinkingLevel(): ThinkingLevel;
@@ -1698,7 +1699,7 @@ export type SetActiveToolsHandler = (toolNames: string[]) => void;
 
 export type RefreshToolsHandler = () => void;
 
-export type SetModelHandler = (model: Model<any>) => Promise<boolean>;
+export type SetModelHandler = (model: Model<any>, options?: { reason?: ModelChangeReason }) => Promise<boolean>;
 
 export type GetThinkingLevelHandler = () => ThinkingLevel;
 

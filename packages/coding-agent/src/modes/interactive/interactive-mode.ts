@@ -4937,7 +4937,7 @@ export class InteractiveMode {
 		const model = await this.findExactModelMatch(searchTerm);
 		if (model) {
 			try {
-				await this.session.setModel(model, { persist: true });
+				await this.session.setModel(model, { persist: true, reason: "manual" });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.showStatus(`Default model: ${model.provider}/${model.id}`);
@@ -5081,7 +5081,7 @@ export class InteractiveMode {
 		this.showSelector((done) => {
 			const selectModel = async (model: Model<any>, persist: boolean) => {
 				try {
-					await this.session.setModel(model, { persist });
+					await this.session.setModel(model, { persist, reason: "manual" });
 					this.updateAvailableProviderCount();
 					this.footer.invalidate();
 					this.updateEditorBorderColor();
@@ -5788,7 +5788,7 @@ export class InteractiveMode {
 					selectionError = `${actionLabel}, but its default model "${defaultModelId}" is not available. Use /model to select a model.`;
 				} else {
 					try {
-						await this.session.setModel(selectedModel, { persist: true });
+						await this.session.setModel(selectedModel, { persist: true, reason: "manual" });
 					} catch (error: unknown) {
 						selectedModel = undefined;
 						const errorMessage = error instanceof Error ? error.message : String(error);

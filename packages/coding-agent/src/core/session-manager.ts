@@ -92,10 +92,15 @@ export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 	thinkingLevel: string;
 }
 
+export type ModelChangeReason = "token_limit" | "provider_error" | "retry_policy" | "manual" | "unknown";
+
 export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	provider: string;
 	modelId: string;
+	fromProvider?: string;
+	fromModelId?: string;
+	reason?: ModelChangeReason;
 }
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
@@ -1564,8 +1569,12 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	/** Append a model change as child of current leaf, then advance leaf. Returns entry id. */
-	appendModelChange(provider: string, modelId: string): string {
+	/** Append a model selection/change as child of current leaf, then advance leaf. Returns entry id. */
+	appendModelChange(
+		provider: string,
+		modelId: string,
+		change?: { fromProvider: string; fromModelId: string; reason: ModelChangeReason },
+	): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
 			id: generateId(this.byId),
@@ -1573,6 +1582,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			provider,
 			modelId,
+			...change,
 		};
 		this._appendEntry(entry);
 		return entry.id;

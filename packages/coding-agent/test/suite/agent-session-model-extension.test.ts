@@ -32,18 +32,72 @@ describe("AgentSession model and extension characterization", () => {
 		harnesses.push(harness);
 		const nextModel = harness.getModel("faux-2")!;
 
-		await harness.session.setModel(nextModel);
+		await harness.session.setModel(nextModel, { reason: "manual" });
 
 		expect(harness.session.model?.id).toBe("faux-2");
 		expect(modelEvents).toEqual(["faux-1->faux-2:set"]);
-		expect(
-			harness.sessionManager
-				.getEntries()
-				.filter((entry) => entry.type === "model_change")
-				.map((entry) => `${entry.provider}/${entry.modelId}`),
-		).toEqual([`${nextModel.provider}/${nextModel.id}`]);
+		const modelChanges = harness.sessionManager.getEntries().filter((entry) => entry.type === "model_change");
+		expect(modelChanges).toHaveLength(1);
+		expect(modelChanges[0]).toMatchObject({
+			provider: nextModel.provider,
+			modelId: nextModel.id,
+			fromProvider: harness.getModel("faux-1")!.provider,
+			fromModelId: "faux-1",
+			reason: "manual",
+		});
 		expect(harness.settingsManager.getDefaultProvider()).toBeUndefined();
 		expect(harness.settingsManager.getDefaultModel()).toBeUndefined();
+	});
+
+	it.each(["token_limit", "provider_error"] as const)("records %s model fallback reason", async (reason) => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One", reasoning: true },
+				{ id: "faux-2", name: "Two", reasoning: true },
+			],
+		});
+		harnesses.push(harness);
+		const previousModel = harness.getModel("faux-1")!;
+		const nextModel = harness.getModel("faux-2")!;
+
+		await harness.session.setModel(nextModel, { reason });
+
+		const modelChanges = harness.sessionManager.getEntries().filter((entry) => entry.type === "model_change");
+		expect(modelChanges[0]).toMatchObject({
+			provider: nextModel.provider,
+			modelId: nextModel.id,
+			fromProvider: previousModel.provider,
+			fromModelId: previousModel.id,
+			reason,
+		});
+	});
+
+	it("records unmapped model changes as countable unknown entries", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One", reasoning: true },
+				{ id: "faux-2", name: "Two", reasoning: true },
+			],
+		});
+		harnesses.push(harness);
+
+		await harness.session.setModel(harness.getModel("faux-2")!);
+
+		const unknownChanges = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "model_change" && entry.reason === "unknown");
+		expect(unknownChanges).toHaveLength(1);
+	});
+
+	it("does not append a model change when the effective model is unchanged", async () => {
+		const harness = await createHarness({ models: [{ id: "faux-1", name: "One", reasoning: true }] });
+		harnesses.push(harness);
+		const currentModel = harness.getModel("faux-1")!;
+		const before = harness.sessionManager.getEntries().filter((entry) => entry.type === "model_change");
+
+		await harness.session.setModel(currentModel, { reason: "manual" });
+
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "model_change")).toEqual(before);
 	});
 
 	it("only persists model and thinking defaults when requested", async () => {
