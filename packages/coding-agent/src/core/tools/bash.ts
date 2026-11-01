@@ -78,7 +78,7 @@ const bashSchema = Type.Object({
 	timeout: Type.Optional(
 		Type.Number({
 			description:
-				"Timeout in seconds (optional). An explicit value always wins and kills the command when it elapses. Without an explicit timeout, a command still running after the default budget (240s unless PI_BASH_DEFAULT_TIMEOUT_MS (ms) is set) is detached to the background and keeps running; the tool returns a notice with the pid, and the command can be checked with `ps` or stopped with `kill -TERM -<pid>`. Use a dedicated background job tool (e.g. bash_bg where available) when you need log capture for long commands.",
+				"Timeout in seconds (optional). An explicit value always wins and kills the command when it elapses. Without an explicit timeout, a command still running after the default budget (240s unless PI_BASH_DEFAULT_TIMEOUT_MS (ms) is set) is detached to the background and keeps running; the tool returns a notice with the pid, and the command can be checked with `ps` or stopped with `kill -TERM -<pid>`. Use a dedicated background job tool (e.g. bash_bg where available) when you need log capture for long commands. For waits, prefer a background job tool; a bare `sleep` over about 2 seconds is almost always the wrong instruction.",
 		}),
 	),
 	cwd: Type.Optional(
