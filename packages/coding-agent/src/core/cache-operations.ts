@@ -279,6 +279,7 @@ interface MessageSnapshot {
 interface MessageClassification {
 	reason: CacheOperationReason;
 	cause?: CacheOperationUnavailableCause;
+	// Messages successfully observed before the failed snapshot stopped; not a missing-baseline sentinel.
 	observedCount?: number;
 	failureIndex?: number;
 	failureType?: string;
@@ -577,7 +578,9 @@ function classifyMessages(before: MessageSnapshot, after: MessageSnapshot): Mess
 		return {
 			reason: overBudget ? "over_budget" : "unavailable",
 			cause,
-			observedCount: Math.min(before.observed, after.observed),
+			// This is progress in the failing snapshot, not the minimum across snapshots: a
+			// missing-baseline sentinel has observed=0 and says nothing about the failed walk.
+			observedCount: failed.observed,
 			...(failed.failureIndex === undefined ? {} : { failureIndex: failed.failureIndex }),
 			...(failed.failureType === undefined ? {} : { failureType: failed.failureType }),
 			...(failed.failureConstructor === undefined ? {} : { failureConstructor: failed.failureConstructor }),

@@ -71,6 +71,24 @@ it("reports the failing message index, runtime type, constructor, path, and caus
 	expect(instrumentation.getFailureCounts()).toEqual({ unusable_message: 3, accessor_property: 1 });
 });
 
+it("reports progress in the failing snapshot when no baseline exists", () => {
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const after = [messages("first")[0], messages("second")[0], () => undefined];
+
+	instrumentation.observeHandler(undefined, after as unknown as AgentMessage[], 0, 1);
+
+	expect(records[0]).toMatchObject({
+		surface: "messages",
+		unavailableCause: "unusable_message",
+		observedCount: 2,
+		failureIndex: 2,
+		failureType: "function",
+		failurePath: "$",
+	});
+	expect(records[0]?.observedCount).not.toBe(0);
+});
+
 it("classifies no-op, in-place edits, history rewrites, suffix growth, shrink, and failures", () => {
 	const records: Array<{ reason: string; beforeCount: number | null; afterCount: number | null }> = [];
 	const observer = createCacheOperationInstrumentation((record) => records.push(record));
