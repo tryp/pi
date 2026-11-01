@@ -237,6 +237,8 @@ describe("detectCacheMiss", () => {
 		expect(getCacheMissLabel(miss)).toBe("Cache miss (no comparable request recorded)");
 		expect(shouldShowCacheMissNotice(miss)).toBe(false);
 		expect(shouldShowCacheMissNotice({ ...miss, missedCost: 0.1 })).toBe(true);
+		expect(shouldShowCacheMissNotice({ ...miss, modelChanged: true, missedCost: 1 })).toBe(false);
+		expect(shouldShowCacheMissNotice({ ...miss, modelChanged: true, missedTokens: 20_000 })).toBe(true);
 		expect(shouldShowCacheMissNotice({ ...miss, missedTokens: 20_000 })).toBe(true);
 	});
 
@@ -260,12 +262,49 @@ describe("detectCacheMiss", () => {
 			reason: "compaction",
 			missedTokens: 105_000,
 			missedCost: 0.36225,
+			costEstimateSuppressed: false,
 			idleMs: 60_000,
 			modelChanged: false,
 			anchorEntryId: "c",
 			attribution: { kind: "tools_changed", changedTools: 2 },
 			anchorPlacement: "tail_fallback",
 		});
+	});
+
+	it("excludes cross-model cost from cumulative estimates", () => {
+		const otherModelTurn = assistant({
+			cacheWrite: 110_000,
+			cost: { cacheWrite: 0.4125 },
+			model: "other-model",
+			timestamp: 120_000,
+		});
+		const totals = computeCacheWaste([entry(turn1), entry(turn2), entry(otherModelTurn)], models);
+		expect(totals.missedTokens).toBe(105_000);
+		expect(totals.missedCost).toBe(0);
+	});
+
+	it("persists a content-free diagnostic without a cross-model cost estimate", () => {
+		const appendCustomEntry = vi.fn();
+		const miss = {
+			missedTokens: 140_000,
+			missedCost: 0.02,
+			idleMs: 0,
+			modelChanged: true,
+			reason: "model_switch" as const,
+			anchorEntryId: undefined,
+		};
+		recordCacheMissDiagnostic({ appendCustomEntry }, miss, "tail_fallback");
+		const [eventType, data] = appendCustomEntry.mock.calls[0] as [string, Record<string, unknown>];
+		expect(eventType).toBe("pi.session_diagnostic");
+		expect(data).toMatchObject({
+			kind: "cache_miss_notice",
+			reason: "model_switch",
+			missedTokens: 140_000,
+			missedCost: null,
+			costEstimateSuppressed: true,
+		});
+		expect(JSON.stringify(data)).not.toContain("message");
+		expect(JSON.stringify(data)).not.toContain("prompt");
 	});
 
 	it("labels unexplained misses with known telemetry attribution", () => {

@@ -104,8 +104,29 @@ describe("InteractiveMode cache-miss notices", () => {
 		expect(chatContainer.children[0]).toBe(summary);
 		expect(chatContainer.children[1]).toBeInstanceOf(Spacer);
 		const rendered = stripAnsi(chatContainer.render(120).join("\n"));
-		expect(rendered).toContain("Cache miss after compaction: 51k tokens re-billed (~$0.18)");
+		expect(rendered).toContain("Cache miss after compaction: estimated ~51k tokens (est. ~$0.18)");
 		expect(rendered).toContain("Context after compaction: 148k -> 51k tokens");
+	});
+
+	test("omits currency estimates across model switches", () => {
+		const chatContainer = new Container();
+		const fakeThis = { chatContainer, renderedEntryComponents: new Map<string, Text>() };
+		const miss: CacheMiss = {
+			missedTokens: 140_000,
+			missedCost: 0.02,
+			idleMs: 0,
+			modelChanged: true,
+			reason: "model_switch",
+			anchorEntryId: undefined,
+		};
+
+		initTheme("dark");
+		addCacheMissNotice.call(fakeThis, miss);
+
+		const rendered = stripAnsi(chatContainer.render(100).join("\n"));
+		expect(rendered).toContain("Cache miss after model switch: estimated ~140k tokens");
+		expect(rendered).not.toContain("$");
+		expect(rendered).not.toContain("re-billed");
 	});
 
 	test("falls back to the tail when the anchor is absent", () => {

@@ -17,7 +17,7 @@ export type CacheMissReason = "compaction" | "model_switch" | "idle" | "unexplai
 export interface CacheMiss {
 	/** Prompt tokens that were in the previous turn's prompt but not read from cache. */
 	missedTokens: number;
-	/** Extra dollars paid vs. a full cache hit; 0 when pricing is unknown. */
+	/** Estimated extra dollars vs. a full cache hit; 0 when pricing is unknown. */
 	missedCost: number;
 	/** Milliseconds since the previous request (which last refreshed the cache). */
 	idleMs: number;
@@ -35,7 +35,7 @@ export interface CacheMiss {
 }
 
 export function shouldShowCacheMissNotice(miss: CacheMiss): boolean {
-	return miss.missedTokens >= 20_000 || miss.missedCost >= 0.1;
+	return miss.missedTokens >= 20_000 || (!miss.modelChanged && miss.missedCost >= 0.1);
 }
 
 export function getCacheMissLabel(miss: CacheMiss): string {
@@ -87,7 +87,10 @@ export function recordCacheMissDiagnostic(
 			Number.MAX_SAFE_INTEGER,
 			Math.max(0, Number.isFinite(miss.missedTokens) ? Math.floor(miss.missedTokens) : 0),
 		),
-		missedCost: Math.min(1_000_000_000, Math.max(0, Number.isFinite(miss.missedCost) ? miss.missedCost : 0)),
+		missedCost: miss.modelChanged
+			? null
+			: Math.min(1_000_000_000, Math.max(0, Number.isFinite(miss.missedCost) ? miss.missedCost : 0)),
+		costEstimateSuppressed: miss.modelChanged,
 		idleMs: Math.min(365 * 24 * 60 * 60 * 1000, Math.max(0, Number.isFinite(miss.idleMs) ? miss.idleMs : 0)),
 		modelChanged: miss.modelChanged,
 		anchorEntryId: miss.anchorEntryId,
@@ -236,7 +239,7 @@ function scan(
 			const miss = detectMiss(prev, entry.message, models, compactionBoundary, modelChangeEntryId);
 			if (miss) {
 				totals.missedTokens += miss.missedTokens;
-				totals.missedCost += miss.missedCost;
+				if (!miss.modelChanged) totals.missedCost += miss.missedCost;
 				totals.missCount += 1;
 				misses.set(entry.message, miss);
 			}
@@ -249,8 +252,8 @@ function scan(
 }
 
 /**
- * Cumulative cache waste across a session: prompt tokens that should have been
- * cache reads (they were in the previous turn's prompt) but were re-billed.
+ * Cumulative cache impact across a session. Token overlap and cost are estimates;
+ * cross-model cost is excluded because model tokenizers may differ.
  */
 export function computeCacheWaste(entries: SessionEntry[], models: ModelPriceSource): CacheWasteTotals {
 	return scan(entries, models).totals;

@@ -3915,11 +3915,11 @@ export class InteractiveMode {
 	private addCacheMissNotice(miss: CacheMiss): "adjacent" | "tail_fallback" | undefined {
 		if (!shouldShowCacheMissNotice(miss)) return undefined;
 
-		const cost = miss.missedCost >= 0.01 ? ` (~$${miss.missedCost.toFixed(2)})` : "";
+		const cost = !miss.modelChanged && miss.missedCost >= 0.01 ? ` (est. ~$${miss.missedCost.toFixed(2)})` : "";
 		const label = getCacheMissLabel(miss);
 		const components: Component[] = [
 			new Spacer(1),
-			new Text(theme.fg("warning", `${label}: ${formatTokens(miss.missedTokens)} tokens re-billed${cost}`), 1, 0),
+			new Text(theme.fg("warning", `${label}: estimated ~${formatTokens(miss.missedTokens)} tokens${cost}`), 1, 0),
 		];
 		if (
 			miss.reason === "compaction" &&
@@ -6330,8 +6330,8 @@ export class InteractiveMode {
 				const detail = `${cacheWaste.missedTokens.toLocaleString()} tokens, ${missLabel}`;
 				info +=
 					cacheWaste.missedCost >= 0.0001
-						? `\n${theme.fg("dim", "Cache Re-billed:")} $${cacheWaste.missedCost.toFixed(3)} ${theme.fg("dim", `(${detail})`)}`
-						: `\n${theme.fg("dim", "Cache Re-billed:")} ${detail}`;
+						? `\n${theme.fg("dim", "Estimated Cache Impact:")} ~$${cacheWaste.missedCost.toFixed(3)} ${theme.fg("dim", `(${detail})`)}`
+						: `\n${theme.fg("dim", "Estimated Cache Impact:")} ${detail}`;
 			}
 		}
 
