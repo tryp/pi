@@ -74,7 +74,7 @@ define assert-dist-fresh
 	fi
 endef
 
-.PHONY: deploy deploy-full verify smoke-test test-deploy-runtime deployed-commit record-deploy build-telemetry build-agent build-ai build-client build-protocol build-tui build-coding-agent build-extra mutcheck-deploy-gates
+.PHONY: deploy deploy-full verify smoke-test test-deploy-runtime deployed-commit record-deploy relink-extension-deps build-telemetry build-agent build-ai build-client build-protocol build-tui build-coding-agent build-extra mutcheck-deploy-gates
 
 build-telemetry:
 	cd packages/telemetry && npm run build
@@ -151,11 +151,21 @@ check-tree-clean:
 
 deploy: check-tree-clean build-telemetry build-agent build-extra build-coding-agent  ## Build all local runtime packages, stage dependencies, verify, install, and smoke-test
 	./scripts/deploy-runtime.sh --source-dir "$(CURDIR)" --runtime-dir "$(RUNTIME_DIR)"
+	@$(MAKE) --no-print-directory relink-extension-deps
 	@$(MAKE) --no-print-directory verify
 	@$(MAKE) --no-print-directory smoke-test
 	@$(MAKE) --no-print-directory record-deploy
 
 deploy-full: deploy  ## Compatibility alias for the complete local-package deployment
+
+# A deploy replaces RUNTIME_DIR wholesale, dropping pi-lsp-adapter's dependency
+# links; only the post-deploy link check notices the missing packages.
+relink-extension-deps:
+	@if [ -d "$(HOME)/src/pi-lsp-adapter" ]; then \
+	  $(MAKE) -C "$(HOME)/src/pi-lsp-adapter" link-pi-deps; \
+	else \
+	  echo "relink-extension-deps: no ~/src/pi-lsp-adapter checkout, skipping"; \
+	fi
 
 # Record the deployment in the analyzer's ledger, after verify and smoke-test
 # have already passed.
