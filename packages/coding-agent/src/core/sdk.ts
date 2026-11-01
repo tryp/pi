@@ -286,7 +286,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					cacheMissAttributionTracker?.recordRequest(record);
 					writer.append(record);
 				},
-				(records: Parameters<typeof writer.appendBatch>[0]) => writer.appendBatch(records),
+				(records: Parameters<typeof writer.appendBatch>[0]) => {
+					// The observer calls this instead of onRecord when batch persistence is available.
+					// Feed request records into attribution here; each batch contains an attempt's
+					// request phases and outcome, with no separate onRecord calls.
+					for (const record of records) cacheMissAttributionTracker?.recordRequest(record);
+					return writer.appendBatch(records);
+				},
 			);
 			disposeCacheTelemetry = async () => {
 				try {

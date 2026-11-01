@@ -192,6 +192,41 @@ function recordFailedCacheAttempt(session: Awaited<ReturnType<typeof createOffli
 	observer.observeOutcome({ ...ids, outcome: "error" });
 }
 
+it("feeds production attempt batches into cache-miss attribution", async () => {
+	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
+	process.env.PI_CACHE_TELEMETRY = "1";
+	const root = mkdtempSync(join(tmpdir(), "pi-sdk-cache-attribution-"));
+	const agentDir = join(root, "agent");
+	const cwd = join(root, "project");
+	vi.stubGlobal("fetch", offlineCodexFetch([]));
+	let session: Awaited<ReturnType<typeof createOfflineCodexSession>>["session"] | undefined;
+	try {
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(cwd, { recursive: true });
+		({ session } = await createOfflineCodexSession(agentDir, cwd, 390_000));
+		session.agent.transport = "sse";
+		const identicalContext = [
+			{ role: "user", content: [{ type: "text", text: "repeated attribution context" }] },
+		] as AgentMessage[];
+		session.agent.transformContext = async () => identicalContext;
+		await session.prompt("repeated attribution context");
+		await session.prompt("repeated attribution context");
+		await session.cacheTelemetry?.flush();
+
+		// This exercises createAgentSession -> Agent -> provider adapter -> attempt batch.
+		// Before the SDK's batch callback fed the tracker, this stayed unknown even though
+		// the second request had a complete, identical-prefix comparison.
+		expect(session.getCacheMissAttribution?.()).toEqual({ kind: "prefix_identical_provider_side" });
+	} finally {
+		await session?.dispose();
+		vi.unstubAllGlobals();
+		if (previousTelemetry === undefined) delete process.env.PI_CACHE_TELEMETRY;
+		else process.env.PI_CACHE_TELEMETRY = previousTelemetry;
+		for (const writer of capturedWriters.values) await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 it("compares the first retry request with the failed attempt's final context", async () => {
 	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
 	process.env.PI_CACHE_TELEMETRY = "1";
