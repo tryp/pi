@@ -184,7 +184,12 @@ function boundedFingerprint(
 				for (let index = 0; index < item.length; index++) {
 					const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
 					if (!descriptor || !("value" in descriptor)) return fail("accessor_property");
-					const part = visit(descriptor.value, depth + 1);
+					const value = descriptor.value;
+					// JSON.stringify renders undefined, functions, and symbols in arrays as null.
+					const part = visit(
+						value === undefined || typeof value === "function" || typeof value === "symbol" ? null : value,
+						depth + 1,
+					);
 					if (part === undefined) return undefined;
 					parts.push(part);
 				}
@@ -198,7 +203,14 @@ function boundedFingerprint(
 			for (const name of names.sort()) {
 				const descriptor = Object.getOwnPropertyDescriptor(item, name);
 				if (!descriptor || !("value" in descriptor)) return fail("accessor_property");
-				if (typeof descriptor.value === "function") continue;
+				// JSON.stringify omits these object properties; they must not affect the fingerprint.
+				if (
+					descriptor.value === undefined ||
+					typeof descriptor.value === "function" ||
+					typeof descriptor.value === "symbol"
+				) {
+					continue;
+				}
 				const child = visit(descriptor.value, depth + 1);
 				if (child === undefined) return undefined;
 				parts.push(`${digest(key, name)}=${child}`);
@@ -342,7 +354,13 @@ function cloneBounded(value: unknown, depth: number, budget: FingerprintBudget):
 		for (let index = 0; index < value.length; index++) {
 			const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
 			if (!descriptor || !("value" in descriptor)) throw new Error("unavailable");
-			result.push(cloneBounded(descriptor.value, depth + 1, budget));
+			const arrayValue = descriptor.value;
+			// JSON.stringify renders undefined, functions, and symbols in arrays as null.
+			result.push(
+				arrayValue === undefined || typeof arrayValue === "function" || typeof arrayValue === "symbol"
+					? cloneBounded(null, depth + 1, budget)
+					: cloneBounded(arrayValue, depth + 1, budget),
+			);
 		}
 		return result;
 	}
@@ -354,7 +372,14 @@ function cloneBounded(value: unknown, depth: number, budget: FingerprintBudget):
 	for (const name of names) {
 		const descriptor = Object.getOwnPropertyDescriptor(value, name);
 		if (!descriptor || !("value" in descriptor)) throw new Error("accessor_property");
-		if (typeof descriptor.value === "function") continue;
+		// JSON.stringify omits these object properties; exclude them from the observation too.
+		if (
+			descriptor.value === undefined ||
+			typeof descriptor.value === "function" ||
+			typeof descriptor.value === "symbol"
+		) {
+			continue;
+		}
 		result[name] = cloneBounded(descriptor.value, depth + 1, budget);
 	}
 	return result;

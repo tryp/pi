@@ -106,6 +106,58 @@ it("treats a Date and the ISO string it serializes to as the same cacheable byte
 	expect(records[1]).toMatchObject({ surface: "messages", reason: "history_rewrite" });
 });
 
+it("matches JSON omission and null rules when cloning and fingerprinting messages", () => {
+	const undefinedObject = { role: "user", content: { text: "same", nested: undefined }, extra: undefined };
+	const omittedObject = { role: "user", content: { text: "same" } };
+	const nonJsonProperties = {
+		role: "user",
+		content: { text: "same", nested: undefined },
+		extra: undefined,
+		handler: () => {},
+		marker: Symbol("marker"),
+	};
+	const clonedObject = cloneMessagesForObservation([nonJsonProperties] as unknown as AgentMessage[]);
+	expect(clonedObject).toEqual([omittedObject]);
+
+	const nonJsonArray = [{ role: "user", content: [undefined, () => {}, Symbol("item")] }];
+	const clonedArray = cloneMessagesForObservation(nonJsonArray as unknown as AgentMessage[]);
+	expect(clonedArray).toEqual([{ role: "user", content: [null, null, null] }]);
+
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	instrumentation.observeHandler(
+		[undefinedObject] as unknown as AgentMessage[],
+		[omittedObject] as unknown as AgentMessage[],
+		0,
+		1,
+	);
+	instrumentation.observeHandler(
+		[nonJsonProperties] as unknown as AgentMessage[],
+		[omittedObject] as unknown as AgentMessage[],
+		0,
+		1,
+	);
+	instrumentation.observeHandler(
+		[{ role: "user", content: "same", extra: undefined }] as unknown as AgentMessage[],
+		[{ role: "user", content: "same", extra: null }] as unknown as AgentMessage[],
+		0,
+		1,
+	);
+	instrumentation.observeHandler(
+		[{ role: "user", content: [undefined, () => {}, Symbol("item")] }] as unknown as AgentMessage[],
+		[{ role: "user", content: [null, null, null] }] as unknown as AgentMessage[],
+		0,
+		1,
+	);
+
+	expect(records.map((record) => record.reason)).toEqual([
+		"unchanged",
+		"unchanged",
+		"history_rewrite",
+		"unchanged",
+	]);
+});
+
 it("reports cyclic messages as unavailable with a specific cause", () => {
 	const records: CacheOperationObservation[] = [];
 	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
@@ -439,6 +491,8 @@ it("marks accessor, unserializable, and oversized paths unavailable without invo
 		1,
 		0,
 	);
+	const notAnArray = "not an array" as unknown as AgentMessage[];
+	instrumentation.observeHandler(notAnArray, notAnArray, 2, 3);
 	const hostile = new Proxy([], {
 		get() {
 			throw new Error("trap");
@@ -446,9 +500,10 @@ it("marks accessor, unserializable, and oversized paths unavailable without invo
 	});
 	expect(cloneMessagesForObservation(hostile)).toBeUndefined();
 	expect(getterCalls).toBe(0);
-	expect(records.map((record) => record.reason)).toEqual(["unavailable", "over_budget"]);
+	expect(records.map((record) => record.reason)).toEqual(["unavailable", "over_budget", "unavailable"]);
 	expect(records[0]?.unavailableCause).toBe("accessor_property");
 	expect(records[1]?.unavailableCause).toBe("too_many_messages");
+	expect(records[2]?.unavailableCause).toBe("not_an_array");
 });
 
 it("sanitizes optional handler annotations and counts unsupported metadata as unavailable", () => {
