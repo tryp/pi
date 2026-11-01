@@ -302,6 +302,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			cacheTelemetry = {
 				observeRequest(input: Parameters<CacheTelemetryObserver["observeRequest"]>[0]) {
 					const ids = observer.observeRequest(input);
+					const priorSuccessfulRequest = cacheOperationInstrumentation?.associateRequest(
+						ids.requestId,
+						input.provider,
+						input.model,
+					);
 					const pending = pendingCacheOperations;
 					if (pendingCacheOperationsDropped)
 						pending.push({
@@ -314,6 +319,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						});
 					pendingCacheOperations = [];
 					pendingCacheOperationsDropped = false;
+					if (priorSuccessfulRequest) {
+						for (const observation of pending) observation.priorSuccessfulRequest = priorSuccessfulRequest;
+					}
 					const sequence = cacheOperationInstrumentation?.nextSequence() ?? 0;
 					cacheMissAttributionTracker?.recordOperations(ids.requestId, pending);
 					for (const observation of pending) {
@@ -330,6 +338,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return ids;
 				},
 				observeOutcome: (input: Parameters<CacheTelemetryObserver["observeOutcome"]>[0]) => {
+					cacheOperationInstrumentation?.completeRequest(input.requestId, input.outcome === "success");
 					// A failed attempt may be retried in the same session; keep its last final context as the baseline.
 					cacheMissAttributionTracker?.complete(input.requestId);
 					observer.observeOutcome(input);

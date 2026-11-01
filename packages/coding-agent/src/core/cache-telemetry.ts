@@ -605,6 +605,42 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 			}
 			output[name] = complete ? safe : null;
 		}
+		const priorInput = data(source, "priorSuccessfulRequest");
+		if (priorInput !== undefined) {
+			const prior = plain(priorInput);
+			const priorRequestId = prior && data(prior, "requestId");
+			const provider = prior && data(prior, "provider");
+			const model = prior && data(prior, "model");
+			const headSizeBytes = prior && data(prior, "headSizeBytes");
+			const surfacesInput = prior && plain(data(prior, "surfaces"));
+			if (
+				!prior || typeof priorRequestId !== "string" || priorRequestId.length > 128 ||
+				typeof provider !== "string" || provider.length > 128 ||
+				typeof model !== "string" || model.length > 256 ||
+				(headSizeBytes !== null && !boundedCount(headSizeBytes, 10_000_000)) || !surfacesInput
+			) return undefined;
+			const surfaces: Record<string, unknown> = {};
+			for (const name of ["messages", "system_prompt", "tools"] as const) {
+				const surface = plain(data(surfacesInput, name));
+				const id = surface && data(surface, "id");
+				const sizeBytes = surface && data(surface, "sizeBytes");
+				const count = surface && data(surface, "count");
+				if (
+					!surface ||
+					(id !== null && (typeof id !== "string" || id.length > 64)) ||
+					(sizeBytes !== null && !boundedCount(sizeBytes, 10_000_000)) ||
+					(count !== null && !boundedCount(count, 1_000_000))
+				) return undefined;
+				surfaces[name] = { id, sizeBytes, count };
+			}
+			output.priorSuccessfulRequest = {
+				requestId: priorRequestId,
+				provider,
+				model,
+				headSizeBytes,
+				surfaces,
+			};
+		}
 		return output as unknown as CacheTelemetryRecord;
 	}
 	if (kind !== "cache_request_outcome") return undefined;

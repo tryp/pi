@@ -46,6 +46,24 @@ export type CacheOperationUnavailableCause =
 /** How an across-request comparison obtained its predecessor. */
 export type CacheOperationComparisonBasis = "first_request" | "prior_available" | "prior_unavailable";
 
+export interface CacheOperationPriorSurface {
+	id: string | null;
+	sizeBytes: number | null;
+	count: number | null;
+}
+
+export interface CacheOperationPriorSuccessfulRequest {
+	requestId: string;
+	provider: string;
+	model: string;
+	headSizeBytes: number | null;
+	surfaces: {
+		messages: CacheOperationPriorSurface;
+		system_prompt: CacheOperationPriorSurface;
+		tools: CacheOperationPriorSurface;
+	};
+}
+
 export interface CacheOperationAnnotationData {
 	reason: "sidecar_gate" | "plan_marker_filter" | "auto_continue_filter" | "unavailable";
 	counters?: Record<string, number>;
@@ -80,6 +98,7 @@ export interface CacheOperationRecord {
 	snapshotNodes?: number;
 	snapshotTextBytes?: number;
 	comparisonBasis?: CacheOperationComparisonBasis;
+	priorSuccessfulRequest?: CacheOperationPriorSuccessfulRequest;
 }
 
 export interface CacheOperationObservation {
@@ -105,6 +124,7 @@ export interface CacheOperationObservation {
 	snapshotNodes?: number;
 	snapshotTextBytes?: number;
 	comparisonBasis?: CacheOperationComparisonBasis;
+	priorSuccessfulRequest?: CacheOperationPriorSuccessfulRequest;
 }
 
 export interface CacheOperationContextSnapshot {
@@ -558,10 +578,16 @@ export function cloneToolsForObservation(tools: readonly unknown[]): readonly un
  * membership change and a reorder change the request body's tool block and therefore the
  * provider's cached prefix.
  */
-function toolFingerprint(tools: readonly unknown[], key: Uint8Array): string | undefined {
+function toolSnapshot(tools: readonly unknown[], key: Uint8Array): { id: string; sizeBytes: number } | undefined {
 	const projection = cloneToolsForObservation(tools);
 	if (projection === undefined) return undefined;
-	return boundedFingerprint(projection, key);
+	const id = boundedFingerprint(projection, key);
+	if (id === undefined) return undefined;
+	try {
+		return { id, sizeBytes: Buffer.byteLength(JSON.stringify(projection)) };
+	} catch {
+		return undefined;
+	}
 }
 
 function classifyMessages(before: MessageSnapshot, after: MessageSnapshot): MessageClassification {
@@ -660,6 +686,11 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 				systemPromptLength: number | null;
 		  }
 		| undefined;
+	let currentRequestContext:
+		| Omit<CacheOperationPriorSuccessfulRequest, "requestId" | "provider" | "model">
+		| undefined;
+	let lastSuccessfulRequest: CacheOperationPriorSuccessfulRequest | undefined;
+	const requestContexts = new Map<string, CacheOperationPriorSuccessfulRequest>();
 	return {
 		epoch,
 		observeHandler(
@@ -747,13 +778,15 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 			let afterMessages = emptySnapshot("no_after_context");
 			let beforeTools: string | undefined;
 			let afterTools: string | undefined;
+			let afterToolSnapshot: { id: string; sizeBytes: number } | undefined;
 			let beforePrompt: string | undefined;
 			let afterPrompt: string | undefined;
 			try {
 				if (before.messages !== undefined) beforeMessages = messageSnapshot(before.messages, key);
 				if (after.messages !== undefined) afterMessages = messageSnapshot(after.messages, key);
-				beforeTools = toolFingerprint(before.tools ?? [], key);
-				afterTools = toolFingerprint(after.tools ?? [], key);
+				beforeTools = toolSnapshot(before.tools ?? [], key)?.id;
+				afterToolSnapshot = toolSnapshot(after.tools ?? [], key);
+				afterTools = afterToolSnapshot?.id;
 				beforePrompt = boundedFingerprint(before.systemPrompt, key);
 				afterPrompt = boundedFingerprint(after.systemPrompt, key);
 			} catch {
@@ -766,6 +799,32 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 			}
 			if (before.messages !== undefined && beforeMessages.cause !== undefined) countFailure(beforeMessages);
 			if (after.messages !== undefined && afterMessages.cause !== undefined) countFailure(afterMessages);
+			const systemPromptBytes = Buffer.byteLength(after.systemPrompt);
+			const messageId = afterMessages.cause === undefined ? digest(key, afterMessages.digests.join("|")) : null;
+			const nextRequestContext: Omit<CacheOperationPriorSuccessfulRequest, "requestId" | "provider" | "model"> = {
+				headSizeBytes:
+					afterToolSnapshot === undefined
+						? null
+						: systemPromptBytes + afterToolSnapshot.sizeBytes,
+				surfaces: {
+					messages: {
+						id: messageId,
+						sizeBytes: messageId === null ? null : afterMessages.textBytes,
+						count: messageId === null ? null : afterMessages.count,
+					},
+					system_prompt: {
+						id: afterPrompt ?? null,
+						sizeBytes: systemPromptBytes,
+						count: null,
+					},
+					tools: {
+						id: afterToolSnapshot?.id ?? null,
+						sizeBytes: afterToolSnapshot?.sizeBytes ?? null,
+						count: afterToolSnapshot === undefined ? null : (after.tools?.length ?? 0),
+					},
+				},
+			};
+			if (contextStage === "stream_input") currentRequestContext = nextRequestContext;
 			const currentFinal = {
 				messages: afterMessages,
 				systemPrompt: afterPrompt,
@@ -942,6 +1001,28 @@ export function createCacheOperationInstrumentation(onObservation: (observation:
 		},
 		resetFinal(): void {
 			previousFinal = undefined;
+			currentRequestContext = undefined;
+		},
+		associateRequest(requestId: string, provider: string, model: string): CacheOperationPriorSuccessfulRequest | undefined {
+			if (currentRequestContext) {
+				requestContexts.set(requestId, {
+					requestId,
+					provider: provider.slice(0, 128),
+					model: model.slice(0, 256),
+					...currentRequestContext,
+				});
+				while (requestContexts.size > 32) {
+					const oldest = requestContexts.keys().next().value;
+					if (oldest === undefined) break;
+					requestContexts.delete(oldest);
+				}
+			}
+			return lastSuccessfulRequest;
+		},
+		completeRequest(requestId: string, successful: boolean): void {
+			const context = requestContexts.get(requestId);
+			requestContexts.delete(requestId);
+			if (successful && context) lastSuccessfulRequest = context;
 		},
 		nextSequence(): number {
 			sequence = Math.min(1_000_000_000, sequence + 1);

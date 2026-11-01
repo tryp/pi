@@ -570,6 +570,56 @@ it("compares each finalized context to the previous request, separately from wit
 	]);
 });
 
+it("records content-free surfaces from the previous successful request", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-cache-operations-prior-success-"));
+	const writer = await createLocalCacheTelemetryWriter(root);
+	try {
+		const observations: CacheOperationObservation[] = [];
+		const instrumentation = createCacheOperationInstrumentation((record) => observations.push(record));
+		const first = { messages: messages("PRIVATE FIRST PROMPT"), systemPrompt: "PRIVATE SYSTEM", tools: [{ name: "private" }] };
+		const second = { messages: messages("SECOND PROMPT"), systemPrompt: "SYSTEM", tools: [{ name: "bash" }] };
+		instrumentation.observeFinal(first, first, 1, "stream_input");
+		expect(instrumentation.associateRequest("request-1", "provider-one", "model-one")).toBeUndefined();
+		instrumentation.completeRequest("request-1", true);
+
+		const firstObservation = observations.length;
+		instrumentation.observeFinal(first, second, 1, "stream_input");
+		const prior = instrumentation.associateRequest("request-2", "provider-two", "model-two");
+		expect(prior).toMatchObject({
+			requestId: "request-1",
+			provider: "provider-one",
+			model: "model-one",
+			headSizeBytes: Buffer.byteLength("PRIVATE SYSTEM") + Buffer.byteLength(JSON.stringify([{ name: "private" }])),
+			surfaces: {
+				messages: { sizeBytes: expect.any(Number), count: 1 },
+				system_prompt: { sizeBytes: Buffer.byteLength("PRIVATE SYSTEM") },
+				tools: { count: 1 },
+			},
+		});
+		for (const observation of observations.slice(firstObservation)) observation.priorSuccessfulRequest = prior;
+		instrumentation.completeRequest("request-2", false);
+
+		instrumentation.resetFinal();
+		instrumentation.observeFinal(second, second, 1, "stream_input");
+		const afterFailure = instrumentation.associateRequest("request-3", "provider-two", "model-two");
+		expect(afterFailure?.requestId).toBe("request-1");
+		for (const observation of observations.slice(firstObservation)) {
+			writer.appendOperation(createCacheOperationRecord(observation, instrumentation.epoch, 1, "a".repeat(32), "b".repeat(32)));
+		}
+		await writer.flush();
+		const directory = join(root, "cache-telemetry");
+		const contents = readdirSync(directory).map((name) => readFileSync(join(directory, name), "utf8")).join("");
+		const records = contents.split("\n").filter(Boolean).map((line) => JSON.parse(line).data);
+		expect(records[0]?.priorSuccessfulRequest).toEqual(prior);
+		expect(contents).not.toContain("PRIVATE FIRST PROMPT");
+		expect(contents).not.toContain("PRIVATE SYSTEM");
+		expect(contents).not.toContain("private");
+	} finally {
+		await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 it("marks accessor, unserializable, and oversized paths unavailable without invoking getters", () => {
 	const records: Array<{ reason: string; unavailableCause?: string }> = [];
 	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
