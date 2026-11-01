@@ -256,6 +256,22 @@ const MODELS = new Set([
 ]);
 const HEX_32 = /^[a-f0-9]{32}$/;
 const HEX_64 = /^[a-f0-9]{64}$/;
+// The producer labels a provider or model it does not recognize with a domain-separated
+// digest rather than its literal name (`stableLabelHash` in packages/ai). Those labels are
+// legitimate records, not malformed ones. Rejecting them was worse than a missing row: one
+// invalid record discards its whole batch, and the batch is the request plus its outcome,
+// so an unrecognized provider produced NO request and NO outcome telemetry at all. Measured
+// on the offline gate: every batch was `[cache_request(final_wire_body), cache_request_outcome]`
+// and every one was rejected on `provider-sha256:...`.
+const HASHED_LABEL = /^(?:provider|model)-sha256:[0-9a-f]{64}$/;
+
+function isProviderLabel(value: unknown): value is string {
+	return typeof value === "string" && (PROVIDERS.has(value) || HASHED_LABEL.test(value));
+}
+
+function isModelLabel(value: unknown): value is string {
+	return typeof value === "string" && (MODELS.has(value) || HASHED_LABEL.test(value));
+}
 
 function data(object: object, key: string): unknown {
 	const descriptor = Object.getOwnPropertyDescriptor(object, key);
@@ -294,10 +310,8 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 		const keyEpoch = data(source, "keyEpoch");
 		const segmentsInput = data(source, "segments");
 		if (
-			typeof provider !== "string" ||
-			!PROVIDERS.has(provider) ||
-			typeof model !== "string" ||
-			!MODELS.has(model) ||
+			!isProviderLabel(provider) ||
+			!isModelLabel(model) ||
 			typeof keyEpoch !== "string" ||
 			!HEX_32.test(keyEpoch) ||
 			!Array.isArray(segmentsInput) ||

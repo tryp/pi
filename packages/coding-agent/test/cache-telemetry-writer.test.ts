@@ -365,6 +365,31 @@ describe("local cache telemetry writer", () => {
 		expect(writer.getStats().serializationErrors).toBe(3);
 	});
 
+	it("accepts the producer's hashed provider and model labels", async () => {
+		// packages/ai hashes a provider/model it does not recognize. The writer must accept that
+		// label: rejecting it discarded the request AND its sibling outcome, so an unrecognized
+		// provider produced no request or outcome telemetry at all.
+		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-hashed-"));
+		tempDirs.push(root);
+		const writer = await createLocalCacheTelemetryWriter(root);
+		const hashed = (kind: "provider" | "model") => `${kind}-sha256:${"a".repeat(64)}`;
+		writer.append({
+			...requestRecord(),
+			provider: hashed("provider"),
+			model: hashed("model"),
+		} as CacheTelemetryRequestRecord);
+		writer.append({ ...requestRecord(), provider: "provider-sha256:short" } as CacheTelemetryRequestRecord);
+		await writer.flush();
+
+		const directory = join(root, "cache-telemetry");
+		const entries = await readdir(directory);
+		const saved = await readFile(join(directory, entries[0]!), "utf8");
+		expect(JSON.parse(saved).data.provider).toBe(hashed("provider"));
+		expect(JSON.parse(saved).data.model).toBe(hashed("model"));
+		// A near-miss (wrong digest length) is still malformed: the allowance is exact.
+		expect(writer.getStats().serializationErrors).toBe(1);
+	});
+
 	it("forwards bounded provider-v2 request metadata descriptor-safely and accepts fractional operation durations", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-v2-fields-"));
 		tempDirs.push(root);
