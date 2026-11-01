@@ -61,9 +61,7 @@ export function getCacheMissLabel(miss: CacheMiss): string {
 				case "comparison_truncated":
 					return "Cache miss (prefix identical in the compared window; remainder truncated)";
 				default:
-					// The bare label was the complaint: it reads as "unexplained" even when the
-					// reason is that no comparable request was recorded at all.
-					return "Cache miss (no comparable request recorded)";
+					return "Cache miss (cause not identified from comparison telemetry)";
 			}
 	}
 }

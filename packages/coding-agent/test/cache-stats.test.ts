@@ -220,11 +220,23 @@ describe("detectCacheMiss", () => {
 		expect(detectCacheMiss([entry(turn1), entry(turn2)], healthy, models)).toBeUndefined();
 	});
 
-	it("returns undefined for the first turn of a session", () => {
+	it("does not report a miss without a prior request", () => {
 		expect(detectCacheMiss([], turn1, models)).toBeUndefined();
 	});
 
-	it("keeps unexplained labels and suppresses sub-threshold notices", () => {
+	it("labels unknown attribution without claiming a missing comparison", () => {
+		const comparableMiss = detectCacheMiss(
+			[entry(turn1), entry(turn2)],
+			assistant({ cacheWrite: 110_000, cost: { cacheWrite: 0.4125 }, timestamp: 120_000 }),
+			models,
+		);
+		expect(comparableMiss?.reason).toBe("unexplained");
+		const label = getCacheMissLabel(comparableMiss!);
+		expect(label).toBe("Cache miss (cause not identified from comparison telemetry)");
+		expect(label).not.toContain("no comparable request");
+	});
+
+	it("suppresses sub-threshold notices", () => {
 		const miss = {
 			missedTokens: 19_999,
 			attribution: { kind: "unknown" as const },
@@ -234,7 +246,6 @@ describe("detectCacheMiss", () => {
 			reason: "unexplained" as const,
 			anchorEntryId: undefined,
 		};
-		expect(getCacheMissLabel(miss)).toBe("Cache miss (no comparable request recorded)");
 		expect(shouldShowCacheMissNotice(miss)).toBe(false);
 		expect(shouldShowCacheMissNotice({ ...miss, missedCost: 0.1 })).toBe(true);
 		expect(shouldShowCacheMissNotice({ ...miss, missedTokens: 20_000 })).toBe(true);
