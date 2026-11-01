@@ -114,18 +114,20 @@ export function classifyCacheMissComparison(
 				.filter((reason) => reason !== undefined && reason !== "unavailable"),
 		),
 	];
-	const inputWasRewritten =
-		operationChanges?.inputCount === "shrunk" ||
-		(operationChanges?.input === "changed" && operationChanges.inputCount === "same");
-	if (rewriteReasons.length || (changedSegment?.name === "message" && inputWasRewritten)) {
+	const previousSegmentCount = request.previousSegmentCount;
+	// An observed difference inside the predecessor is a rewrite of history: an appended segment
+	// always sits *after* the common prefix, so it can never be the one that differs. The
+	// `operationChanges` heuristic only names a rewrite the instrumentation happened to record;
+	// the difference itself is the evidence, and the notice says "history rewritten" when no
+	// annotation explains it.
+	if (typeof previousSegmentCount === "number" && common < previousSegmentCount)
 		return { kind: "messages_rewritten", reasons: rewriteReasons };
-	}
+	if (rewriteReasons.length) return { kind: "messages_rewritten", reasons: rewriteReasons };
 	// Every request that appends a message grows its segment list, so requiring the common
 	// prefix to cover the *current* request made this branch unreachable for anything but a
 	// re-sent identical request. What explains a miss with an unchanged prefix is the prefix
 	// being unchanged: everything the predecessor sent was still identical at the front, and
 	// the extra segments are new content appended after it.
-	const previousSegmentCount = request.previousSegmentCount;
 	const prefixIdentical =
 		typeof previousSegmentCount === "number" && previousSegmentCount > 0 && common >= previousSegmentCount;
 	if (prefixIdentical) {

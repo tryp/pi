@@ -234,7 +234,7 @@ describe("detectCacheMiss", () => {
 			reason: "unexplained" as const,
 			anchorEntryId: undefined,
 		};
-		expect(getCacheMissLabel(miss)).toBe("Cache miss");
+		expect(getCacheMissLabel(miss)).toBe("Cache miss (no comparable request recorded)");
 		expect(shouldShowCacheMissNotice(miss)).toBe(false);
 		expect(shouldShowCacheMissNotice({ ...miss, missedCost: 0.1 })).toBe(true);
 		expect(shouldShowCacheMissNotice({ ...miss, missedTokens: 20_000 })).toBe(true);

@@ -563,8 +563,8 @@ describe("cache miss attribution", () => {
 		truncated.previousSegmentCount = 2;
 		truncated.truncatedSegmentCount = 37;
 		expect(classifyCacheMissComparison(truncated)).toEqual({ kind: "comparison_truncated" });
-		// A request that kept fewer segments than its predecessor has a changed prefix somewhere the
-		// comparison stopped before reaching, so nothing may be claimed.
+		// A request that kept fewer segments than its predecessor differed *inside* the predecessor,
+		// which is a rewrite of history however the list happened to be capped.
 		const shrunk = mutableRequestRecord();
 		shrunk.segments = [
 			{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
@@ -573,7 +573,7 @@ describe("cache miss attribution", () => {
 		shrunk.prefixComparable = true;
 		shrunk.previousCommonPrefixSegments = 2;
 		shrunk.previousSegmentCount = 3;
-		expect(classifyCacheMissComparison(shrunk)).toEqual({ kind: "unknown" });
+		expect(classifyCacheMissComparison(shrunk)).toEqual({ kind: "messages_rewritten", reasons: [] });
 		expect(classifyCacheMissComparison(requestRecord())).toEqual({ kind: "unknown" });
 		const noPredecessor = mutableRequestRecord();
 		noPredecessor.prefixComparable = true;
