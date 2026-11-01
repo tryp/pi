@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CacheTelemetryRequestRecord } from "../../ai/src/cache-telemetry.ts";
+import type { CacheTelemetryRecord, CacheTelemetryRequestRecord } from "../../ai/src/cache-telemetry.ts";
 import type { CacheOperationObservation, CacheOperationRecord } from "../src/core/cache-operations.ts";
 import {
 	CacheMissAttributionTracker,
@@ -163,6 +163,104 @@ function operationRecord(): CacheOperationRecord {
 	};
 }
 
+function providerCacheRequest(requestId: string): Mutable<CacheTelemetryRequestRecord> {
+	const request = mutableRequestRecord();
+	request.requestId = requestId;
+	request.provider = "openai-codex";
+	request.phase = "canonical_body";
+	request.cacheKeyPresent = true;
+	request.cacheIdentityMatch = true;
+	request.prefixComparable = true;
+	request.comparisonBasis = "complete";
+	request.previousSegmentCount = 2;
+	request.previousCommonPrefixSegments = 2;
+	request.truncatedSegmentCount = 0;
+	request.segments = [
+		{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) },
+		{ name: "message", byteLength: 10, hmacSha256: "b".repeat(64) },
+		{ name: "message", byteLength: 10, hmacSha256: "c".repeat(64) },
+	];
+	request.operationChanges = {
+		cacheIdentity: "unchanged",
+		instructions: "unchanged",
+		tools: "unchanged",
+		toolOrder: "unchanged",
+		model: "unchanged",
+		reasoning: "unchanged",
+		requestOptions: "unchanged",
+		input: "changed",
+		inputCardinality: "unchanged",
+		inputCount: "grown",
+	};
+	return request;
+}
+
+function providerCacheOperation(
+	requestId: string,
+	surface: CacheOperationRecord["surface"],
+	reason: CacheOperationRecord["reason"] = "unchanged",
+): CacheOperationRecord {
+	return {
+		...operationRecord(),
+		requestId,
+		surface,
+		reason,
+		beforeCount: 2,
+		afterCount: reason === "append" ? 3 : 2,
+		comparisonScope: "across_requests",
+		comparisonBasis: "prior_available",
+	};
+}
+
+async function writeCacheMissRecords(records: readonly (CacheTelemetryRecord | CacheOperationRecord)[]) {
+	const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-verdict-"));
+	tempDirs.push(root);
+	const writer = await createLocalCacheTelemetryWriter(root);
+	for (const record of records) {
+		if (record.kind === "cache_context_operation") writer.appendOperation(record);
+		else writer.append(record);
+	}
+	await writer.flush();
+	const directory = join(root, "cache-telemetry");
+	const files = await readdir(directory);
+	return (await readFile(join(directory, files[0]!), "utf8"))
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line).data as Record<string, unknown>);
+}
+
+async function writeCacheMissRecordsInThreeBatches(
+	request: CacheTelemetryRequestRecord | undefined,
+	operations: readonly CacheOperationRecord[],
+	outcome: CacheTelemetryRecord,
+) {
+	const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-verdict-batches-"));
+	tempDirs.push(root);
+	const writer = await createLocalCacheTelemetryWriter(root);
+	if (request) writer.appendBatch([request]);
+	if (operations.length > 0) writer.appendBatch(operations as unknown as CacheTelemetryRecord[]);
+	writer.appendBatch([outcome]);
+	await writer.flush();
+	const directory = join(root, "cache-telemetry");
+	const files = await readdir(directory);
+	const records = (await readFile(join(directory, files[0]!), "utf8"))
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line).data as Record<string, unknown>);
+	return { records, stats: writer.getStats() };
+}
+
+function providerCacheOutcome(requestId: string, input: number, cacheRead: number): CacheTelemetryRecord {
+	return {
+		schemaVersion: 2,
+		kind: "cache_request_outcome",
+		requestId,
+		attemptId: "abcdef0123456789abcdef0123456789",
+		outcome: "success",
+		normalizedUsage: { input, cacheRead },
+	} as CacheTelemetryRecord;
+}
+
 describe("local cache telemetry writer", () => {
 	it("rejects a cache telemetry symlink before chmod or write", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-symlink-"));
@@ -202,6 +300,9 @@ describe("local cache telemetry writer", () => {
 		expect(writer.getStats()).toEqual({
 			queueDrops: 2,
 			serializationErrors: 0,
+			missVerdictsSkipped: 0,
+			missComparisonOperationDrops: 0,
+			missComparisonRequestOverwrites: 0,
 			writeErrors: 0,
 			prunedFiles: 0,
 			prunedBytes: 0,
@@ -353,6 +454,9 @@ describe("local cache telemetry writer", () => {
 		expect(writer.getStats()).toEqual({
 			queueDrops: 0,
 			serializationErrors: 0,
+			missVerdictsSkipped: 0,
+			missComparisonOperationDrops: 0,
+			missComparisonRequestOverwrites: 0,
 			writeErrors: 0,
 			prunedFiles: 0,
 			prunedBytes: 0,
@@ -481,6 +585,124 @@ describe("local cache telemetry writer", () => {
 });
 
 describe("cache miss attribution", () => {
+	it("joins request, operation batch and outcome across three appendBatch calls", async () => {
+		const requestId = "55555555555555555555555555555555";
+		const result = await writeCacheMissRecordsInThreeBatches(
+			providerCacheRequest(requestId),
+			[
+				providerCacheOperation(requestId, "messages", "append"),
+				providerCacheOperation(requestId, "system_prompt"),
+				providerCacheOperation(requestId, "tools"),
+			],
+			providerCacheOutcome(requestId, 11_800, 0),
+		);
+		const outcome = result.records.find((record) => record.kind === "cache_request_outcome");
+		expect(outcome).toMatchObject({ cacheMissVerdict: "provider_cache" });
+		expect(result.stats.missVerdictsSkipped).toBe(0);
+	});
+
+	it("counts an outcome whose request comparison was never recorded", async () => {
+		const requestId = "66666666666666666666666666666666";
+		const result = await writeCacheMissRecordsInThreeBatches(
+			undefined,
+			[],
+			providerCacheOutcome(requestId, 11_800, 0),
+		);
+		const outcome = result.records.find((record) => record.kind === "cache_request_outcome");
+		expect(outcome).not.toHaveProperty("cacheMissVerdict");
+		expect(result.stats.missVerdictsSkipped).toBe(1);
+	});
+
+	it("counts operation-list overflow and repeated request ids", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-verdict-caps-"));
+		tempDirs.push(root);
+		const writer = await createLocalCacheTelemetryWriter(root);
+		const requestId = "77777777777777777777777777777777";
+		writer.appendBatch([providerCacheRequest(requestId)]);
+		writer.appendBatch([providerCacheRequest(requestId)]);
+		for (let index = 0; index < 65; index++) {
+			writer.appendOperation(providerCacheOperation(requestId, "messages"));
+		}
+		writer.append(providerCacheOutcome(requestId, 11_800, 0));
+		await writer.flush();
+		expect(writer.getStats().missComparisonRequestOverwrites).toBe(1);
+		expect(writer.getStats().missComparisonOperationDrops).toBe(1);
+	});
+
+	it("writes provider_cache for a large zero-read miss with complete unchanged/append comparisons", async () => {
+		const requestId = "11111111111111111111111111111111";
+		const saved = await writeCacheMissRecords([
+			providerCacheRequest(requestId),
+			providerCacheOperation(requestId, "messages", "append"),
+			providerCacheOperation(requestId, "system_prompt"),
+			providerCacheOperation(requestId, "tools"),
+			providerCacheOutcome(requestId, 11_800, 0),
+		]);
+		const outcome = saved.find((record) => record.kind === "cache_request_outcome");
+		expect(outcome).toMatchObject({
+			schemaVersion: 2,
+			kind: "cache_request_outcome",
+			requestId,
+			cacheMissVerdict: "provider_cache",
+			normalizedUsage: { input: 11_800, cacheRead: 0 },
+		});
+	});
+
+	it("does not label a request with a history rewrite as provider_cache", async () => {
+		const requestId = "22222222222222222222222222222222";
+		const saved = await writeCacheMissRecords([
+			providerCacheRequest(requestId),
+			providerCacheOperation(requestId, "messages", "history_rewrite"),
+			providerCacheOperation(requestId, "system_prompt"),
+			providerCacheOperation(requestId, "tools"),
+			providerCacheOutcome(requestId, 11_800, 0),
+		]);
+		const outcome = saved.find((record) => record.kind === "cache_request_outcome");
+		expect(outcome).not.toHaveProperty("cacheMissVerdict");
+	});
+
+	it("keeps a miss unknown when any surface has no comparator", async () => {
+		const requestId = "33333333333333333333333333333333";
+		const unavailable = {
+			...providerCacheOperation(requestId, "messages", "unavailable"),
+			unavailableCause: "no_prior_request" as const,
+			comparisonBasis: "prior_unavailable" as const,
+		};
+		const saved = await writeCacheMissRecords([
+			providerCacheRequest(requestId),
+			unavailable,
+			providerCacheOperation(requestId, "system_prompt"),
+			providerCacheOperation(requestId, "tools"),
+			providerCacheOutcome(requestId, 11_800, 0),
+		]);
+		const outcome = saved.find((record) => record.kind === "cache_request_outcome");
+		expect(outcome).not.toHaveProperty("cacheMissVerdict");
+	});
+
+	it("excludes a cold first request above the threshold when no predecessor exists", async () => {
+		const requestId = "44444444444444444444444444444444";
+		const cold = providerCacheRequest(requestId);
+		cold.prefixComparable = false;
+		cold.comparisonBasis = undefined;
+		cold.comparisonUnavailableCause = "no_predecessor";
+		cold.previousCommonPrefixSegments = 0;
+		cold.previousSegmentCount = undefined;
+		const firstRequestOperation = (surface: CacheOperationRecord["surface"]) => ({
+			...providerCacheOperation(requestId, surface, "unavailable"),
+			unavailableCause: "no_prior_request" as const,
+			comparisonBasis: "first_request" as const,
+		});
+		const saved = await writeCacheMissRecords([
+			cold,
+			firstRequestOperation("messages"),
+			firstRequestOperation("system_prompt"),
+			firstRequestOperation("tools"),
+			providerCacheOutcome(requestId, 11_800, 0),
+		]);
+		const outcome = saved.find((record) => record.kind === "cache_request_outcome");
+		expect(outcome).not.toHaveProperty("cacheMissVerdict");
+	});
+
 	it("classifies changed prompt segments and recorded message rewrites", () => {
 		const system = mutableRequestRecord();
 		system.segments = [

@@ -18,7 +18,17 @@ interface CacheMissComparison {
 	operations: CacheOperationObservation[];
 }
 
-const MAX_MISS_COMPARISONS = 32;
+type CacheTelemetryOutcomeRecord = Extract<CacheTelemetryRecord, { kind: "cache_request_outcome" }> & {
+	cacheMissVerdict?: "provider_cache";
+};
+
+const PROVIDER_CACHE_MISS_MIN_INPUT = 1_000;
+const REQUIRED_CACHE_MISS_SURFACES = ["messages", "system_prompt", "tools"] as const;
+// Separate bounded maps: the tracker serves notice attribution; the writer joins telemetry records.
+const MAX_WRITER_MISS_COMPARISONS = 32;
+const MAX_TRACKED_MISS_COMPARISONS = 32;
+// A request may emit multiple operation observations; cap retained state per request independently of map size.
+const MAX_WRITER_MISS_OPERATIONS = 64;
 
 /**
  * How long a completed request's comparison may still label a miss.
@@ -48,7 +58,7 @@ export class CacheMissAttributionTracker {
 			comparison = { operations: [] };
 			this.comparisons.set(requestId, comparison);
 			// Keep a fixed window: a late outcome must not grow this per-session map.
-			while (this.comparisons.size > MAX_MISS_COMPARISONS) {
+			while (this.comparisons.size > MAX_TRACKED_MISS_COMPARISONS) {
 				const oldest = this.comparisons.keys().next().value;
 				if (oldest === undefined) break;
 				this.comparisons.delete(oldest);
@@ -149,6 +159,9 @@ export interface LocalCacheTelemetryWriter {
 	getStats(): Readonly<{
 		queueDrops: number;
 		serializationErrors: number;
+		missVerdictsSkipped: number;
+		missComparisonOperationDrops: number;
+		missComparisonRequestOverwrites: number;
 		writeErrors: number;
 		prunedFiles: number;
 		prunedBytes: number;
@@ -662,6 +675,72 @@ async function pruneTelemetryDirectory(directory: string): Promise<{ files: numb
 	return outcome;
 }
 
+function isProviderCacheMiss(
+	request: CacheTelemetryRequestRecord,
+	operations: readonly CacheOperationObservation[],
+	outcome: CacheTelemetryOutcomeRecord,
+): boolean {
+	const usage = outcome.normalizedUsage;
+	if (outcome.outcome !== "success" || usage?.cacheRead !== 0 || (usage.input ?? 0) <= PROVIDER_CACHE_MISS_MIN_INPUT)
+		return false;
+	if (
+		request.phase !== "canonical_body" ||
+		request.cacheKeyPresent !== true ||
+		request.cacheIdentityMatch !== true ||
+		request.prefixComparable !== true ||
+		request.fingerprintStatus !== "ok" ||
+		request.comparisonBasis !== "complete" ||
+		request.comparisonUnavailableCause !== undefined ||
+		(request.previousSegmentCount ?? 0) < 1 ||
+		(request.previousCommonPrefixSegments ?? 0) < (request.previousSegmentCount ?? 0) ||
+		(request.truncatedSegmentCount ?? 0) !== 0
+	) {
+		return false;
+	}
+
+	// Inputs may append/grow, but every other comparable request dimension must be unchanged.
+	const changes = request.operationChanges;
+	if (
+		!changes ||
+		changes.cacheIdentity !== "unchanged" ||
+		changes.instructions !== "unchanged" ||
+		changes.tools !== "unchanged" ||
+		changes.toolOrder !== "unchanged" ||
+		changes.model !== "unchanged" ||
+		changes.reasoning !== "unchanged" ||
+		changes.requestOptions !== "unchanged" ||
+		changes.inputCardinality !== "unchanged" ||
+		(changes.input !== "unchanged" && changes.input !== "changed") ||
+		(changes.inputCount !== "same" && changes.inputCount !== "grown") ||
+		(changes.input === "changed" && changes.inputCount !== "grown")
+	) {
+		return false;
+	}
+
+	if (operations.length === 0) return false;
+	const observedSurfaces = new Set<string>();
+	const comparedSurfaces = new Set<string>();
+	for (const operation of operations) {
+		if (
+			(operation.reason !== "unchanged" && operation.reason !== "append") ||
+			operation.unavailableCause !== undefined ||
+			(operation.comparisonScope !== "within_request" && operation.comparisonScope !== "across_requests")
+		) {
+			return false;
+		}
+		observedSurfaces.add(operation.surface);
+		if (operation.comparisonScope === "across_requests") {
+			if (operation.comparisonBasis !== "prior_available") return false;
+			comparedSurfaces.add(operation.surface);
+		}
+	}
+	// Require the three request-wide surfaces and a prior comparator for every observed surface.
+	return (
+		REQUIRED_CACHE_MISS_SURFACES.every((surface) => comparedSurfaces.has(surface)) &&
+		[...observedSurfaces].every((surface) => comparedSurfaces.has(surface))
+	);
+}
+
 export async function createLocalCacheTelemetryWriter(agentDir: string): Promise<LocalCacheTelemetryWriter> {
 	const directory = join(agentDir, "cache-telemetry");
 	await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -680,20 +759,58 @@ export async function createLocalCacheTelemetryWriter(agentDir: string): Promise
 	let pending = 0;
 	let queueDrops = 0;
 	let serializationErrors = 0;
+	let missVerdictsSkipped = 0;
+	let missComparisonOperationDrops = 0;
+	let missComparisonRequestOverwrites = 0;
 	let writeErrors = 0;
 	let closed = false;
 	let closePromise: Promise<void> | undefined;
 	let chain = Promise.resolve();
+	let missComparisons = new Map<string, CacheMissComparison>();
 	const appendBatch = (records: readonly CacheTelemetryRecord[]): boolean => {
 		if (closed || records.length === 0 || records.length > 3 || pending + records.length > MAX_PENDING_RECORDS) {
 			queueDrops = Math.min(1_000_000_000, queueDrops + 1);
 			return false;
 		}
 		const lines: string[] = [];
+		const nextMissComparisons = new Map(missComparisons);
+		let skippedVerdicts = 0;
+		let droppedOperations = 0;
+		let overwrittenRequests = 0;
 		try {
 			for (const record of records) {
-				const safeRecord = sanitizeRecord(record);
+				let safeRecord = sanitizeRecord(record);
 				if (!safeRecord) throw new Error("invalid telemetry record");
+				const requestId = safeRecord.requestId;
+				const recordKind = (safeRecord as { kind: string }).kind;
+				if (recordKind === "cache_request" && (safeRecord as CacheTelemetryRequestRecord).phase === "canonical_body") {
+					const previous = nextMissComparisons.get(requestId);
+					if (previous) overwrittenRequests++;
+					nextMissComparisons.set(requestId, {
+						request: safeRecord as CacheTelemetryRequestRecord,
+						operations: previous?.operations ?? [],
+					});
+				} else if (recordKind === "cache_context_operation") {
+					const previous = nextMissComparisons.get(requestId);
+					if (previous && previous.operations.length < MAX_WRITER_MISS_OPERATIONS) {
+						nextMissComparisons.set(requestId, {
+							...previous,
+							operations: [...previous.operations, safeRecord as unknown as CacheOperationObservation],
+						});
+					} else if (previous) {
+						droppedOperations++;
+					}
+				} else if (recordKind === "cache_request_outcome") {
+					const comparison = nextMissComparisons.get(requestId);
+					if (!comparison?.request) {
+						skippedVerdicts++;
+					} else if (
+						isProviderCacheMiss(comparison.request, comparison.operations, safeRecord as CacheTelemetryOutcomeRecord)
+					) {
+						safeRecord = { ...(safeRecord as CacheTelemetryOutcomeRecord), cacheMissVerdict: "provider_cache" } as CacheTelemetryOutcomeRecord;
+					}
+					nextMissComparisons.delete(requestId);
+				}
 				const line = JSON.stringify({
 					type: "custom",
 					customType: "pi.session_diagnostic",
@@ -706,6 +823,15 @@ export async function createLocalCacheTelemetryWriter(agentDir: string): Promise
 		} catch {
 			serializationErrors = Math.min(1_000_000_000, serializationErrors + 1);
 			return false;
+		}
+		missVerdictsSkipped = Math.min(1_000_000_000, missVerdictsSkipped + skippedVerdicts);
+		missComparisonOperationDrops = Math.min(1_000_000_000, missComparisonOperationDrops + droppedOperations);
+		missComparisonRequestOverwrites = Math.min(1_000_000_000, missComparisonRequestOverwrites + overwrittenRequests);
+		missComparisons = nextMissComparisons;
+		while (missComparisons.size > MAX_WRITER_MISS_COMPARISONS) {
+			const oldest = missComparisons.keys().next().value;
+			if (oldest === undefined) break;
+			missComparisons.delete(oldest);
 		}
 		pending += lines.length;
 		chain = chain.then(async () => {
@@ -746,6 +872,9 @@ export async function createLocalCacheTelemetryWriter(agentDir: string): Promise
 			return {
 				queueDrops,
 				serializationErrors,
+				missVerdictsSkipped,
+				missComparisonOperationDrops,
+				missComparisonRequestOverwrites,
 				writeErrors,
 				prunedFiles: pruned.files,
 				prunedBytes: pruned.bytes,

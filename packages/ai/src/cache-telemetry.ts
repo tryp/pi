@@ -118,6 +118,7 @@ export interface CacheTelemetryOutcomeRecord {
 	readonly requestId: string;
 	readonly attemptId: string;
 	readonly outcome: "success" | "failed" | "aborted";
+	readonly cacheMissVerdict?: "provider_cache";
 	readonly normalizedUsage?: Readonly<
 		Partial<Record<"input" | "output" | "cacheRead" | "cacheWrite" | "cacheWrite1h", number>>
 	>;
