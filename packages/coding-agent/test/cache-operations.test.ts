@@ -115,10 +115,24 @@ it("reports cyclic messages as unavailable with a specific cause", () => {
 	expect(records[0]).toMatchObject({ reason: "unavailable", unavailableCause: "cyclic" });
 });
 
-it("reports bounded message snapshots as over_budget with content-free size counters", () => {
+it("digests complete long message text without retaining the body", () => {
 	const records: CacheOperationObservation[] = [];
 	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
-	const oversized = messages("x".repeat(128 * 1024 + 1));
+	const longText = "x".repeat(128 * 1024 + 1);
+	instrumentation.observeHandler(messages(longText), messages(longText), 0, 1);
+
+	expect(records[0]).toMatchObject({ surface: "messages", operation: "handler", reason: "unchanged" });
+	expect(JSON.stringify(records[0])).not.toContain("x".repeat(32));
+
+	const changedTail = `${longText.slice(0, -1)}y`;
+	instrumentation.observeHandler(messages(longText), messages(changedTail), 1, 2);
+	expect(records[1]).toMatchObject({ surface: "messages", operation: "handler", reason: "history_rewrite" });
+});
+
+it("keeps snapshots over the whole-snapshot text budget incomplete", () => {
+	const records: CacheOperationObservation[] = [];
+	const instrumentation = createCacheOperationInstrumentation((record) => records.push(record));
+	const oversized = messages("x".repeat(4 * 1024 * 1024 + 1));
 	instrumentation.observeHandler(messages("before"), oversized, 0, 1);
 
 	const record = records[0];
@@ -126,7 +140,7 @@ it("reports bounded message snapshots as over_budget with content-free size coun
 		surface: "messages",
 		operation: "handler",
 		reason: "over_budget",
-		unavailableCause: "over_budget",
+		unavailableCause: "snapshot_budget_exhausted",
 		snapshotNodes: expect.any(Number),
 		snapshotTextBytes: expect.any(Number),
 	});
@@ -142,13 +156,13 @@ it("persists over-budget reason and size counters through telemetry validation",
 				createCacheOperationRecord(observation, instrumentation.epoch, 1, "a".repeat(32), "b".repeat(32)),
 			);
 		});
-		instrumentation.observeHandler(messages("before"), messages("x".repeat(128 * 1024 + 1)), 0, 1);
+		instrumentation.observeHandler(messages("before"), messages("x".repeat(4 * 1024 * 1024 + 1)), 0, 1);
 		await writer.flush();
 		const directory = join(root, "cache-telemetry");
 		const saved = JSON.parse(readFileSync(join(directory, readdirSync(directory)[0]!), "utf8")).data;
-		expect(saved).toMatchObject({ reason: "over_budget", unavailableCause: "over_budget" });
+		expect(saved).toMatchObject({ reason: "over_budget", unavailableCause: "snapshot_budget_exhausted" });
 		expect(saved.snapshotNodes).toEqual(expect.any(Number));
-		expect(saved.snapshotTextBytes).toBeGreaterThan(128 * 1024);
+		expect(saved.snapshotTextBytes).toBeGreaterThan(4 * 1024 * 1024);
 	} finally {
 		await writer.flush();
 		rmSync(root, { recursive: true, force: true });
@@ -540,8 +554,8 @@ it("reports prior_unavailable when the previous request kept no usable surface",
 		cyclic.self = cyclic;
 		const tooManyTools = Array.from({ length: 257 }, () => ({ name: "bash" }));
 		instrumentation.observeFinal(
-			context([cyclic], "x".repeat(200 * 1024), tooManyTools),
-			context([cyclic], "x".repeat(200 * 1024), tooManyTools),
+			context([cyclic], "x".repeat(4 * 1024 * 1024 + 1), tooManyTools),
+			context([cyclic], "x".repeat(4 * 1024 * 1024 + 1), tooManyTools),
 			1,
 			"stream_input",
 		);
@@ -561,17 +575,15 @@ it("reports prior_unavailable when the previous request kept no usable surface",
 			}
 		}
 		const acrossRequests = saved.filter((record) => record.comparisonScope === "across_requests");
-		// The second request emits three across_requests surfaces: one per surface, all comparing
-		// against a predecessor that kept nothing usable.
-		const secondRequest = acrossRequests.slice(-3);
-		expect(secondRequest.map((record) => record.surface).sort()).toEqual(["messages", "system_prompt", "tools"]);
+		// The oversized prompt, malformed messages, and over-wide tools remain unavailable; no
+		// capped fingerprint is promoted to a complete comparison.
+		const secondRequest = acrossRequests.slice(-2);
+		expect(secondRequest.map((record) => record.surface).sort()).toEqual(["messages", "tools"]);
 		expect(secondRequest.map((record) => record.comparisonBasis)).toEqual([
-			"prior_unavailable",
-			"prior_unavailable",
-			"prior_unavailable",
+			"prior_available",
+			"prior_available",
 		]);
 		expect(secondRequest.map((record) => record.unavailableCause)).toEqual([
-			"prior_surface_unavailable",
 			"prior_surface_unavailable",
 			"prior_surface_unavailable",
 		]);

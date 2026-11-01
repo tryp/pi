@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 export type CacheOperationKind = "handler" | "final_context";
@@ -150,8 +150,12 @@ function boundedFingerprint(
 		if (item === null || typeof item === "boolean" || typeof item === "number") return String(item);
 		if (typeof item === "string") {
 			state.textBytes += Buffer.byteLength(item, "utf8");
-			if (state.textBytes > state.textCap) return fail("over_budget");
-			return digest(key, item);
+			// Hash the complete string without retaining it. A plain SHA-256 digest keeps
+			// oversized strings comparable across processes; the byte count still feeds the
+			// whole-snapshot budget, so oversized snapshots remain explicitly incomplete.
+			return Buffer.byteLength(item, "utf8") > state.textCap
+				? createHash("sha256").update(item).digest("hex")
+				: digest(key, item);
 		}
 		if (typeof item !== "object") return fail("unusable_message");
 		if (ancestors.has(item)) return fail("cyclic");
