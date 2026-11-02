@@ -846,7 +846,7 @@ function isProviderCacheMiss(
 
 export async function createLocalCacheTelemetryWriter(
 	agentDir: string,
-	sessionId?: string,
+	getSessionId?: () => string | undefined,
 ): Promise<LocalCacheTelemetryWriter> {
 	const directory = join(agentDir, "cache-telemetry");
 	await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -885,7 +885,8 @@ export async function createLocalCacheTelemetryWriter(
 		let overwrittenRequests = 0;
 		try {
 			for (const record of records) {
-				const recordWithSessionId = sessionId ? { ...record, sessionId } : record;
+				const sessionId = getSessionId?.();
+				const recordWithSessionId = getSessionId ? { ...record, sessionId } : record;
 				let safeRecord = sanitizeRecord(recordWithSessionId);
 				if (!safeRecord) throw new Error("invalid telemetry record");
 				const requestId = safeRecord.requestId;

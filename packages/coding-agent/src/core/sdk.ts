@@ -258,7 +258,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
-	const cacheTelemetrySessionId = sessionManager.getSessionFile() ? sessionManager.getSessionId() : undefined;
+	const getCacheTelemetrySessionId = () =>
+		sessionManager.getSessionFile() ? sessionManager.getSessionId() : undefined;
 	let cacheTelemetry: CacheTelemetryObserver | undefined;
 	let cacheMissAttributionTracker: CacheMissAttributionTracker | undefined;
 	let disposeCacheTelemetry: (() => Promise<void>) | undefined;
@@ -281,7 +282,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		cacheTelemetrySetting === "no";
 	if (!cacheTelemetryDisabled) {
 		try {
-			const writer = await createLocalCacheTelemetryWriter(agentDir, cacheTelemetrySessionId);
+			const writer = await createLocalCacheTelemetryWriter(agentDir, getCacheTelemetrySessionId);
 			cacheMissAttributionTracker = new CacheMissAttributionTracker();
 			const observer = createCacheTelemetrySession(
 				(record: CacheTelemetryRecord) => {
@@ -334,7 +335,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								sequence,
 								ids.requestId,
 								ids.attemptId,
-								cacheTelemetrySessionId,
+								getCacheTelemetrySessionId(),
 							),
 						);
 					}

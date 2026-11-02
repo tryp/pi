@@ -282,6 +282,31 @@ function providerCacheOutcome(requestId: string, input: number, cacheRead: numbe
 }
 
 describe("local cache telemetry writer", () => {
+	it("reads the current session ID supplier for each emitted record", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-session-id-"));
+		tempDirs.push(root);
+		let currentSessionId: string | undefined = "11111111111111111111111111111111";
+		const writer = await createLocalCacheTelemetryWriter(root, () => currentSessionId);
+		writer.append(requestRecord());
+		currentSessionId = "22222222222222222222222222222222";
+		writer.append(requestRecord());
+		currentSessionId = undefined;
+		writer.append({ ...requestRecord(), sessionId: "11111111111111111111111111111111" } as CacheTelemetryRecord);
+		await writer.flush();
+
+		const directory = join(root, "cache-telemetry");
+		const files = await readdir(directory);
+		const records = (await readFile(join(directory, files[0]!), "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line).data as Record<string, unknown>);
+		expect(records.map((record) => record.sessionId)).toEqual([
+			"11111111111111111111111111111111",
+			"22222222222222222222222222222222",
+			undefined,
+		]);
+	});
+
 	it("rejects a cache telemetry symlink before chmod or write", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-symlink-"));
 		const target = join(root, "target");

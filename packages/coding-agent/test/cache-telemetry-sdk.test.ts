@@ -7,6 +7,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { expect, it, vi } from "vitest";
 import type { CacheTelemetryObserver } from "../../ai/src/cache-telemetry.ts";
 import { ContextGuardError } from "../src/core/agent-session.ts";
+import { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { estimateProviderContextTokens } from "../src/core/compaction/compaction.ts";
 import { convertToLlm } from "../src/core/messages.ts";
@@ -165,17 +166,25 @@ async function createOfflineCodexSession(
 		resourceLoader,
 		noTools: "all",
 	});
-	return { session, token, sessionManager };
+	return {
+		session,
+		token,
+		sessionManager,
+		extensionsResult: resourceLoader.getExtensions(),
+		services: { cwd, agentDir, modelRuntime, settingsManager, resourceLoader, diagnostics: [] },
+	};
 }
 
 function cacheOperationRecords(agentDir: string): Array<Record<string, unknown>> {
 	const directory = join(agentDir, "cache-telemetry");
-	const filename = readdirSync(directory).find((name) => name.endsWith(".jsonl"));
-	if (!filename) throw new Error("Cache telemetry sidecar was not written");
-	return readFileSync(join(directory, filename), "utf8")
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => JSON.parse(line).data as Record<string, unknown>);
+	const filenames = readdirSync(directory).filter((name) => name.endsWith(".jsonl"));
+	if (filenames.length === 0) throw new Error("Cache telemetry sidecar was not written");
+	return filenames.flatMap((filename) =>
+		readFileSync(join(directory, filename), "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line).data as Record<string, unknown>),
+	);
 }
 
 function recordFailedCacheAttempt(session: Awaited<ReturnType<typeof createOfflineCodexSession>>["session"]): void {
@@ -189,7 +198,7 @@ function recordFailedCacheAttempt(session: Awaited<ReturnType<typeof createOffli
 		payload: {},
 		wirePayload: "{}",
 	});
-	observer.observeOutcome({ ...ids, outcome: "error" });
+	observer.observeOutcome({ ...ids, outcome: "failed" });
 }
 
 it("links telemetry to each persisted session and omits linkage for no-session sessions", async () => {
@@ -249,6 +258,98 @@ it("links telemetry to each persisted session and omits linkage for no-session s
 		expect(noSessionRecords.every((record) => !Object.hasOwn(record, "sessionId"))).toBe(true);
 	} finally {
 		for (const session of sessions) await session.dispose();
+		vi.unstubAllGlobals();
+		if (previousTelemetry === undefined) delete process.env.PI_CACHE_TELEMETRY;
+		else process.env.PI_CACHE_TELEMETRY = previousTelemetry;
+		for (const writer of capturedWriters.values) await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+it("tracks the current session ID through new-session and resume replacements", async () => {
+	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
+	process.env.PI_CACHE_TELEMETRY = "1";
+	const root = mkdtempSync(join(tmpdir(), "pi-sdk-cache-session-replacement-"));
+	const agentDir = join(root, "agent");
+	const cwd = join(root, "project");
+	mkdirSync(agentDir, { recursive: true });
+	mkdirSync(cwd, { recursive: true });
+	vi.stubGlobal("fetch", offlineCodexFetch([]));
+	let runtime: AgentSessionRuntime | undefined;
+	let disposed = false;
+	try {
+		const initialManager = SessionManager.create(cwd, join(agentDir, "sessions"));
+		const initial = await createOfflineCodexSession(agentDir, cwd, 390_000, undefined, false, undefined, initialManager);
+		initial.session.agent.transport = "sse";
+		const initialId = initialManager.getSessionId();
+		const initialSessionFile = initialManager.getSessionFile();
+		if (!initialSessionFile) throw new Error("Initial session is not persisted");
+
+		runtime = new AgentSessionRuntime(initial.session, initial.services, async ({ cwd, agentDir, sessionManager }) => {
+			const created = await createOfflineCodexSession(
+				agentDir,
+				cwd,
+				390_000,
+				undefined,
+				false,
+				undefined,
+				sessionManager,
+			);
+			created.session.agent.transport = "sse";
+			return {
+				session: created.session,
+				extensionsResult: created.extensionsResult,
+				services: created.services,
+				diagnostics: [],
+			};
+		});
+
+		await runtime.session.prompt("initial session request");
+		await runtime.newSession();
+		const newId = runtime.session.sessionManager.getSessionId();
+		expect(newId).not.toBe(initialId);
+		const initialRequestIds = new Set(
+			cacheOperationRecords(agentDir)
+				.filter((record) => record.sessionId === initialId && record.kind === "cache_request")
+				.map((record) => record.requestId),
+		);
+		expect(initialRequestIds.size).toBeGreaterThan(0);
+
+		await runtime.session.prompt("new session request");
+		await runtime.switchSession(initialSessionFile);
+		expect(runtime.session.sessionManager.getSessionId()).toBe(initialId);
+		const newSessionRequestIds = new Set(
+			cacheOperationRecords(agentDir)
+				.filter((record) => record.sessionId === newId && record.kind === "cache_request")
+				.map((record) => record.requestId),
+		);
+		expect(newSessionRequestIds.size).toBeGreaterThan(0);
+
+		await runtime.session.prompt("resumed session request");
+		await runtime.dispose();
+		disposed = true;
+
+		const records = cacheOperationRecords(agentDir);
+		const resumedRequestIds = new Set(
+			records
+				.filter(
+					(record) =>
+						record.sessionId === initialId &&
+						record.kind === "cache_request" &&
+						typeof record.requestId === "string" &&
+						!initialRequestIds.has(record.requestId),
+				)
+				.map((record) => record.requestId),
+		);
+		expect(resumedRequestIds.size).toBeGreaterThan(0);
+		for (const sessionId of [initialId, newId]) {
+			const sessionRecords = records.filter((record) => record.sessionId === sessionId);
+			expect(sessionRecords.some((record) => record.kind === "cache_request")).toBe(true);
+			expect(sessionRecords.some((record) => record.kind === "cache_request_outcome")).toBe(true);
+			expect(sessionRecords.some((record) => record.kind === "cache_context_operation")).toBe(true);
+		}
+	} finally {
+		if (runtime && !disposed) await runtime.dispose();
 		vi.unstubAllGlobals();
 		if (previousTelemetry === undefined) delete process.env.PI_CACHE_TELEMETRY;
 		else process.env.PI_CACHE_TELEMETRY = previousTelemetry;
