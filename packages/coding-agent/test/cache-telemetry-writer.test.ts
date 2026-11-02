@@ -92,6 +92,7 @@ type OptionalRequestField = Exclude<
  * on the way to disk without anybody noticing.
  */
 const optionalRequestFields: Record<OptionalRequestField, unknown> = {
+	sessionId: "0123456789abcdef0123456789abcdef",
 	continuationPresent: true,
 	deltaGenerated: false,
 	deltaEmpty: false,
@@ -112,6 +113,7 @@ const optionalRequestFields: Record<OptionalRequestField, unknown> = {
 	},
 	postHookInputCardinality: "nonempty",
 	postHookInputCount: 12,
+	labelsSuppressed: { provider: false, model: true },
 	comparisonUnavailableCause: "predecessor_not_recorded",
 	comparisonBasis: "bounded_truncated",
 	previousSegmentCount: 128,
@@ -134,6 +136,7 @@ type OptionalOperationField = Exclude<
 >;
 
 const optionalOperationFields: Record<OptionalOperationField, unknown> = {
+	sessionId: "0123456789abcdef0123456789abcdef",
 	handlerIndex: 0,
 	annotation: { reason: "sidecar_gate", counters: { considered: 2, changed: 1 } },
 	comparisonScope: "across_requests",
@@ -143,7 +146,24 @@ const optionalOperationFields: Record<OptionalOperationField, unknown> = {
 	stopReasonCounts: { stop: 1, length: 0, toolUse: 0, error: 0, aborted: 0, unknown: 0 },
 	unavailableCause: "no_prior_request",
 	observedCount: 5,
+	failureIndex: 2,
+	failureType: "error",
+	failureConstructor: null,
+	failurePath: "$.messages[2]",
+	snapshotNodes: 3,
+	snapshotTextBytes: 12,
 	comparisonBasis: "prior_unavailable",
+	priorSuccessfulRequest: {
+		requestId: "0123456789abcdef0123456789abcdef",
+		provider: "openai-codex",
+		model: "gpt-5.4",
+		headSizeBytes: 128,
+		surfaces: {
+			messages: { id: null, sizeBytes: 96, count: 1 },
+			system_prompt: { id: "system-hash", sizeBytes: 16, count: 1 },
+			tools: { id: "tools-hash", sizeBytes: 16, count: 1 },
+		},
+	},
 };
 
 function operationRecord(): CacheOperationRecord {

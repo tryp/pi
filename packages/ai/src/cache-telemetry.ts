@@ -60,6 +60,8 @@ export interface CacheTelemetrySegment {
 export interface CacheTelemetryRequestRecord {
 	readonly schemaVersion: 2;
 	readonly kind: "cache_request";
+	/** Session identity is attached by the coding-agent when it persists this record. */
+	readonly sessionId?: string;
 	readonly requestId: string;
 	readonly attemptId: string;
 	readonly keyEpoch: string;
@@ -115,6 +117,8 @@ export function classifyCacheTelemetryRawField(
 export interface CacheTelemetryOutcomeRecord {
 	readonly schemaVersion: 2;
 	readonly kind: "cache_request_outcome";
+	/** Session identity is attached by the coding-agent when it persists this record. */
+	readonly sessionId?: string;
 	readonly requestId: string;
 	readonly attemptId: string;
 	readonly outcome: "success" | "failed" | "aborted";

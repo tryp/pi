@@ -257,6 +257,8 @@ export function enforceRequestContextBudget(
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
+	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	const cacheTelemetrySessionId = sessionManager.getSessionFile() ? sessionManager.getSessionId() : undefined;
 	let cacheTelemetry: CacheTelemetryObserver | undefined;
 	let cacheMissAttributionTracker: CacheMissAttributionTracker | undefined;
 	let disposeCacheTelemetry: (() => Promise<void>) | undefined;
@@ -279,7 +281,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		cacheTelemetrySetting === "no";
 	if (!cacheTelemetryDisabled) {
 		try {
-			const writer = await createLocalCacheTelemetryWriter(agentDir);
+			const writer = await createLocalCacheTelemetryWriter(agentDir, cacheTelemetrySessionId);
 			cacheMissAttributionTracker = new CacheMissAttributionTracker();
 			const observer = createCacheTelemetrySession(
 				(record: CacheTelemetryRecord) => {
@@ -332,6 +334,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								sequence,
 								ids.requestId,
 								ids.attemptId,
+								cacheTelemetrySessionId,
 							),
 						);
 					}
@@ -357,7 +360,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
-	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });

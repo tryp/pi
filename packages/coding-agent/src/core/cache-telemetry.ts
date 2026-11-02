@@ -288,6 +288,15 @@ function exactId(value: unknown): value is string {
 	return typeof value === "string" && value.length === 32 && HEX_32.test(value);
 }
 
+function validSessionId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= 128 &&
+		/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(value)
+	);
+}
+
 function boundedCount(value: unknown, max = 1_000_000_000_000): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= max;
 }
@@ -302,7 +311,13 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 	const kind = data(source, "kind");
 	const requestId = data(source, "requestId");
 	const attemptId = data(source, "attemptId");
-	if (!exactId(requestId) || !exactId(attemptId)) return undefined;
+	const sessionId = data(source, "sessionId");
+	if (
+		!exactId(requestId) ||
+		!exactId(attemptId) ||
+		(sessionId !== undefined && !validSessionId(sessionId))
+	)
+		return undefined;
 
 	if (kind === "cache_request") {
 		const provider = data(source, "provider");
@@ -370,6 +385,7 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 		const output: Record<string, unknown> = {
 			schemaVersion: 2,
 			kind,
+			...(sessionId === undefined ? {} : { sessionId }),
 			requestId,
 			attemptId,
 			keyEpoch,
@@ -388,6 +404,14 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 			previousCommonPrefixSegments,
 			truncatedSegmentCount,
 		};
+		const labelsSuppressedInput = data(source, "labelsSuppressed");
+		if (labelsSuppressedInput !== undefined) {
+			const labelsSuppressed = plain(labelsSuppressedInput);
+			const providerSuppressed = labelsSuppressed && data(labelsSuppressed, "provider");
+			const modelSuppressed = labelsSuppressed && data(labelsSuppressed, "model");
+			if (typeof providerSuppressed !== "boolean" || typeof modelSuppressed !== "boolean") return undefined;
+			output.labelsSuppressed = { provider: providerSuppressed, model: modelSuppressed };
+		}
 		for (const field of ["continuationPresent", "deltaGenerated", "deltaEmpty", "fellBackToFull"] as const) {
 			const value = data(source, field);
 			if (value !== undefined) {
@@ -498,6 +522,7 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 		const output: Record<string, unknown> = {
 			schemaVersion: 2,
 			kind,
+			...(sessionId === undefined ? {} : { sessionId }),
 			requestId,
 			attemptId,
 			epoch,
@@ -646,7 +671,14 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 	if (kind !== "cache_request_outcome") return undefined;
 	const outcome = data(source, "outcome");
 	if (typeof outcome !== "string" || !OUTCOMES.has(outcome)) return undefined;
-	const output: Record<string, unknown> = { schemaVersion: 2, kind, requestId, attemptId, outcome };
+	const output: Record<string, unknown> = {
+		schemaVersion: 2,
+		kind,
+		...(sessionId === undefined ? {} : { sessionId }),
+		requestId,
+		attemptId,
+		outcome,
+	};
 	const usage = plain(data(source, "normalizedUsage"));
 	if (usage) {
 		const normalizedUsage: Record<string, number> = {};
@@ -812,7 +844,10 @@ function isProviderCacheMiss(
 	);
 }
 
-export async function createLocalCacheTelemetryWriter(agentDir: string): Promise<LocalCacheTelemetryWriter> {
+export async function createLocalCacheTelemetryWriter(
+	agentDir: string,
+	sessionId?: string,
+): Promise<LocalCacheTelemetryWriter> {
 	const directory = join(agentDir, "cache-telemetry");
 	await mkdir(directory, { recursive: true, mode: 0o700 });
 	const directoryStat = await lstat(directory);
@@ -850,7 +885,8 @@ export async function createLocalCacheTelemetryWriter(agentDir: string): Promise
 		let overwrittenRequests = 0;
 		try {
 			for (const record of records) {
-				let safeRecord = sanitizeRecord(record);
+				const recordWithSessionId = sessionId ? { ...record, sessionId } : record;
+				let safeRecord = sanitizeRecord(recordWithSessionId);
 				if (!safeRecord) throw new Error("invalid telemetry record");
 				const requestId = safeRecord.requestId;
 				const recordKind = (safeRecord as { kind: string }).kind;

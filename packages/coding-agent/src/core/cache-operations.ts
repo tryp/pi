@@ -72,6 +72,7 @@ export interface CacheOperationAnnotationData {
 export interface CacheOperationRecord {
 	schemaVersion: 2;
 	kind: "cache_context_operation";
+	sessionId?: string;
 	requestId: string;
 	attemptId: string;
 	epoch: string;
@@ -1091,6 +1092,16 @@ export function createCacheOperationRecord(
 	sequence: number,
 	requestId: string,
 	attemptId: string,
+	sessionId?: string,
 ): CacheOperationRecord {
-	return { schemaVersion: 2, kind: "cache_context_operation", epoch, sequence, requestId, attemptId, ...observation };
+	return {
+		schemaVersion: 2,
+		kind: "cache_context_operation",
+		epoch,
+		sequence,
+		requestId,
+		attemptId,
+		...(sessionId ? { sessionId } : {}),
+		...observation,
+	};
 }

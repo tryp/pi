@@ -114,12 +114,12 @@ async function createOfflineCodexSession(
 	contextAnchor = "synthetic context anchor",
 	enableCompaction = false,
 	injectedMessages?: AgentMessage[],
+	sessionManager: SessionManager = SessionManager.inMemory(cwd),
 ) {
 	const settingsManager = SettingsManager.inMemory({
 		transport: "sse",
 		compaction: { enabled: enableCompaction, maxContextTokens, reserveTokens: 0, keepRecentTokens: 0 },
 	});
-	const sessionManager = SessionManager.inMemory(cwd);
 	const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 	const jwtPayload = Buffer.from(
 		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "offline-test-account" } }),
@@ -165,7 +165,7 @@ async function createOfflineCodexSession(
 		resourceLoader,
 		noTools: "all",
 	});
-	return { session, token };
+	return { session, token, sessionManager };
 }
 
 function cacheOperationRecords(agentDir: string): Array<Record<string, unknown>> {
@@ -191,6 +191,71 @@ function recordFailedCacheAttempt(session: Awaited<ReturnType<typeof createOffli
 	});
 	observer.observeOutcome({ ...ids, outcome: "error" });
 }
+
+it("links telemetry to each persisted session and omits linkage for no-session sessions", async () => {
+	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
+	process.env.PI_CACHE_TELEMETRY = "1";
+	const root = mkdtempSync(join(tmpdir(), "pi-sdk-cache-session-link-"));
+	const sessions: Array<Awaited<ReturnType<typeof createOfflineCodexSession>>["session"]> = [];
+	vi.stubGlobal("fetch", offlineCodexFetch([]));
+	try {
+		const createLinkedSession = async (name: string) => {
+			const agentDir = join(root, name, "agent");
+			const cwd = join(root, name, "project");
+			mkdirSync(agentDir, { recursive: true });
+			mkdirSync(cwd, { recursive: true });
+			const manager = SessionManager.create(cwd, join(agentDir, "sessions"));
+			const created = await createOfflineCodexSession(agentDir, cwd, 390_000, undefined, false, undefined, manager);
+			sessions.push(created.session);
+			created.session.agent.transport = "sse";
+			return created;
+		};
+
+		const first = await createLinkedSession("first");
+		const second = await createLinkedSession("second");
+		const firstId = first.sessionManager.getSessionId();
+		const secondId = second.sessionManager.getSessionId();
+		expect(firstId).not.toBe(secondId);
+
+		await Promise.all([
+			first.session.prompt("first session request"),
+			second.session.prompt("second session request"),
+		]);
+		await Promise.all([first.session.dispose(), second.session.dispose()]);
+
+		for (const [agentDir, expectedId] of [
+			[join(root, "first", "agent"), firstId],
+			[join(root, "second", "agent"), secondId],
+		] as const) {
+			const records = cacheOperationRecords(agentDir);
+			expect(records.length).toBeGreaterThan(0);
+			expect(records.every((record) => record.sessionId === expectedId)).toBe(true);
+			expect(records.some((record) => record.kind === "cache_request")).toBe(true);
+			expect(records.some((record) => record.kind === "cache_request_outcome")).toBe(true);
+			expect(records.some((record) => record.kind === "cache_context_operation")).toBe(true);
+		}
+
+		const noSessionAgentDir = join(root, "no-session", "agent");
+		const noSessionCwd = join(root, "no-session", "project");
+		mkdirSync(noSessionAgentDir, { recursive: true });
+		mkdirSync(noSessionCwd, { recursive: true });
+		const noSession = await createOfflineCodexSession(noSessionAgentDir, noSessionCwd, 390_000);
+		sessions.push(noSession.session);
+		noSession.session.agent.transport = "sse";
+		await noSession.session.prompt("ephemeral request");
+		await noSession.session.dispose();
+		const noSessionRecords = cacheOperationRecords(noSessionAgentDir);
+		expect(noSessionRecords.length).toBeGreaterThan(0);
+		expect(noSessionRecords.every((record) => !Object.hasOwn(record, "sessionId"))).toBe(true);
+	} finally {
+		for (const session of sessions) await session.dispose();
+		vi.unstubAllGlobals();
+		if (previousTelemetry === undefined) delete process.env.PI_CACHE_TELEMETRY;
+		else process.env.PI_CACHE_TELEMETRY = previousTelemetry;
+		for (const writer of capturedWriters.values) await writer.flush();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
 it("compares the first retry request with the failed attempt's final context", async () => {
 	const previousTelemetry = process.env.PI_CACHE_TELEMETRY;
