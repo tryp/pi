@@ -76,8 +76,14 @@ export interface CacheTelemetryRequestRecord {
 	readonly cacheIdentityMatch: boolean | null;
 	readonly fingerprintStatus: "ok" | "truncated" | "unavailable";
 	readonly segments: readonly CacheTelemetrySegment[];
-	/** SHA-256 of the exact UTF-8 wire payload, when it is within the fingerprint byte limit. */
+	/** SHA-256 of the exact UTF-8 wire payload, including payloads too large to fingerprint. */
 	readonly wirePayloadSha256?: string;
+	/** Comparison-time digest equality; null when either request lacks a whole-body digest. */
+	readonly previousWirePayloadSha256Match?: boolean | null;
+	/** Whether retained tails align as an append, a rewrite, or cannot be aligned. */
+	readonly previousTailMatch?: "aligned_append" | "aligned_rewrite" | "unknown";
+	/** Current tail distance to the first differing segment; present only for aligned_rewrite. */
+	readonly tailChangedFromEnd?: number;
 	/** Total classified segments before sampling or byte-budget drops. */
 	readonly segmentCount?: number;
 	/** Retained segments aligned from the start of the payload. */
@@ -107,6 +113,8 @@ export interface CacheTelemetryRequestRecord {
 	readonly comparisonBasis?: CacheTelemetryComparisonBasis;
 	/** Segments the predecessor retained, so a partial comparison reads as partial. */
 	readonly previousSegmentCount?: number;
+	/** Head segments retained by the predecessor, when comparison metadata is available. */
+	readonly previousKeptHead?: number;
 }
 
 export interface CacheTelemetryRawField {
@@ -610,7 +618,17 @@ export function createCacheTelemetrySession(
 	} catch {
 		/* unavailable fingerprints are reported without affecting requests */
 	}
-	const previousByLane = new Map<string, { digests: readonly string[]; bounded: boolean }>();
+	const previousByLane = new Map<
+		string,
+		{
+			digests: readonly string[];
+			bounded: boolean;
+			wirePayloadSha256?: string;
+			segmentCount?: number;
+			keptHead?: number;
+			keptTail?: number;
+		}
+	>();
 	/**
 	 * Lanes whose predecessor could not be fingerprinted. Kept so the next comparable record can
 	 * name `predecessor_not_recorded` instead of reporting a zero-length common prefix, which is
@@ -677,9 +695,9 @@ export function createCacheTelemetrySession(
 					// SDK-facing request objects may contain arbitrary getters/extension data, so they are
 					// deliberately unavailable. Only provider-produced serialized JSON is bounded before parsing.
 					if (typeof input.wirePayload !== "string") throw new Error("provider wire payload unavailable");
+					wirePayloadSha256 = createHash("sha256").update(input.wirePayload).digest("hex");
 					if (utf8Length(input.wirePayload, MAX_TOTAL_BYTES) > MAX_TOTAL_BYTES)
 						throw new Error("bounded provider wire payload unavailable");
-					wirePayloadSha256 = createHash("sha256").update(input.wirePayload).digest("hex");
 					const parsedPayload: unknown = JSON.parse(input.wirePayload);
 					const classified = classifyPayload(parsedPayload);
 					segmentCount = classified.segmentCount;
@@ -783,6 +801,10 @@ export function createCacheTelemetrySession(
 					let comparisonBasis: CacheTelemetryComparisonBasis | undefined;
 					let comparisonUnavailableCause: CacheTelemetryComparisonUnavailableCause | undefined;
 					let previousSegmentCount: number | undefined;
+					let previousKeptHead: number | undefined;
+					let previousWirePayloadSha256Match: boolean | null = null;
+					let previousTailMatch: CacheTelemetryRequestRecord["previousTailMatch"] = "unknown";
+					let tailChangedFromEnd: number | undefined;
 					let postHookInputCardinality: CacheTelemetryInputCardinality | undefined =
 						phase === "canonical_body" && payloadMode === "full" ? "unknown" : undefined;
 					let postHookInputCount: number | undefined;
@@ -912,12 +934,43 @@ export function createCacheTelemetrySession(
 								// and align the retained tail from its end. Never compare a tail item by absolute index.
 								const previous = previousByLane.get(lane);
 								previousSegmentCount = previous?.digests.length ?? 0;
+								previousKeptHead = previous?.keptHead;
 								if (!previous) {
 									// A zero here is not a broken prefix: nothing was available to compare against.
 									comparisonUnavailableCause = resetLanes.has(lane)
 										? "predecessor_not_recorded"
 										: "no_predecessor";
 								} else {
+									previousWirePayloadSha256Match =
+										previous.wirePayloadSha256 !== undefined && wirePayloadSha256 !== undefined
+											? previous.wirePayloadSha256 === wirePayloadSha256
+											: null;
+									const canAlignTail =
+										typeof segmentCount === "number" &&
+										typeof keptHead === "number" &&
+										typeof keptTail === "number" &&
+										typeof previous.segmentCount === "number" &&
+										typeof previous.keptHead === "number" &&
+										typeof previous.keptTail === "number" &&
+										keptTail > 0 &&
+										previous.keptTail > 0;
+									if (canAlignTail) {
+										const shift = segmentCount! - previous.segmentCount!;
+										const overlap = Math.min(previous.keptTail!, keptTail! - Math.max(0, shift));
+										if (shift >= 0 && overlap > 0) {
+											for (let distance = 0; distance < overlap; distance++) {
+												const previousIndex = previous.digests.length - 1 - distance;
+												const currentIndex = segments.length - 1 - distance - shift;
+												if (previous.digests[previousIndex] !== segments[currentIndex]?.hmacSha256) {
+													previousTailMatch = "aligned_rewrite";
+													tailChangedFromEnd = distance + shift;
+													break;
+												}
+											}
+											if (tailChangedFromEnd === undefined)
+												previousTailMatch = "aligned_append";
+										}
+									}
 									while (
 										previousCommonPrefixSegments < segments.length &&
 										previousCommonPrefixSegments < previous.digests.length &&
@@ -935,6 +988,10 @@ export function createCacheTelemetrySession(
 								previousByLane.set(lane, {
 									digests: segments.map((segment) => segment.hmacSha256),
 									bounded: fingerprintStatus === "truncated",
+									...(wirePayloadSha256 === undefined ? {} : { wirePayloadSha256 }),
+									...(segmentCount === undefined ? {} : { segmentCount }),
+									...(keptHead === undefined ? {} : { keptHead }),
+									...(keptTail === undefined ? {} : { keptTail }),
 								});
 								resetLanes.delete(lane);
 							}
@@ -983,6 +1040,10 @@ export function createCacheTelemetrySession(
 						...(comparisonUnavailableCause === undefined ? {} : { comparisonUnavailableCause }),
 						...(comparisonBasis === undefined ? {} : { comparisonBasis }),
 						...(previousSegmentCount === undefined ? {} : { previousSegmentCount }),
+						...(previousKeptHead === undefined ? {} : { previousKeptHead }),
+						previousWirePayloadSha256Match,
+						previousTailMatch,
+						...(tailChangedFromEnd === undefined ? {} : { tailChangedFromEnd }),
 						...(postHookInputCount === undefined ? {} : { postHookInputCount }),
 						...(continuationPresent !== undefined ? { continuationPresent } : {}),
 						...(deltaGenerated !== undefined ? { deltaGenerated } : {}),

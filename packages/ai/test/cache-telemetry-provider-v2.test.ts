@@ -714,10 +714,10 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 			await telemetry.observer.flush();
 			return { request: requestRecords(telemetry.records).at(-1)!, wirePayload };
 		};
-		const makeBody = (tail = "unchanged", middle = "unchanged") => ({
+		const makeBody = (tail = "unchanged", middle = "unchanged", count = 200) => ({
 			model: "gpt-6-luna",
 			instructions: "system prompt",
-			input: Array.from({ length: 200 }, (_, index) => ({
+			input: Array.from({ length: count }, (_, index) => ({
 				role: "user",
 				content: `message ${index}: ${index === 100 ? middle : index === 199 ? tail : "unchanged"}`,
 			})),
@@ -742,15 +742,35 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 		// The middle remains intentionally omitted, but the changed tail is explicit evidence rather
 		// than an undifferentiated truncation-only record.
 		expect(changedTail.request.fingerprintStatus).toBe("truncated");
+		expect(changedTail.request.previousTailMatch).toBe("aligned_rewrite");
+		expect(changedTail.request.tailChangedFromEnd).toBe(0);
+		expect(changedTail.request.previousWirePayloadSha256Match).toBe(false);
+
+		const appended = await observe(makeBody("rewritten tail", "unchanged", 201));
+		expect(appended.request.previousTailMatch).toBe("aligned_append");
+		expect(appended.request.previousSegmentCount).toBe(128);
 
 		const identical = await observe(makeBody());
 		expect(identical.request.wirePayloadSha256).toBe(first.request.wirePayloadSha256);
+		expect(identical.request.previousWirePayloadSha256Match).toBe(false);
 		expect(identical.request.segments).toEqual(first.request.segments);
+		const identicalAgain = await observe(makeBody());
+		expect(identicalAgain.request.previousWirePayloadSha256Match).toBe(true);
 
 		const changedMiddle = await observe(makeBody("unchanged", "rewritten middle"));
 		expect(changedMiddle.request.segments.slice(0, 64)).toEqual(first.request.segments.slice(0, 64));
 		expect(changedMiddle.request.segments.slice(64)).toEqual(first.request.segments.slice(64));
 		expect(changedMiddle.request.wirePayloadSha256).not.toBe(first.request.wirePayloadSha256);
+
+		const oversized = await observe({
+			model: "gpt-6-luna",
+			instructions: "x".repeat(4 * 1024 * 1024),
+			input: [],
+		});
+		expect(oversized.request.fingerprintStatus).toBe("unavailable");
+		expect(oversized.request.wirePayloadSha256).toBe(
+			createHash("sha256").update(oversized.wirePayload).digest("hex"),
+		);
 
 		const shortBody = {
 			model: "gpt-6-luna",
