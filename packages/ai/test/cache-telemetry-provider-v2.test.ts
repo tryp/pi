@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -684,7 +685,8 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 		expect(afterTruncation).toMatchObject({ comparisonBasis: "bounded_truncated" });
 		expect(afterTruncation?.comparisonUnavailableCause).toBeUndefined();
 		expect(afterTruncation?.previousSegmentCount).toBe(128);
-		expect(afterTruncation?.previousCommonPrefixSegments).toBe(128);
+		// The head aligns by prefix; tail items are intentionally aligned from the end instead.
+		expect(afterTruncation?.previousCommonPrefixSegments).toBe(64);
 
 		// A final-wire record is not comparison eligible, and now names that as the reason.
 		const wire = await observe(2, "final_wire_body");
@@ -694,6 +696,87 @@ describe("cache telemetry v2 provider transport fixtures", () => {
 			comparisonUnavailableCause: "not_comparison_eligible",
 		});
 		assertTelemetryPrivacy(telemetry.records);
+	});
+
+	it("keeps tail evidence and exact-body hashes for long payloads", async () => {
+		const telemetry = createTelemetryCollector();
+		const observe = async (payload: Record<string, unknown>) => {
+			const wirePayload = JSON.stringify(payload);
+			const ids = telemetry.observer.observeRequest({
+				provider: "openai-codex",
+				model: codexModel.id,
+				phase: "canonical_body",
+				transport: "sse",
+				payload,
+				wirePayload,
+			});
+			telemetry.observer.observeOutcome({ ...ids, outcome: "success" });
+			await telemetry.observer.flush();
+			return { request: requestRecords(telemetry.records).at(-1)!, wirePayload };
+		};
+		const makeBody = (tail = "unchanged", middle = "unchanged") => ({
+			model: "gpt-6-luna",
+			instructions: "system prompt",
+			input: Array.from({ length: 200 }, (_, index) => ({
+				role: "user",
+				content: `message ${index}: ${index === 100 ? middle : index === 199 ? tail : "unchanged"}`,
+			})),
+		});
+
+		const first = await observe(makeBody());
+		const changedTail = await observe(makeBody("rewritten tail"));
+		expect(first.request).toMatchObject({
+			segmentCount: 201,
+			keptHead: 64,
+			keptTail: 64,
+			middleSegmentCount: 73,
+			headDroppedForBudget: 0,
+		});
+		expect(first.request.wirePayloadSha256).toBe(createHash("sha256").update(first.wirePayload).digest("hex"));
+		expect(changedTail.request.wirePayloadSha256).not.toBe(first.request.wirePayloadSha256);
+		expect(changedTail.request.segments.slice(0, 64)).toEqual(first.request.segments.slice(0, 64));
+		const firstTail = first.request.segments.slice(first.request.keptHead);
+		const changedTailSegments = changedTail.request.segments.slice(changedTail.request.keptHead);
+		expect(changedTailSegments.slice(0, -1)).toEqual(firstTail.slice(0, -1));
+		expect(changedTailSegments.at(-1)?.hmacSha256).not.toBe(firstTail.at(-1)?.hmacSha256);
+		// The middle remains intentionally omitted, but the changed tail is explicit evidence rather
+		// than an undifferentiated truncation-only record.
+		expect(changedTail.request.fingerprintStatus).toBe("truncated");
+
+		const identical = await observe(makeBody());
+		expect(identical.request.wirePayloadSha256).toBe(first.request.wirePayloadSha256);
+		expect(identical.request.segments).toEqual(first.request.segments);
+
+		const changedMiddle = await observe(makeBody("unchanged", "rewritten middle"));
+		expect(changedMiddle.request.segments.slice(0, 64)).toEqual(first.request.segments.slice(0, 64));
+		expect(changedMiddle.request.segments.slice(64)).toEqual(first.request.segments.slice(64));
+		expect(changedMiddle.request.wirePayloadSha256).not.toBe(first.request.wirePayloadSha256);
+
+		const shortBody = {
+			model: "gpt-6-luna",
+			instructions: "system prompt",
+			input: Array.from({ length: 10 }, (_, index) => ({ role: "user", content: `short ${index}` })),
+		};
+		const shortFirst = await observe(shortBody);
+		const shortSecond = await observe(shortBody);
+		const expectedShortVector = [
+			{ name: "system", byteLength: Buffer.byteLength(JSON.stringify(shortBody.instructions)) },
+			...shortBody.input.map((message) => ({
+				name: "message",
+				byteLength: Buffer.byteLength(JSON.stringify(message)),
+			})),
+		];
+		expect(shortFirst.request.segments.map(({ name, byteLength }) => ({ name, byteLength }))).toEqual(
+			expectedShortVector,
+		);
+		expect(shortSecond.request.segments).toEqual(shortFirst.request.segments);
+		expect(shortFirst.request).toMatchObject({
+			segmentCount: 11,
+			keptHead: 11,
+			keptTail: 0,
+			middleSegmentCount: 0,
+			fingerprintStatus: "ok",
+		});
 	});
 
 	it("names an unfingerprintable predecessor instead of reporting a broken prefix", async () => {
