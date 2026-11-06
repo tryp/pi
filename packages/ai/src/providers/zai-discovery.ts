@@ -1,5 +1,6 @@
 import type { RefreshModelsContext } from "../models.ts";
 import type { Model, ThinkingLevel, ThinkingLevelMap } from "../types.ts";
+import { joinPublishedLimits } from "./limit-join.ts";
 import { getModelsDevCatalog, type ModelsDevCatalog, type ModelsDevModelEntry } from "./models-dev-client.ts";
 
 const ZAI_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
@@ -44,7 +45,7 @@ export function buildZaiModelsFromCatalog(
 
 		const reasoningOptions = entry.reasoning_options ?? [];
 		const thinkingLevelMap = getThinkingLevelMap(reasoningOptions);
-		models.push({
+		const model: Model<"openai-completions"> = {
 			id,
 			name: entry.name?.trim() || id,
 			api: "openai-completions",
@@ -67,7 +68,26 @@ export function buildZaiModelsFromCatalog(
 			},
 			contextWindow: entry.limit?.context ?? DEFAULT_CONTEXT_WINDOW,
 			maxTokens: entry.limit?.output ?? DEFAULT_MAX_TOKENS,
+		};
+		// The live models.dev entry carries a price but no request-wide tiers, so zai models gain
+		// their tier boundary from the compiled catalog row for the same id.
+		const fill = joinPublishedLimits({
+			provider: "zai",
+			id,
+			model,
+			...(entry.limit?.context ? { providerContextWindow: entry.limit.context } : {}),
+			...(entry.limit?.output ? { providerMaxTokens: entry.limit.output } : {}),
 		});
+		models.push(
+			fill
+				? {
+						...model,
+						...(fill.cost ? { cost: fill.cost } : {}),
+						costSource: fill.costSource,
+						...(fill.maxTokens !== undefined ? { maxTokens: fill.maxTokens } : {}),
+					}
+				: model,
+		);
 	}
 	return models;
 }

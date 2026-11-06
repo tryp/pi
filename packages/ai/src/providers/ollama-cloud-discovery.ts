@@ -42,6 +42,7 @@
 
 import type { RefreshModelsContext } from "../models.ts";
 import type { Model } from "../types.ts";
+import { joinPublishedLimits } from "./limit-join.ts";
 import { getModelsDevCatalog, type ModelsDevCatalog, type ModelsDevModelEntry } from "./models-dev-client.ts";
 import {
 	OLLAMA_CLOUD_BASE_URL,
@@ -116,7 +117,7 @@ function positiveOr(value: number | undefined, fallback: number): number {
 }
 
 function modelForEntry(entry: ModelsDevModelEntry, id: string): Model<"openai-completions"> {
-	return {
+	const model: Model<"openai-completions"> = {
 		id,
 		name: entry.name?.trim() || id,
 		api: "openai-completions",
@@ -134,6 +135,23 @@ function modelForEntry(entry: ModelsDevModelEntry, id: string): Model<"openai-co
 		compat: OLLAMA_CLOUD_COMPAT,
 		contextWindow: positiveOr(entry.limit?.context, OLLAMA_CLOUD_DEFAULT_CONTEXT_WINDOW),
 		maxTokens: positiveOr(entry.limit?.output, OLLAMA_CLOUD_DEFAULT_MAX_TOKENS),
+	};
+	// The live models.dev payload carries no request-wide price tiers, so a served id
+	// (`deepseek-v4.1-flash:1017`) or a vendor id whose row the compiled catalog has gains its
+	// tiers here. A colon-tagged id has no catalog row and is counted, not guessed.
+	const fill = joinPublishedLimits({
+		provider: OLLAMA_CLOUD_PROVIDER_ID,
+		id,
+		model,
+		...(entry.limit?.context ? { providerContextWindow: entry.limit.context } : {}),
+		...(entry.limit?.output ? { providerMaxTokens: entry.limit.output } : {}),
+	});
+	if (!fill) return model;
+	return {
+		...model,
+		...(fill.cost ? { cost: fill.cost } : {}),
+		costSource: fill.costSource,
+		...(fill.maxTokens !== undefined ? { maxTokens: fill.maxTokens } : {}),
 	};
 }
 

@@ -1,6 +1,7 @@
 import type { OAuthCredential } from "../auth/types.ts";
 import type { RefreshModelsContext } from "../models.ts";
 import type { Api, Model, ModelCost } from "../types.ts";
+import { joinPublishedLimits } from "./limit-join.ts";
 
 /**
  * The catalog is version-gated by Codex client version: pi's own 0.84.3 version returns an empty list,
@@ -89,8 +90,48 @@ function isOAuthCredential(credential: RefreshModelsContext["credential"]): cred
 	return credential?.type === "oauth" && typeof credential.access === "string" && credential.access.length > 0;
 }
 
+/**
+ * Enrich one discovered model from the compiled catalog.
+ *
+ * The Codex backend publishes a context window and nothing else, so every discovered model
+ * arrives unpriced. `joinPublishedLimits` fills the price (with its request-wide tiers) from
+ * the catalog row for the same id, labelling the provenance so a backend price and a joined
+ * price stay distinguishable. The backend window always wins; a disagreement is booked in
+ * the existing drift array rather than silently applied.
+ */
+function joinCodexModel(
+	model: Model<"openai-codex-responses">,
+	providerContextWindow: number | undefined,
+	curatedIds: ReadonlySet<string>,
+): Model<"openai-codex-responses"> {
+	const fill = joinPublishedLimits({
+		provider: "openai-codex",
+		id: model.id,
+		model,
+		...(providerContextWindow !== undefined ? { providerContextWindow } : {}),
+	});
+	if (!fill) return model;
+	// One drift array, two producers: the curated-vs-backend loop in `fetchCodexModels` already
+	// reports ids the curated catalog ships, so the join adds only the ids it alone can compare --
+	// a discovered model with no curated row, where the joined price row implies another window.
+	if (fill.windowDisagreement && !curatedIds.has(model.id)) {
+		codexCatalogDiscoveryStats.drift.push({
+			modelId: model.id,
+			backendContextWindow: fill.windowDisagreement.providerWindow,
+			curatedContextWindow: fill.windowDisagreement.catalogWindow,
+		});
+	}
+	return {
+		...model,
+		...(fill.cost ? { cost: fill.cost } : {}),
+		costSource: fill.costSource,
+		...(fill.maxTokens !== undefined ? { maxTokens: fill.maxTokens } : {}),
+	};
+}
+
 function buildCatalogModels(
 	response: CodexCatalogResponse,
+	curatedIds: ReadonlySet<string>,
 ): { models: Model<"openai-codex-responses">[]; contextWindows: Map<string, number> } {
 	if (!Array.isArray(response.models)) return { models: [], contextWindows: new Map() };
 	const models: Model<"openai-codex-responses">[] = [];
@@ -106,7 +147,7 @@ function buildCatalogModels(
 				? entry.context_window
 				: undefined;
 		if (contextWindow !== undefined) contextWindows.set(id, contextWindow);
-		models.push({
+		const model: Model<"openai-codex-responses"> = {
 			id,
 			name: typeof entry.display_name === "string" && entry.display_name.trim() ? entry.display_name : id,
 			...(typeof entry.description === "string" ? { description: entry.description } : {}),
@@ -120,7 +161,8 @@ function buildCatalogModels(
 			contextWindow: contextWindow ?? DEFAULT_CONTEXT_WINDOW,
 			contextWindowSource: contextWindow === undefined ? "default" : "backend",
 			maxTokens: Math.min(DEFAULT_MAX_TOKENS, contextWindow ?? DEFAULT_CONTEXT_WINDOW),
-		});
+		};
+		models.push(joinCodexModel(model, contextWindow, curatedIds));
 	}
 	return { models, contextWindows };
 }
@@ -227,12 +269,15 @@ export async function fetchCodexModels(
 			return retainFallback(context, staticModels);
 		}
 		if (!isRecord(data)) throw new Error("Codex catalog response is not an object");
-		const { models: backendModels, contextWindows } = buildCatalogModels(data as CodexCatalogResponse);
+		const curatedById = new Map(staticModels.map((model) => [model.id, model]));
+		const { models: backendModels, contextWindows } = buildCatalogModels(
+			data as CodexCatalogResponse,
+			new Set(curatedById.keys()),
+		);
 		if (backendModels.length === 0) {
 			codexCatalogDiscoveryStats.emptyVersionGated += 1;
 			return retainFallback(context, staticModels);
 		}
-		const curatedById = new Map(staticModels.map((model) => [model.id, model]));
 		for (const [modelId, backendContextWindow] of contextWindows) {
 			const curated = curatedById.get(modelId);
 			if (curated && curated.contextWindow !== backendContextWindow) {

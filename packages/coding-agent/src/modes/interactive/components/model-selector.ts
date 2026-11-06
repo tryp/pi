@@ -36,6 +36,40 @@ interface DefaultModelReference {
 type ModelScope = "all" | "scoped";
 
 /**
+ * One line of model facts: price and where it came from, plus the context window.
+ *
+ * A discovered model whose provider publishes no pricing carries an all-zero cost object.
+ * Rendering that as `$0 in` would claim the model is free, so it says the price is not
+ * published instead. A price joined from the compiled catalog is labelled with the provider
+ * it came from, because that price is informative and may lag or lead the provider's own.
+ */
+export function describeModelFacts(model: Model<any>): string {
+	const cost = model.cost;
+	const unpriced =
+		model.costSource === "unknown" ||
+		(cost.input === 0 &&
+			cost.output === 0 &&
+			cost.cacheRead === 0 &&
+			cost.cacheWrite === 0 &&
+			!(cost.tiers ?? []).length);
+	const parts: string[] = [];
+	if (unpriced) {
+		parts.push("price: not published by provider");
+	} else {
+		const source = model.costSource?.startsWith("catalog:")
+			? ` (models.dev via ${model.costSource.slice("catalog:".length)})`
+			: "";
+		parts.push(`price: $${cost.input}/$${cost.output} in/out per Mtok${source}`);
+		const boundaries = (cost.tiers ?? []).map((tier) => tier.inputTokensAbove).filter((value) => value > 0);
+		if (boundaries.length > 0) parts.push(`tiers at ${Math.min(...boundaries).toLocaleString()}`);
+	}
+	if (Number.isFinite(model.contextWindow) && model.contextWindow > 0) {
+		parts.push(`${model.contextWindow.toLocaleString()} ctx`);
+	}
+	return parts.join(" \u00b7 ");
+}
+
+/**
  * Component that renders a model selector with search
  */
 export class ModelSelectorComponent extends Container implements Focusable {
@@ -352,6 +386,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const selected = this.filteredModels[this.selectedIndex];
 			this.listContainer.addChild(new Spacer(1));
 			this.listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${selected.model.name}`), 0, 0));
+			this.listContainer.addChild(new Text(theme.fg("muted", `  ${describeModelFacts(selected.model)}`), 0, 0));
 		}
 		if (this.refreshStatusMessage) {
 			this.listContainer.addChild(new Spacer(1));

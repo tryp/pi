@@ -849,8 +849,14 @@ export interface Model<TApi extends Api> {
 	thinkingLevelMap?: ThinkingLevelMap;
 	input: ("text" | "image")[];
 	cost: ModelCost;
-	/** Explicitly marks discovered models whose provider does not publish pricing. */
-	costSource?: "unknown" | "known";
+	/**
+	 * Where the price came from. `unknown` marks a discovered model whose provider publishes no
+	 * pricing (the all-zero cost object is then a placeholder, not a price); `known` marks a price
+	 * the provider or the curated catalog states; `catalog:<provider>` marks a price joined at
+	 * runtime from the compiled catalog row for the same id under another provider, which is
+	 * informative rather than authoritative.
+	 */
+	costSource?: "unknown" | "known" | `catalog:${string}`;
 	contextWindow: number;
 	/** Provenance for dynamic context-window resolution when known. */
 	contextWindowSource?: "backend" | "stored" | "static" | "default";

@@ -86,8 +86,11 @@ describe("openai-codex dynamic discovery", () => {
 			input: ["text", "image"],
 			contextWindow: 500_000,
 		});
-		expect(latest?.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-		expect(latest?.costSource).toBe("unknown");
+		// The backend publishes no price at all, so the join fills it from the catalog row for the
+		// same id under the aliased vendor, and marks where it came from.
+		expect(latest?.costSource).toBe("catalog:openai");
+		expect(latest?.cost.input).toBeGreaterThan(0);
+		expect(firstTierBoundary(latest!)).toBe(272_000);
 		expect(models.map((model) => model.id)).toContain("codex-auto-review");
 	});
 
@@ -109,7 +112,10 @@ describe("openai-codex dynamic discovery", () => {
 		expect(models[0]?.cost.tiers).toEqual(STATIC_MODEL.cost.tiers);
 		expect(firstTierBoundary(models[0]!)).toBe(272_000);
 		expect(models[1]).toEqual(STORED_MODEL);
+		// Two producers, one array: the join reports ids with no curated row (gpt-6.1-sol, whose
+		// catalog price row implies a different window) and the curated loop reports the rest.
 		expect(codexCatalogDiscoveryStats.drift).toEqual([
+			{ modelId: "gpt-6.1-sol", backendContextWindow: 500_000, curatedContextWindow: 1_050_000 },
 			{ modelId: "gpt-5.6-luna", backendContextWindow: 300_000, curatedContextWindow: 272_000 },
 		]);
 	});
