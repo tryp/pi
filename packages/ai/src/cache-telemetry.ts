@@ -27,8 +27,8 @@ export type CacheTelemetryComparisonUnavailableCause =
 	| "no_predecessor"
 	| "predecessor_not_recorded";
 /**
- * How exact a recorded comparison is. A truncated fingerprint retains only a prefix of the
- * payload, so its common-prefix count is a lower bound rather than the whole answer.
+ * How exact a recorded comparison is. A bounded fingerprint omits middle segments and retains
+ * the head and tail; its common-prefix count covers only the head-first alignment.
  */
 export type CacheTelemetryComparisonBasis = "complete" | "bounded_truncated";
 export type CacheTelemetryFallbackReason =
@@ -76,6 +76,18 @@ export interface CacheTelemetryRequestRecord {
 	readonly cacheIdentityMatch: boolean | null;
 	readonly fingerprintStatus: "ok" | "truncated" | "unavailable";
 	readonly segments: readonly CacheTelemetrySegment[];
+	/** SHA-256 of the exact UTF-8 wire payload, when it is within the fingerprint byte limit. */
+	readonly wirePayloadSha256?: string;
+	/** Total classified segments before sampling or byte-budget drops. */
+	readonly segmentCount?: number;
+	/** Retained segments aligned from the start of the payload. */
+	readonly keptHead?: number;
+	/** Retained segments aligned from the end of the payload. */
+	readonly keptTail?: number;
+	/** Segments omitted between the retained head and tail. */
+	readonly middleSegmentCount?: number;
+	/** Head segments omitted to preserve the tail under the total-byte budget. */
+	readonly headDroppedForBudget?: number;
 	readonly prefixComparable: boolean;
 	/** Present when bounded telemetry labels hide a provider or model id; otherwise absent. */
 	readonly labelsSuppressed?: Readonly<{ provider: boolean; model: boolean }>;
@@ -245,6 +257,8 @@ export function observeCacheOutcomeSafely(
 }
 
 const MAX_SEGMENTS = 128;
+const HEAD_KEEP = 64;
+const TAIL_KEEP = MAX_SEGMENTS - HEAD_KEEP;
 const MAX_SEGMENT_BYTES = 1024 * 1024;
 const MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 const MAX_DEPTH = 32;
@@ -302,7 +316,7 @@ function safeLabels(
 		? modelAllowlist.has(model)
 			? model
 			: stableLabelHash("model", model)
-		: "unknown";
+			: "unknown";
 	return {
 		provider: safeProvider,
 		model: safeModel,
@@ -428,42 +442,70 @@ function encodeBounded(value: unknown): { text: string; byteLength: number } {
 }
 
 function classifyPayload(payload: unknown): {
-	segments: Array<{ name: CacheTelemetrySegmentName; value: unknown }>;
-	truncated: number;
+	segments: Array<{ name: CacheTelemetrySegmentName; value: unknown; alignment: "head" | "tail" }>;
+	segmentCount: number;
+	middleSegmentCount: number;
 } {
-	if (typeof payload !== "object" || payload === null)
-		return { segments: [{ name: "other", value: payload }], truncated: 0 };
-	const segments: Array<{ name: CacheTelemetrySegmentName; value: unknown }> = [];
-	let truncated = 0;
-	const object = payload as Record<string, unknown>;
-	for (const key of ["instructions", "system", "tools", "messages", "input"]) {
-		const descriptor = Object.getOwnPropertyDescriptor(object, key);
-		if (!descriptor) continue;
-		if (!("value" in descriptor)) throw new Error("payload accessor");
-		const name: CacheTelemetrySegmentName =
-			key === "instructions" || key === "system" ? "system" : key === "tools" ? "tools" : "message";
-		const value = descriptor.value;
-		if (Array.isArray(value)) {
-			for (let index = 0; index < value.length; index++) {
-				if (segments.length >= MAX_SEGMENTS) {
-					truncated = Math.min(1_000_000, truncated + value.length - index);
-					break;
+	const initial: Array<{ name: CacheTelemetrySegmentName; value: unknown }> = [];
+	let head: Array<{ name: CacheTelemetrySegmentName; value: unknown }> = [];
+	let tail: Array<{ name: CacheTelemetrySegmentName; value: unknown }> = [];
+	let split = false;
+	let segmentCount = 0;
+	const add = (candidate: { name: CacheTelemetrySegmentName; value: unknown }) => {
+		if (!split && segmentCount < MAX_SEGMENTS) {
+			initial.push(candidate);
+			segmentCount++;
+			return;
+		}
+		if (!split) {
+			head = initial.slice(0, HEAD_KEEP);
+			tail = initial.slice(HEAD_KEEP);
+			split = true;
+		}
+		tail.push(candidate);
+		if (tail.length > TAIL_KEEP) tail.shift();
+		segmentCount++;
+	};
+	const object = typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : undefined;
+	if (object) {
+		for (const key of ["instructions", "system", "tools", "messages", "input"]) {
+			const descriptor = Object.getOwnPropertyDescriptor(object, key);
+			if (!descriptor) continue;
+			if (!("value" in descriptor)) throw new Error("payload accessor");
+			const name: CacheTelemetrySegmentName =
+				key === "instructions" || key === "system" ? "system" : key === "tools" ? "tools" : "message";
+			const value = descriptor.value;
+			if (Array.isArray(value)) {
+				for (let index = 0; index < value.length; index++) {
+					const item = Object.getOwnPropertyDescriptor(value, String(index));
+					if (!item || !("value" in item)) throw new Error("payload array accessor or hole");
+					let segmentName = name;
+					if (name === "message" && typeof item.value === "object" && item.value !== null) {
+						const role = Object.getOwnPropertyDescriptor(item.value, "role");
+						if (role && "value" in role && (role.value === "system" || role.value === "developer"))
+							segmentName = "system";
+					}
+					add({ name: segmentName, value: item.value });
 				}
-				const item = Object.getOwnPropertyDescriptor(value, String(index));
-				if (!item || !("value" in item)) throw new Error("payload array accessor or hole");
-				let segmentName = name;
-				if (name === "message" && typeof item.value === "object" && item.value !== null) {
-					const role = Object.getOwnPropertyDescriptor(item.value, "role");
-					if (role && "value" in role && (role.value === "system" || role.value === "developer"))
-						segmentName = "system";
-				}
-				segments.push({ name: segmentName, value: item.value });
-			}
-		} else if (segments.length < MAX_SEGMENTS) segments.push({ name, value });
-		else truncated++;
+			} else add({ name, value });
+		}
 	}
-	if (segments.length === 0 && truncated === 0) segments.push({ name: "other", value: payload });
-	return { segments, truncated };
+	if (segmentCount === 0) add({ name: "other", value: payload });
+	const middleSegmentCount = Math.max(0, segmentCount - MAX_SEGMENTS);
+	if (!split)
+		return {
+			segments: initial.map((candidate) => ({ ...candidate, alignment: "head" as const })),
+			segmentCount,
+			middleSegmentCount: 0,
+		};
+	return {
+		segments: [
+			...head.map((candidate) => ({ ...candidate, alignment: "head" as const })),
+			...tail.map((candidate) => ({ ...candidate, alignment: "tail" as const })),
+		],
+		segmentCount,
+		middleSegmentCount,
+	};
 }
 
 type OperationName = keyof CacheTelemetryOperationChanges;
@@ -623,36 +665,62 @@ export function createCacheTelemetrySession(
 				const labels = safeLabels(input.provider, input.model);
 				let fingerprintStatus: CacheTelemetryRequestRecord["fingerprintStatus"] = "ok";
 				let truncatedSegmentCount = 0;
+				let wirePayloadSha256: string | undefined;
+				let segmentCount: number | undefined;
+				let keptHead: number | undefined;
+				let keptTail: number | undefined;
+				let middleSegmentCount: number | undefined;
+				let headDroppedForBudget = 0;
 				const prepared: Array<{ name: CacheTelemetrySegmentName; text: string; byteLength: number }> = [];
 				let totalBytes = 0;
 				try {
 					// SDK-facing request objects may contain arbitrary getters/extension data, so they are
 					// deliberately unavailable. Only provider-produced serialized JSON is bounded before parsing.
-					if (
-						typeof input.wirePayload !== "string" ||
-						utf8Length(input.wirePayload, MAX_TOTAL_BYTES) > MAX_TOTAL_BYTES
-					) {
+					if (typeof input.wirePayload !== "string") throw new Error("provider wire payload unavailable");
+					if (utf8Length(input.wirePayload, MAX_TOTAL_BYTES) > MAX_TOTAL_BYTES)
 						throw new Error("bounded provider wire payload unavailable");
-					}
+					wirePayloadSha256 = createHash("sha256").update(input.wirePayload).digest("hex");
 					const parsedPayload: unknown = JSON.parse(input.wirePayload);
 					const classified = classifyPayload(parsedPayload);
-					truncatedSegmentCount = classified.truncated;
+					segmentCount = classified.segmentCount;
+					middleSegmentCount = classified.middleSegmentCount;
+					truncatedSegmentCount = Math.min(1_000_000, classified.middleSegmentCount);
 					if (truncatedSegmentCount > 0) fingerprintStatus = "truncated";
-					for (const candidate of classified.segments) {
-						if (prepared.length >= MAX_SEGMENTS) {
-							truncatedSegmentCount++;
-							fingerprintStatus = "truncated";
-							break;
-						}
+					const prioritized =
+						classified.middleSegmentCount > 0
+							? [
+									...classified.segments.filter((candidate) => candidate.alignment === "tail"),
+									...classified.segments.filter((candidate) => candidate.alignment === "head"),
+								]
+							: classified.segments;
+					const encodedCandidates: Array<{
+						name: CacheTelemetrySegmentName;
+						text: string;
+						byteLength: number;
+						alignment: "head" | "tail";
+					}> = [];
+					for (const candidate of prioritized) {
 						const encoded = encodeBounded(candidate.value);
 						if (totalBytes + encoded.byteLength > MAX_TOTAL_BYTES) {
-							truncatedSegmentCount++;
+							truncatedSegmentCount = Math.min(1_000_000, truncatedSegmentCount + 1);
 							fingerprintStatus = "truncated";
-							break;
+							if (candidate.alignment === "head") headDroppedForBudget++;
+							if (classified.middleSegmentCount === 0) break;
+							continue;
 						}
 						totalBytes += encoded.byteLength;
-						prepared.push({ name: candidate.name, ...encoded });
+						encodedCandidates.push({ name: candidate.name, ...encoded, alignment: candidate.alignment });
 					}
+					const selected =
+						classified.middleSegmentCount > 0
+							? [
+									...encodedCandidates.filter((candidate) => candidate.alignment === "head"),
+									...encodedCandidates.filter((candidate) => candidate.alignment === "tail"),
+								]
+							: encodedCandidates;
+					prepared.push(...selected.map(({ alignment: _alignment, ...candidate }) => candidate));
+					keptHead = encodedCandidates.filter((candidate) => candidate.alignment === "head").length;
+					keptTail = encodedCandidates.filter((candidate) => candidate.alignment === "tail").length;
 				} catch {
 					fingerprintStatus = "unavailable";
 					prepared.length = 0;
@@ -840,6 +908,8 @@ export function createCacheTelemetrySession(
 								segments.push({ name: item.name, byteLength: item.byteLength, hmacSha256 });
 							}
 							if (prefixComparable) {
+								// `segments` is head-first, then tail; downstream comparisons align the head from index 0
+								// and align the retained tail from its end. Never compare a tail item by absolute index.
 								const previous = previousByLane.get(lane);
 								previousSegmentCount = previous?.digests.length ?? 0;
 								if (!previous) {
@@ -856,9 +926,7 @@ export function createCacheTelemetrySession(
 									)
 										previousCommonPrefixSegments++;
 									comparisonBasis =
-										fingerprintStatus === "truncated" || previous.bounded
-											? "bounded_truncated"
-											: "complete";
+										fingerprintStatus === "truncated" || previous.bounded ? "bounded_truncated" : "complete";
 								}
 								if (!previousByLane.has(lane) && previousByLane.size >= MAX_LANES)
 									previousByLane.delete(previousByLane.keys().next().value!);
@@ -900,8 +968,14 @@ export function createCacheTelemetrySession(
 						cacheIdentityMatch,
 						fingerprintStatus,
 						segments,
+						...(wirePayloadSha256 === undefined ? {} : { wirePayloadSha256 }),
+						...(segmentCount === undefined ? {} : { segmentCount }),
+						...(keptHead === undefined ? {} : { keptHead }),
+						...(keptTail === undefined ? {} : { keptTail }),
+						...(middleSegmentCount === undefined ? {} : { middleSegmentCount }),
+						headDroppedForBudget,
 						prefixComparable,
-						...((labels.providerSuppressed || labels.modelSuppressed)
+						...(labels.providerSuppressed || labels.modelSuppressed
 							? { labelsSuppressed: { provider: labels.providerSuppressed, model: labels.modelSuppressed } }
 							: {}),
 						previousCommonPrefixSegments,
