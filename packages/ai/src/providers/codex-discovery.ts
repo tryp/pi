@@ -1,6 +1,6 @@
 import type { OAuthCredential } from "../auth/types.ts";
 import type { RefreshModelsContext } from "../models.ts";
-import type { Model } from "../types.ts";
+import type { Api, Model } from "../types.ts";
 
 /**
  * The catalog is version-gated by Codex client version: pi's own 0.84.3 version returns an empty list,
@@ -24,6 +24,40 @@ interface CodexCatalogResponse {
 	models?: unknown;
 }
 
+/** Process-local counters for the Codex discovery fallback paths. */
+export const codexCatalogDiscoveryStats = {
+	skippedNoNetwork: 0,
+	skippedNoCredential: 0,
+	skippedNoAccountId: 0,
+	aborted: 0,
+	httpFailed: 0,
+	httpFailedStatuses: {} as Record<string, number>,
+	exception: 0,
+	emptyVersionGated: 0,
+	fallbackRetained: 0,
+	drift: [] as Array<{ modelId: string; backendContextWindow: number; curatedContextWindow: number }>,
+};
+
+export function firstTierBoundary<TApi extends Api>(model: Model<TApi>): number | null {
+	const boundaries = (model.cost.tiers ?? [])
+		.map((tier) => tier.inputTokensAbove)
+		.filter((value) => Number.isFinite(value) && value > 0);
+	return boundaries.length > 0 ? Math.min(...boundaries) : null;
+}
+
+export function resetCodexCatalogDiscoveryStats(): void {
+	codexCatalogDiscoveryStats.skippedNoNetwork = 0;
+	codexCatalogDiscoveryStats.skippedNoCredential = 0;
+	codexCatalogDiscoveryStats.skippedNoAccountId = 0;
+	codexCatalogDiscoveryStats.aborted = 0;
+	codexCatalogDiscoveryStats.httpFailed = 0;
+	codexCatalogDiscoveryStats.httpFailedStatuses = {};
+	codexCatalogDiscoveryStats.exception = 0;
+	codexCatalogDiscoveryStats.emptyVersionGated = 0;
+	codexCatalogDiscoveryStats.fallbackRetained = 0;
+	codexCatalogDiscoveryStats.drift = [];
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -32,9 +66,12 @@ function isOAuthCredential(credential: RefreshModelsContext["credential"]): cred
 	return credential?.type === "oauth" && typeof credential.access === "string" && credential.access.length > 0;
 }
 
-function buildCatalogModels(response: CodexCatalogResponse): Model<"openai-codex-responses">[] {
-	if (!Array.isArray(response.models)) return [];
+function buildCatalogModels(
+	response: CodexCatalogResponse,
+): { models: Model<"openai-codex-responses">[]; contextWindows: Map<string, number> } {
+	if (!Array.isArray(response.models)) return { models: [], contextWindows: new Map() };
 	const models: Model<"openai-codex-responses">[] = [];
+	const contextWindows = new Map<string, number>();
 	for (const rawModel of response.models) {
 		if (!isRecord(rawModel)) continue;
 		const entry = rawModel as CodexCatalogModel;
@@ -42,9 +79,10 @@ function buildCatalogModels(response: CodexCatalogResponse): Model<"openai-codex
 		const id = entry.slug.trim();
 		const modalities = Array.isArray(entry.input_modalities) ? entry.input_modalities : [];
 		const contextWindow =
-			typeof entry.context_window === "number" && Number.isFinite(entry.context_window)
+			typeof entry.context_window === "number" && Number.isFinite(entry.context_window) && entry.context_window > 0
 				? entry.context_window
-				: DEFAULT_CONTEXT_WINDOW;
+				: undefined;
+		if (contextWindow !== undefined) contextWindows.set(id, contextWindow);
 		models.push({
 			id,
 			name: typeof entry.display_name === "string" && entry.display_name.trim() ? entry.display_name : id,
@@ -55,23 +93,43 @@ function buildCatalogModels(response: CodexCatalogResponse): Model<"openai-codex
 			reasoning: true,
 			input: modalities.includes("image") ? ["text", "image"] : ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow,
-			maxTokens: Math.min(DEFAULT_MAX_TOKENS, contextWindow),
+			contextWindow: contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+			contextWindowSource: contextWindow === undefined ? "default" : "backend",
+			maxTokens: Math.min(DEFAULT_MAX_TOKENS, contextWindow ?? DEFAULT_CONTEXT_WINDOW),
 		});
 	}
-	return models;
+	return { models, contextWindows };
 }
 
-/** Build a stable union; curated and previously stored metadata win id collisions. */
+/** Build a stable union; curated/stored metadata wins, but per-key capacity wins contextWindow. */
 export function mergeCodexModels(
 	staticModels: readonly Model<"openai-codex-responses">[],
 	storedModels: readonly Model<"openai-codex-responses">[],
 	backendModels: readonly Model<"openai-codex-responses">[],
+	backendContextWindows?: ReadonlyMap<string, number>,
 ): Model<"openai-codex-responses">[] {
 	const byId = new Map<string, Model<"openai-codex-responses">>();
 	for (const model of staticModels) byId.set(model.id, model);
 	for (const model of storedModels) if (!byId.has(model.id)) byId.set(model.id, model);
-	for (const model of backendModels) if (!byId.has(model.id)) byId.set(model.id, model);
+	for (const model of backendModels) {
+		const existing = byId.get(model.id);
+		if (!existing) {
+			byId.set(model.id, model);
+			continue;
+		}
+		const backendContextWindow = backendContextWindows
+			? backendContextWindows.get(model.id)
+			: Number.isFinite(model.contextWindow) && model.contextWindow > 0
+				? model.contextWindow
+				: undefined;
+		if (backendContextWindow !== undefined) {
+			byId.set(model.id, {
+				...existing,
+				contextWindow: backendContextWindow,
+				contextWindowSource: "backend",
+			});
+		}
+	}
 	return [...byId.values()];
 }
 
@@ -85,14 +143,33 @@ function retainedModels(
 	return mergeCodexModels(staticModels, storedModels, []);
 }
 
-/** Fetch Codex's account-scoped catalog; preserve the curated and persisted catalog on failure. */
+function retainFallback(context: RefreshModelsContext, staticModels: readonly Model<"openai-codex-responses">[]) {
+	codexCatalogDiscoveryStats.fallbackRetained += 1;
+	return retainedModels(context, staticModels);
+}
+
+/** Fetch Codex's account-scoped catalog; preserve curated and persisted metadata on failure. */
 export async function fetchCodexModels(
 	context: RefreshModelsContext,
 	staticModels: readonly Model<"openai-codex-responses">[],
 ): Promise<readonly Model<"openai-codex-responses">[]> {
-	if (!context.allowNetwork || context.signal.aborted || !isOAuthCredential(context.credential)) return [];
+	if (!context.allowNetwork) {
+		codexCatalogDiscoveryStats.skippedNoNetwork += 1;
+		return retainFallback(context, staticModels);
+	}
+	if (context.signal.aborted) {
+		codexCatalogDiscoveryStats.aborted += 1;
+		return retainFallback(context, staticModels);
+	}
+	if (!isOAuthCredential(context.credential)) {
+		codexCatalogDiscoveryStats.skippedNoCredential += 1;
+		return retainFallback(context, staticModels);
+	}
 	const accountId = context.credential.accountId;
-	if (typeof accountId !== "string" || accountId.length === 0) return [];
+	if (typeof accountId !== "string" || accountId.length === 0) {
+		codexCatalogDiscoveryStats.skippedNoAccountId += 1;
+		return retainFallback(context, staticModels);
+	}
 
 	try {
 		const response = await fetch(`${CODEX_CATALOG_URL}?client_version=${CODEX_CATALOG_CLIENT_VERSION}`, {
@@ -103,15 +180,46 @@ export async function fetchCodexModels(
 			},
 			signal: context.signal,
 		});
-		if (!response.ok) return retainedModels(context, staticModels);
+		if (context.signal.aborted) {
+			codexCatalogDiscoveryStats.aborted += 1;
+			return retainFallback(context, staticModels);
+		}
+		if (!response.ok) {
+			codexCatalogDiscoveryStats.httpFailed += 1;
+			const status = String(response.status);
+			codexCatalogDiscoveryStats.httpFailedStatuses[status] =
+				(codexCatalogDiscoveryStats.httpFailedStatuses[status] ?? 0) + 1;
+			return retainFallback(context, staticModels);
+		}
 		const data: unknown = await response.json();
-		if (context.signal.aborted || !isRecord(data)) return [];
-		const backendModels = buildCatalogModels(data as CodexCatalogResponse);
+		if (context.signal.aborted) {
+			codexCatalogDiscoveryStats.aborted += 1;
+			return retainFallback(context, staticModels);
+		}
+		if (!isRecord(data)) throw new Error("Codex catalog response is not an object");
+		const { models: backendModels, contextWindows } = buildCatalogModels(data as CodexCatalogResponse);
+		if (backendModels.length === 0) {
+			codexCatalogDiscoveryStats.emptyVersionGated += 1;
+			return retainFallback(context, staticModels);
+		}
+		const curatedById = new Map(staticModels.map((model) => [model.id, model]));
+		for (const [modelId, backendContextWindow] of contextWindows) {
+			const curated = curatedById.get(modelId);
+			if (curated && curated.contextWindow !== backendContextWindow) {
+				codexCatalogDiscoveryStats.drift.push({
+					modelId,
+					backendContextWindow,
+					curatedContextWindow: curated.contextWindow,
+				});
+			}
+		}
 		const storedModels = (context.stored?.models ?? []).filter(
 			(model): model is Model<"openai-codex-responses"> => model.provider === "openai-codex",
 		);
-		return mergeCodexModels(staticModels, storedModels, backendModels);
+		return mergeCodexModels(staticModels, storedModels, backendModels, contextWindows);
 	} catch {
-		return context.signal.aborted ? [] : retainedModels(context, staticModels);
+		if (context.signal.aborted) codexCatalogDiscoveryStats.aborted += 1;
+		else codexCatalogDiscoveryStats.exception += 1;
+		return retainFallback(context, staticModels);
 	}
 }

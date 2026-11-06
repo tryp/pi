@@ -802,7 +802,22 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		}
 		if (!mergedModel.compat && base.compat) mergedModel.compat = base.compat;
 		mergedModel.maxTokens = Math.max(base.maxTokens, dynamic.maxTokens);
-		mergedModel.contextWindow = Math.max(base.contextWindow, dynamic.contextWindow);
+		// Context-window precedence. A backend-published value is authoritative, so it
+		// wins in both directions: it may legitimately shrink the window when a provider
+		// lowers a limit. Every other dynamic source (static default, stored value, or
+		// unknown provenance) must never inflate the curated catalog entry, so keep the
+		// curated window and only fall back to the dynamic one when the curated entry has
+		// none. A maximum of the two would let a stale or fabricated window persist
+		// forever, widening the compaction budget past the provider's real limit.
+		const dynamicWindowTrusted = dynamic.contextWindowSource === "backend";
+		const curatedWindow = base.contextWindow > 0 ? base.contextWindow : undefined;
+		const candidateWindow = dynamic.contextWindow > 0 ? dynamic.contextWindow : undefined;
+		mergedModel.contextWindow = dynamicWindowTrusted
+			? (candidateWindow ?? curatedWindow ?? 0)
+			: (curatedWindow ?? candidateWindow ?? 0);
+		mergedModel.contextWindowSource = dynamicWindowTrusted
+			? "backend"
+			: (base.contextWindowSource ?? "static");
 		return mergedModel;
 	};
 	const currentModels = (): readonly Model<TApi>[] => {

@@ -115,6 +115,78 @@ describe("dynamic model merge", () => {
 		).toBe(true);
 	});
 
+	it("preserves curated cost tiers when applying a backend context-window override", async () => {
+		const curated = {
+			...catalogModel(),
+			cost: {
+				...catalogModel().cost,
+				tiers: [{ inputTokensAbove: 272000, input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 }],
+			},
+		};
+		const dynamicProvider = createProvider({
+			id: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			auth,
+			models: [curated],
+			fetchModels: async () => [{ ...placeholderModel(), contextWindow: 500000, contextWindowSource: "backend" }],
+			api: {
+				stream: () => new AssistantMessageEventStream(),
+				streamSimple: () => new AssistantMessageEventStream(),
+			},
+		});
+		const models = createModels({ modelsStore: stubStore });
+		models.setProvider(dynamicProvider);
+		await models.refresh({ providers: ["opencode-go"], allowNetwork: true });
+
+		const resolved = models.getModel("opencode-go", "deepseek-flash");
+		expect(resolved?.contextWindow).toBe(500000);
+		expect(resolved?.cost.tiers).toEqual(curated.cost.tiers);
+	});
+
+	it("does not let an untrusted dynamic window inflate the curated window", async () => {
+		const dynamicProvider = createProvider({
+			id: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			auth,
+			models: [catalogModel()],
+			fetchModels: async () => [{ ...placeholderModel(), contextWindow: 1000000, contextWindowSource: "static" }],
+			api: {
+				stream: () => new AssistantMessageEventStream(),
+				streamSimple: () => new AssistantMessageEventStream(),
+			},
+		});
+		const models = createModels({ modelsStore: stubStore });
+		models.setProvider(dynamicProvider);
+		await models.refresh({ providers: ["opencode-go"], allowNetwork: true });
+
+		const resolved = models.getModel("opencode-go", "deepseek-flash");
+		// A stale or fabricated 1M window must never widen the budget past the real limit.
+		expect(resolved?.contextWindow).toBe(384000);
+		expect(resolved?.contextWindowSource).toBe("static");
+	});
+
+	it("honours a backend window that lowers the curated limit", async () => {
+		const dynamicProvider = createProvider({
+			id: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			auth,
+			models: [catalogModel()],
+			fetchModels: async () => [{ ...placeholderModel(), contextWindow: 128000, contextWindowSource: "backend" }],
+			api: {
+				stream: () => new AssistantMessageEventStream(),
+				streamSimple: () => new AssistantMessageEventStream(),
+			},
+		});
+		const models = createModels({ modelsStore: stubStore });
+		models.setProvider(dynamicProvider);
+		await models.refresh({ providers: ["opencode-go"], allowNetwork: true });
+
+		const resolved = models.getModel("opencode-go", "deepseek-flash");
+		// Backend data is authoritative in both directions; a lowered limit must apply.
+		expect(resolved?.contextWindow).toBe(128000);
+		expect(resolved?.contextWindowSource).toBe("backend");
+	});
+
 	it("still applies legitimate dynamic updates (new model ids, upgrades)", async () => {
 		entry = { models: [placeholderModel(), { ...catalogModel(), id: "deepseek-v4.1-flash", reasoning: false }] };
 		const models = createModels({ modelsStore: stubStore });

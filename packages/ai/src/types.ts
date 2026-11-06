@@ -850,6 +850,8 @@ export interface Model<TApi extends Api> {
 	input: ("text" | "image")[];
 	cost: ModelCost;
 	contextWindow: number;
+	/** Provenance for dynamic context-window resolution when known. */
+	contextWindowSource?: "backend" | "stored" | "static" | "default";
 	maxTokens: number;
 	/** Default sampling parameters for this model. See {@link StreamOptions.samplingParams}; per-request keys override these. */
 	samplingParams?: Record<string, unknown>;
