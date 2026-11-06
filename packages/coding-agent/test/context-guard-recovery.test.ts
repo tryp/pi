@@ -14,7 +14,12 @@ import {
 	isContextGuardRefusal,
 } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import { estimateContextTokens, estimateToolSchemaTokens } from "../src/core/compaction/compaction.ts";
+import {
+	estimateContextTokens,
+	estimateToolSchemaTokens,
+	resolveCompactionTrigger,
+	shouldCompact,
+} from "../src/core/compaction/compaction.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -207,8 +212,8 @@ describe("transport abort retry gate", () => {
 		expect(gateAt(Math.floor(size / 2))).toBe(false);
 	});
 
-	it("withholds the retry when the limit cannot be evaluated", () => {
-		expect(gateAt(undefined)).toBe(false);
+	it("uses the model-relative limit when no absolute cap is configured", () => {
+		expect(gateAt(undefined)).toBe(true);
 		expect(gateAt(170_000, false)).toBe(false);
 	});
 });
@@ -483,7 +488,9 @@ describe("pre-send gate end to end", () => {
 			).toBe(false);
 			expect(compactionEndEvents.at(-1)?.errorMessage).toContain("No conversation history could be reduced");
 			expect(compactionEndEvents.at(-1)?.errorMessage).not.toContain("after compaction and retry");
-			expect(recoveryDiagnostics(session)).toHaveLength(1);
+			expect(
+				recoveryDiagnostics(session).filter((diagnostic) => diagnostic.kind === "context_guard_recovery"),
+			).toHaveLength(1);
 			expect(session.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
 			expect(session.agent.state.messages).toEqual([currentPrompt]);
 		} finally {
@@ -608,11 +615,11 @@ describe("pre-send gate end to end", () => {
 			reasoning: false,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128_000,
+			contextWindow: 272_000,
 			maxTokens: 4_096,
 		};
 		const settingsManager = SettingsManager.inMemory({
-			compaction: { enabled: true, maxContextTokens: 20_000, keepRecentTokens: 20_000 },
+			compaction: { enabled: true, maxContextTokens: 170_000, keepRecentTokens: 20_000 },
 		});
 		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
@@ -637,6 +644,7 @@ describe("pre-send gate end to end", () => {
 			},
 		});
 		let preparationTokens: number | undefined;
+		let compactEvent: import("../src/core/extensions/types.ts").SessionBeforeCompactEvent | undefined;
 		const resourceLoader = new DefaultResourceLoader({
 			cwd,
 			agentDir,
@@ -644,6 +652,7 @@ describe("pre-send gate end to end", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => {
+						compactEvent = event;
 						preparationTokens = event.preparation.tokensBefore;
 						return {
 							compaction: {
@@ -679,11 +688,54 @@ describe("pre-send gate end to end", () => {
 
 			const handled = await internals._checkCompaction.call(
 				session as unknown as SessionInternals,
-				guardRefusalMessage(200_000, 20_000),
+				guardRefusalMessage(200_000, 170_000),
 			);
 
 			expect(handled).toBe(true);
 			expect(preparationTokens).toBeGreaterThan(0);
+			const trigger = resolveCompactionTrigger(model, model.contextWindow, settingsManager.getCompactionSettings());
+			expect(trigger.uncappedTrigger).toBe(239_360);
+			expect(trigger.trigger).toBe(170_000);
+			expect(trigger.capApplied).toBe(true);
+			expect(trigger.capValue).toBe(170_000);
+			expect(
+				shouldCompact(trigger.trigger + 1, model.contextWindow, settingsManager.getCompactionSettings(), model),
+			).toBe(true);
+			expect(compactEvent).toMatchObject({
+				effectiveContextWindow: 272_000,
+				effectiveBudget: 272_000,
+				firstCostTierBoundary: null,
+				triggerTokens: trigger.trigger,
+				triggerFraction: settingsManager.getCompactionSettings().triggerFraction,
+				reserveTokens: trigger.reserveTokens,
+				capApplied: true,
+				capValue: 170_000,
+				windowSource: "static",
+			});
+			const eventLimits = session as unknown as {
+				_compactionEventLimits: (settings: ReturnType<SettingsManager["getCompactionSettings"]>) => {
+					windowSource: string;
+				};
+			};
+			expect(eventLimits._compactionEventLimits(settingsManager.getCompactionSettings()).windowSource).toBe(
+				"static",
+			);
+			(session.model as unknown as Model<Api> & { contextWindowSource?: "backend" }).contextWindowSource = "backend";
+			expect(eventLimits._compactionEventLimits(settingsManager.getCompactionSettings()).windowSource).toBe(
+				"backend",
+			);
+			const capDiagnostics = session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic")
+				.map((entry) => (entry as { data: Record<string, unknown> }).data);
+			expect(capDiagnostics).toContainEqual(
+				expect.objectContaining({
+					kind: "compaction_trigger_capped_by_absolute",
+					capValue: 170_000,
+					derivedTrigger: 239_360,
+					triggerTokens: 170_000,
+				}),
+			);
 			expect(session.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
 		} finally {
 			session.dispose();

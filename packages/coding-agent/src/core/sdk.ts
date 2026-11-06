@@ -20,7 +20,7 @@ import {
 	createCacheOperationRecord,
 } from "./cache-operations.ts";
 import { CacheMissAttributionTracker, createLocalCacheTelemetryWriter } from "./cache-telemetry.ts";
-import { estimateProviderContextTokens } from "./compaction/compaction.ts";
+import { estimateProviderContextTokens, resolveCompactionTrigger } from "./compaction/compaction.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm, hasProviderInputContent, isProviderUserInputMessage } from "./messages.ts";
@@ -505,10 +505,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				tools: context.tools,
 			};
 			session?.guardContextForRequest(requestContext);
-			const configuredBudget = settingsManager.getCompactionMaxContextTokens();
-			const requestBudget =
-				configuredBudget ??
-				(model.contextWindow > 0 ? model.contextWindow - settingsManager.getCompactionReserveTokens() : undefined);
+			const requestBudget = resolveCompactionTrigger(
+				model,
+				model.contextWindow,
+				settingsManager.getCompactionSettings(),
+			).hardLimit;
 			if (requestBudget != null && requestBudget > 0) {
 				const estimate = estimateProviderContextTokens(
 					requestContext.messages,
@@ -622,12 +623,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							: undefined,
 					)
 				: source;
+			const finalBudget = resolveCompactionTrigger(
+				agent.state.model,
+				agent.state.model?.contextWindow ?? 0,
+				settingsManager.getCompactionSettings(),
+			).hardLimit;
 			const finalized = enforceRequestContextBudget(
 				transformed,
 				agent.state.systemPrompt ?? "",
 				agent.state.model,
-				settingsManager.getCompactionMaxContextTokens(),
-				settingsManager.getCompactionReserveTokens(),
+				finalBudget,
+				0,
 				agent.state.tools,
 			);
 			if (instrumentation && beforeContext) {

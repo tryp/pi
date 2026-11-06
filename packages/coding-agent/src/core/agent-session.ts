@@ -24,13 +24,12 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { CacheTelemetryObserver } from "@earendil-works/pi-ai";
+import type { CacheTelemetryObserver, Model } from "@earendil-works/pi-ai";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
 	ImageContent,
-	Model,
 	ProviderHeaders,
 	TextContent,
 	Usage,
@@ -60,10 +59,12 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	DEFAULT_COMPACTION_SETTINGS,
 	estimateContextTokens,
 	estimateProviderContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	resolveCompactionTrigger,
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
@@ -330,7 +331,7 @@ export const CONTEXT_GUARD_ERROR_MESSAGE =
  * connection, so the gate compacts instead of submitting, and transport-abort
  * retries are withheld.
  */
-export const CONTEXT_BORDERLINE_FRACTION = 0.9;
+export const CONTEXT_BORDERLINE_FRACTION = DEFAULT_COMPACTION_SETTINGS.borderlineFraction!;
 
 export class ContextGuardError extends Error {
 	constructor(estimatedTokens?: number, maxContextTokens?: number) {
@@ -421,6 +422,7 @@ export class AgentSession {
 	 * compacted does not compact again until new messages arrive.
 	 */
 	private _lastPreSendCompactionLength = -1;
+	private _reportedDefaultCompactionWindows = new Set<string>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -554,7 +556,7 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		env?: Record<string, string>;
 	}> {
-		if (this.agent.streamFunction === streamSimple) {
+		if ((this.agent.streamFunction as unknown) === streamSimple) {
 			return this._getRequiredRequestAuth(model);
 		}
 
@@ -1381,13 +1383,74 @@ export class AgentSession {
 		});
 	}
 
+	private _resolveCompactionTrigger(settings: ReturnType<SettingsManager["getCompactionSettings"]>) {
+		const model = this.model;
+		const resolution = resolveCompactionTrigger(model, model?.contextWindow ?? 0, settings);
+		if (resolution.usedDefaultWindow) {
+			const key = `${model?.provider ?? "unknown"}/${model?.id ?? "unknown"}`;
+			if (!this._reportedDefaultCompactionWindows.has(key)) {
+				this._reportedDefaultCompactionWindows.add(key);
+				this._appendDiagnostic({
+					kind: "compaction_context_window_fallback",
+					provider: model?.provider,
+					model: model?.id,
+					contextWindow: resolution.contextWindow,
+				});
+			}
+		}
+		if (resolution.zeroTriggerCause) {
+			this._appendDiagnostic({
+				kind: "compaction_trigger_clamped_to_zero",
+				cause: resolution.zeroTriggerCause,
+				budget: resolution.budget,
+				reserveTokens: resolution.reserveTokens,
+			});
+		}
+		return resolution;
+	}
+
+	private _compactionEventLimits(settings: ReturnType<SettingsManager["getCompactionSettings"]>) {
+		const resolution = this._resolveCompactionTrigger(settings);
+		const windowSource =
+			(
+				this.model as
+					| (Model<any> & { contextWindowSource?: "backend" | "stored" | "static" | "default" })
+					| undefined
+			)?.contextWindowSource ?? "static";
+		if (resolution.capApplied) {
+			const absolute = resolution.capSource === "absolute";
+			const capName = absolute ? "maxContextTokens" : "maxContextFraction";
+			this._appendDiagnostic({
+				kind: absolute ? "compaction_trigger_capped_by_absolute" : "compaction_trigger_capped_by_fraction",
+				message: `Compaction trigger capped by ${capName}=${resolution.capValue}; derived trigger=${resolution.uncappedTrigger}, effective trigger=${resolution.trigger}.`,
+				capValue: resolution.capValue,
+				capSource: resolution.capSource,
+				derivedTrigger: resolution.uncappedTrigger,
+				triggerTokens: resolution.trigger,
+			});
+		}
+		return {
+			effectiveContextWindow: resolution.contextWindow,
+			effectiveBudget: resolution.budget,
+			firstCostTierBoundary: resolution.firstCostTierBoundary,
+			triggerTokens: resolution.trigger,
+			triggerFraction: resolution.triggerFraction,
+			reserveTokens: resolution.reserveTokens,
+			capApplied: resolution.capApplied,
+			capValue: resolution.capValue,
+			capSource: resolution.capSource,
+			windowSource,
+		};
+	}
+
 	guardContextForRequest(
 		contextOrMessages:
 			| AgentMessage[]
 			| { messages: AgentMessage[]; systemPrompt?: string; tools?: readonly unknown[] },
 	): void {
 		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled || settings.maxContextTokens == null || this.isCompacting) return;
+		if (!settings.enabled || this.isCompacting) return;
+		const { hardLimit } = resolveCompactionTrigger(this.model, this.model?.contextWindow ?? 0, settings);
 		// The array form remains accepted for direct session callers that do not
 		// have the provider Context object; use session overhead in that case. The
 		// SDK passes the full, possibly extension-transformed request context.
@@ -1403,8 +1466,8 @@ export class AgentSession {
 			context.systemPrompt,
 			context.tools,
 		).tokens;
-		if (estimatedTokens > settings.maxContextTokens) {
-			throw new ContextGuardError(estimatedTokens, settings.maxContextTokens);
+		if (estimatedTokens > hardLimit) {
+			throw new ContextGuardError(estimatedTokens, hardLimit);
 		}
 	}
 
@@ -1434,7 +1497,12 @@ export class AgentSession {
 	 */
 	async compactBeforeSubmit(): Promise<AgentMessage[] | undefined> {
 		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled || settings.maxContextTokens == null || this.isCompacting) return undefined;
+		if (!settings.enabled || this.isCompacting) return undefined;
+		const { trigger, borderlineFraction } = resolveCompactionTrigger(
+			this.model,
+			this.model?.contextWindow ?? 0,
+			settings,
+		);
 
 		const messages = this.agent.state.messages;
 		if (messages.length === this._lastPreSendCompactionLength) return undefined;
@@ -1444,7 +1512,7 @@ export class AgentSession {
 			this.agent.state.systemPrompt,
 			this.agent.state.tools,
 		).tokens;
-		if (estimatedTokens < CONTEXT_BORDERLINE_FRACTION * settings.maxContextTokens) return undefined;
+		if (estimatedTokens < borderlineFraction * trigger) return undefined;
 
 		// `_runAutoCompaction` rewrites agent state from the new session context, so a
 		// changed array identity is the reliable "a compaction ran" signal: its return
@@ -1471,13 +1539,18 @@ export class AgentSession {
 	 */
 	private _transportAbortRetryAllowed(): boolean {
 		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled || settings.maxContextTokens == null) return false;
+		if (!settings.enabled) return false;
+		const { trigger, borderlineFraction } = resolveCompactionTrigger(
+			this.model,
+			this.model?.contextWindow ?? 0,
+			settings,
+		);
 		const estimatedTokens = estimateProviderContextTokens(
 			this.agent.state.messages,
 			this.agent.state.systemPrompt,
 			this.agent.state.tools,
 		).tokens;
-		return estimatedTokens < CONTEXT_BORDERLINE_FRACTION * settings.maxContextTokens;
+		return estimatedTokens < borderlineFraction * trigger;
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -2559,8 +2632,10 @@ export class AgentSession {
 
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
+			const compactionLimits = this._compactionEventLimits(settings);
+			const effectiveSettings = { ...settings, reserveTokens: compactionLimits.reserveTokens };
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = prepareCompaction(pathEntries, effectiveSettings);
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -2581,6 +2656,7 @@ export class AgentSession {
 					reason: "manual",
 					willRetry: false,
 					signal: this._compactionAbortController.signal,
+					...compactionLimits,
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (result?.cancel) {
@@ -2651,6 +2727,7 @@ export class AgentSession {
 					fromExtension,
 					reason: "manual",
 					willRetry: false,
+					...compactionLimits,
 				});
 			}
 
@@ -2843,7 +2920,7 @@ export class AgentSession {
 		} else {
 			contextTokens = directContextTokens;
 		}
-		if ((guardRefusal && settings.enabled) || shouldCompact(contextTokens, contextWindow, settings)) {
+		if ((guardRefusal && settings.enabled) || shouldCompact(contextTokens, contextWindow, settings, this.model)) {
 			// A recognized pre-send context guard is authoritative: extension-transformed
 			// system prompts/tools may differ from the agent state re-estimate below.
 			// A pre-send context guard deliberately fails the request so compaction can
@@ -2901,6 +2978,8 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
+		const compactionLimits = this._compactionEventLimits(settings);
+		const effectiveSettings = { ...settings, reserveTokens: compactionLimits.reserveTokens };
 		const isGuardRecovery = reason === "threshold" && willRetry;
 		let started = false;
 		let fromExtension = false;
@@ -2937,7 +3016,9 @@ export class AgentSession {
 			// Guard accounting includes transformed request context, while the normal
 			// keep target is based only on message content. Use an aggressive cut for this
 			// one bounded recovery attempt so short histories can still be summarized.
-			const preparationSettings = isGuardRecovery ? { ...settings, keepRecentTokens: 0 } : settings;
+			const preparationSettings = isGuardRecovery
+				? { ...effectiveSettings, keepRecentTokens: 0 }
+				: effectiveSettings;
 			const preparation = prepareCompaction(pathEntries, preparationSettings);
 			if (!preparation) {
 				if (isGuardRecovery) {
@@ -2979,6 +3060,7 @@ export class AgentSession {
 					reason,
 					willRetry,
 					signal: this._autoCompactionAbortController.signal,
+					...compactionLimits,
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (extensionResult?.cancel) {
@@ -3083,6 +3165,7 @@ export class AgentSession {
 					fromExtension,
 					reason,
 					willRetry,
+					...compactionLimits,
 				});
 			}
 

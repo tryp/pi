@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DEFAULT_COMPACTION_SETTINGS } from "../src/core/compaction/compaction.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS } from "../src/core/http-dispatcher.ts";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
 import { DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS } from "../src/core/stream-watchdog.ts";
@@ -623,18 +624,37 @@ describe("SettingsManager", () => {
 	});
 
 	describe("compaction settings", () => {
-		it("returns undefined maxContextTokens by default", () => {
+		it("returns configurable compaction defaults and leaves caps unset", () => {
 			const manager = SettingsManager.create(projectDir, agentDir);
+			const settings = manager.getCompactionSettings();
 			expect(manager.getCompactionMaxContextTokens()).toBeUndefined();
-			expect(manager.getCompactionSettings().maxContextTokens).toBeUndefined();
+			expect(settings.maxContextTokens).toBeUndefined();
+			expect(settings.maxContextFraction).toBeUndefined();
+			expect(settings.reserveTokens).toBe(DEFAULT_COMPACTION_SETTINGS.reserveTokens);
+			expect(manager.getCompactionReserveTokens()).toBe(DEFAULT_COMPACTION_SETTINGS.reserveTokens);
+			expect(settings.triggerFraction).toBe(DEFAULT_COMPACTION_SETTINGS.triggerFraction);
+			expect(settings.borderlineFraction).toBe(DEFAULT_COMPACTION_SETTINGS.borderlineFraction);
 		});
 
-		it("returns configured maxContextTokens", () => {
-			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ compaction: { maxContextTokens: 180000 } }));
+		it("returns configured absolute and fractional caps", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ compaction: { maxContextTokens: 180000, maxContextFraction: 0.5 } }),
+			);
 			const manager = SettingsManager.create(projectDir, agentDir);
 			expect(manager.getCompactionMaxContextTokens()).toBe(180000);
-			expect(manager.getCompactionSettings().maxContextTokens).toBe(180000);
+			expect(manager.getCompactionSettings()).toMatchObject({ maxContextTokens: 180000, maxContextFraction: 0.5 });
 		});
+
+		it.each([0, -1, 1.5, Number.NaN])(
+			"falls back and records an error for invalid triggerFraction %s",
+			(triggerFraction) => {
+				const manager = SettingsManager.inMemory({ compaction: { triggerFraction } });
+				const settings = manager.getCompactionSettings();
+				expect(settings.triggerFraction).toBe(DEFAULT_COMPACTION_SETTINGS.triggerFraction);
+				expect(manager.drainErrors().some((entry) => entry.error.message.includes("triggerFraction"))).toBe(true);
+			},
+		);
 	});
 
 	describe("getSessionDir", () => {

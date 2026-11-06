@@ -27,6 +27,8 @@ import {
 	serializeConversation,
 } from "./utils.ts";
 
+export const DEFAULT_BRANCH_SUMMARY_RESERVE_TOKENS = 16_384;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -230,6 +232,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
 			// If this is a summary entry, try to fit it anyway as it's important context
 			if (entry.type === "compaction" || entry.type === "branch_summary") {
+				// Keep 10% headroom as a safety margin for estimated token accounting near the provider limit.
 				if (totalTokens < tokenBudget * 0.9) {
 					messages.unshift(message);
 					totalTokens += tokens;
@@ -302,7 +305,7 @@ export async function generateBranchSummary(
 		signal,
 		customInstructions,
 		replaceInstructions,
-		reserveTokens = 16384,
+		reserveTokens = DEFAULT_BRANCH_SUMMARY_RESERVE_TOKENS,
 		streamFn,
 		retry,
 		callbacks,

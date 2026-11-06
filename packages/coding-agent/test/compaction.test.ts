@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
 import { getModel } from "@earendil-works/pi-ai/compat";
+import { firstTierBoundary } from "@earendil-works/pi-ai/providers/codex-discovery";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -13,6 +14,7 @@ import {
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
+	resolveCompactionTrigger,
 	shouldCompact,
 } from "../src/core/compaction/index.ts";
 import {
@@ -280,7 +282,7 @@ describe("shouldCompact", () => {
 		};
 
 		expect(shouldCompact(95000, 100000, settings)).toBe(true);
-		expect(shouldCompact(89000, 100000, settings)).toBe(false);
+		expect(shouldCompact(87000, 100000, settings)).toBe(false);
 	});
 
 	it("should return false when disabled", () => {
@@ -293,7 +295,7 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(95000, 100000, settings)).toBe(false);
 	});
 
-	it("maxContextTokens acts as an absolute model-independent threshold", () => {
+	it("maxContextTokens caps the model-relative trigger", () => {
 		const settings: CompactionSettings = {
 			enabled: true,
 			reserveTokens: 10000,
@@ -301,10 +303,11 @@ describe("shouldCompact", () => {
 			maxContextTokens: 180000,
 		};
 
-		// Compact at the fixed level regardless of context window size
-		expect(shouldCompact(181000, 200000, settings)).toBe(true);
+		// The 0.88 window-relative threshold fires below the absolute ceiling for 200k;
+		// on a larger window, the absolute ceiling is the first threshold reached.
+		expect(shouldCompact(177000, 200000, settings)).toBe(true);
 		expect(shouldCompact(181000, 1000000, settings)).toBe(true);
-		expect(shouldCompact(179000, 200000, settings)).toBe(false);
+		expect(shouldCompact(175000, 200000, settings)).toBe(false);
 		expect(shouldCompact(179000, 1000000, settings)).toBe(false);
 	});
 
@@ -329,7 +332,7 @@ describe("shouldCompact", () => {
 		};
 
 		expect(shouldCompact(190001, 200000, settings)).toBe(true);
-		expect(shouldCompact(180000, 200000, settings)).toBe(false);
+		expect(shouldCompact(175000, 200000, settings)).toBe(false);
 	});
 
 	it("disabled wins even when maxContextTokens would fire", () => {
@@ -341,6 +344,144 @@ describe("shouldCompact", () => {
 		};
 
 		expect(shouldCompact(60000, 200000, settings)).toBe(false);
+	});
+});
+
+describe("resolveCompactionTrigger", () => {
+	const model = {
+		id: "test-272k",
+		provider: "test",
+		contextWindow: 272_000,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tiers: [] },
+	} as unknown as NonNullable<Parameters<typeof resolveCompactionTrigger>[0]>;
+
+	it("uses the configurable default and preserves today's derived trigger", () => {
+		const result = resolveCompactionTrigger(model, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(result.trigger).toBe(239_360);
+		expect(result.triggerFraction).toBe(DEFAULT_COMPACTION_SETTINGS.triggerFraction);
+		expect(result.reserveTokens).toBe(DEFAULT_COMPACTION_SETTINGS.reserveTokens);
+		expect(result.capApplied).toBe(false);
+	});
+
+	it("scales the trigger with triggerFraction", () => {
+		const result = resolveCompactionTrigger(model, 0, { ...DEFAULT_COMPACTION_SETTINGS, triggerFraction: 0.5 });
+		expect(result.trigger).toBe(136_000);
+	});
+
+	it("lets an explicit reserveTokens override the policy default", () => {
+		const result = resolveCompactionTrigger(model, 0, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			reserveTokens: 40_000,
+		});
+		expect(result.reserveTokens).toBe(40_000);
+		expect(result.trigger).toBe(232_000);
+	});
+
+	it("uses curated cost tiers to clamp sol and terra-sized windows", () => {
+		const solOrTerra = {
+			...model,
+			id: "gpt-6.1-sol",
+			contextWindow: 500_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tiers: [{ inputTokensAbove: 272_000 }] },
+		} as unknown as NonNullable<Parameters<typeof resolveCompactionTrigger>[0]>;
+		const boundary = firstTierBoundary(solOrTerra);
+		expect(boundary).toBe(272_000);
+		const result = resolveCompactionTrigger(solOrTerra, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(result.firstCostTierBoundary).toBe(boundary);
+		expect(result.budget).toBe(272_000);
+		expect(result.trigger).toBe(239_360);
+
+		const noTierModel = { ...model, contextWindow: 200_000 };
+		const noTiers = resolveCompactionTrigger(noTierModel, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(noTiers.firstCostTierBoundary).toBeNull();
+		expect(noTiers.budget).toBe(200_000);
+		expect(noTiers.trigger).toBe(176_000);
+	});
+
+	it("uses the model's curated tier boundary instead of a fixed token threshold", () => {
+		const tierBoundary = 123_457;
+		const tieredModel = {
+			...model,
+			contextWindow: 500_000,
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				tiers: [{ inputTokensAbove: tierBoundary, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }],
+			},
+		};
+		const curatedBoundary = firstTierBoundary(tieredModel);
+		const result = resolveCompactionTrigger(tieredModel, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(curatedBoundary).toBe(tierBoundary);
+		expect(result.firstCostTierBoundary).toBe(curatedBoundary);
+		expect(result.budget).toBe(curatedBoundary);
+		expect(result.trigger).toBe(
+			Math.min(
+				Math.floor(curatedBoundary! * DEFAULT_COMPACTION_SETTINGS.triggerFraction!),
+				curatedBoundary! - DEFAULT_COMPACTION_SETTINGS.reserveTokens!,
+			),
+		);
+	});
+
+	it("clamps to non-negative thresholds and identifies a reserve-driven zero", () => {
+		const windowNearReserve = resolveCompactionTrigger({ ...model, contextWindow: 32_000 }, 0, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			reserveTokens: 16_384,
+		});
+		expect(windowNearReserve.trigger).toBe(15_616);
+		expect(windowNearReserve.zeroTriggerCause).toBeNull();
+
+		const belowReserveTier = {
+			...model,
+			cost: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				tiers: [{ inputTokensAbove: 12_000, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }],
+			},
+		};
+		const tierResolution = resolveCompactionTrigger(belowReserveTier, 0, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			reserveTokens: 16_384,
+		});
+		expect(tierResolution.budget).toBe(12_000);
+		expect(tierResolution.trigger).toBe(0);
+		expect(tierResolution.zeroTriggerCause).toBe("tier_boundary_below_reserve");
+
+		const smallWindow = resolveCompactionTrigger({ ...model, contextWindow: 12_000 }, 0, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			reserveTokens: 16_384,
+		});
+		expect(smallWindow.trigger).toBe(0);
+		expect(smallWindow.zeroTriggerCause).toBe("window_below_reserve");
+	});
+
+	it("uses maxContextFraction when set and reports that the fraction bound", () => {
+		const result = resolveCompactionTrigger(model, 0, { ...DEFAULT_COMPACTION_SETTINGS, maxContextFraction: 0.5 });
+		expect(result.trigger).toBe(136_000);
+		expect(result.capApplied).toBe(true);
+		expect(result.capValue).toBe(136_000);
+		expect(result.capSource).toBe("fraction");
+	});
+
+	it("applies an absolute cap before a percentage cap and reports whether it binds", () => {
+		const capped = resolveCompactionTrigger(model, 0, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			maxContextTokens: 170_000,
+			maxContextFraction: 0.5,
+		});
+		expect(capped.uncappedTrigger).toBe(239_360);
+		expect(capped.trigger).toBe(170_000);
+		expect(capped.capApplied).toBe(true);
+		expect(capped.capValue).toBe(170_000);
+		expect(capped.capSource).toBe("absolute");
+
+		const uncapped = resolveCompactionTrigger(model, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(uncapped.trigger).toBe(239_360);
+		expect(uncapped.capApplied).toBe(false);
+		expect(uncapped.capValue).toBeNull();
 	});
 });
 

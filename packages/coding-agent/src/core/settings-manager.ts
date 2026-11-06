@@ -8,6 +8,8 @@ import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
+import { DEFAULT_BRANCH_SUMMARY_RESERVE_TOKENS } from "./compaction/branch-summarization.ts";
+import { DEFAULT_COMPACTION_SETTINGS } from "./compaction/compaction.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import { DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS, type StreamInactivityAction } from "./stream-watchdog.ts";
 
@@ -38,13 +40,22 @@ export interface ContextSettings {
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
-	reserveTokens?: number; // default: 16384
-	keepRecentTokens?: number; // default: 20000
-	maxContextTokens?: number; // if set, absolute threshold (model-independent)
+	/** Explicit token count reserved from the window. Default: 16384. */
+	reserveTokens?: number;
+	keepRecentTokens?: number; // default: 20000 tokens
+	/** Absolute upper bound on trigger tokens; takes precedence over maxContextFraction. Default: unset. */
+	maxContextTokens?: number;
+	/** Fraction of effectiveBudget used as the trigger, before caps. Default: DEFAULT_COMPACTION_SETTINGS.triggerFraction. */
+	triggerFraction?: number;
+	/** Fraction of effectiveBudget cap; used only when maxContextTokens is unset. Default: unset. */
+	maxContextFraction?: number;
+	/** Fraction of trigger at which pre-send compaction begins. Default: DEFAULT_COMPACTION_SETTINGS.borderlineFraction. */
+	borderlineFraction?: number;
+	triggerFractions?: Record<string, number>; // provider/model-id overrides
 }
 
 export interface BranchSummarySettings {
-	reserveTokens?: number; // default: 16384 (tokens reserved for prompt + LLM response)
+	reserveTokens?: number; // tokens reserved for prompt + LLM response; default: DEFAULT_BRANCH_SUMMARY_RESERVE_TOKENS
 	skipPrompt?: boolean; // default: false - when true, skips "Summarize branch?" prompt and defaults to no summary
 }
 
@@ -342,6 +353,7 @@ export class SettingsManager {
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
 	private settingsPaths: SettingsPaths;
+	private compactionWarnings = new Set<string>();
 
 	private constructor(
 		storage: SettingsStorage,
@@ -871,7 +883,7 @@ export class SettingsManager {
 	}
 
 	getCompactionReserveTokens(): number {
-		return this.settings.compaction?.reserveTokens ?? 16384;
+		return this.settings.compaction?.reserveTokens ?? DEFAULT_COMPACTION_SETTINGS.reserveTokens!;
 	}
 
 	getCompactionKeepRecentTokens(): number {
@@ -904,21 +916,102 @@ export class SettingsManager {
 
 	getCompactionSettings(): {
 		enabled: boolean;
-		reserveTokens: number;
+		reserveTokens?: number;
 		keepRecentTokens: number;
 		maxContextTokens?: number;
+		maxContextFraction?: number;
+		triggerFraction: number;
+		borderlineFraction: number;
+		triggerFractions: Record<string, number>;
 	} {
+		const raw = this.settings.compaction;
+		const configuredFraction = raw?.triggerFraction;
+		const triggerFraction =
+			this.validateCompactionFraction(configuredFraction, "triggerFraction") ??
+			DEFAULT_COMPACTION_SETTINGS.triggerFraction!;
+		const borderlineFraction =
+			this.validateCompactionFraction(raw?.borderlineFraction, "borderlineFraction") ??
+			DEFAULT_COMPACTION_SETTINGS.borderlineFraction!;
+		const reserveTokens = raw?.reserveTokens;
+		if (
+			reserveTokens !== undefined &&
+			(typeof reserveTokens !== "number" || !Number.isFinite(reserveTokens) || reserveTokens < 0)
+		) {
+			this.warnCompactionSetting(
+				"reserveTokens",
+				"Invalid compaction.reserveTokens; expected a finite non-negative token count",
+			);
+		}
+		const validReserveTokens =
+			typeof reserveTokens === "number" && Number.isFinite(reserveTokens) && reserveTokens >= 0
+				? reserveTokens
+				: undefined;
+		const maxContextTokens = raw?.maxContextTokens;
+		if (
+			maxContextTokens !== undefined &&
+			(typeof maxContextTokens !== "number" || !Number.isFinite(maxContextTokens) || maxContextTokens < 0)
+		) {
+			this.warnCompactionSetting(
+				"maxContextTokens",
+				"Invalid compaction.maxContextTokens; expected a finite non-negative token count",
+			);
+		}
+		const validMaxContextTokens =
+			typeof maxContextTokens === "number" && Number.isFinite(maxContextTokens) && maxContextTokens >= 0
+				? maxContextTokens
+				: undefined;
+		const maxContextFraction = this.validateCompactionFraction(raw?.maxContextFraction, "maxContextFraction");
+		const triggerFractions: Record<string, number> = {};
+		const overrides = raw?.triggerFractions;
+		if (
+			overrides !== undefined &&
+			(typeof overrides !== "object" || overrides === null || Array.isArray(overrides))
+		) {
+			this.warnCompactionSetting("triggerFractions", "compaction.triggerFractions must be an object; ignoring it");
+		} else {
+			for (const [key, value] of Object.entries(overrides ?? {})) {
+				if (!/^[^/\s]+\/[^/\s]+$/.test(key)) {
+					this.warnCompactionSetting(
+						`triggerFractions:${key}`,
+						`Unknown compaction triggerFractions key '${key}'; ignoring it`,
+					);
+					continue;
+				}
+				const fraction = this.validateCompactionFraction(value, `triggerFractions.${key}`);
+				if (fraction !== undefined) triggerFractions[key] = fraction;
+			}
+		}
 		return {
 			enabled: this.getCompactionEnabled(),
-			reserveTokens: this.getCompactionReserveTokens(),
+			reserveTokens: validReserveTokens ?? DEFAULT_COMPACTION_SETTINGS.reserveTokens!,
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
-			maxContextTokens: this.getCompactionMaxContextTokens(),
+			maxContextTokens: validMaxContextTokens,
+			maxContextFraction,
+			triggerFraction,
+			borderlineFraction,
+			triggerFractions,
 		};
+	}
+
+	private validateCompactionFraction(value: unknown, name: string): number | undefined {
+		if (value === undefined) return undefined;
+		if (typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 1) return value;
+		this.warnCompactionSetting(
+			name,
+			`Invalid compaction.${name}; expected a finite number greater than 0 and at most 1`,
+		);
+		return undefined;
+	}
+
+	private warnCompactionSetting(key: string, message: string): void {
+		if (this.compactionWarnings.has(key)) return;
+		this.compactionWarnings.add(key);
+		this.errors.push({ scope: "global", error: new Error(message) });
 	}
 
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
 		return {
-			reserveTokens: this.settings.branchSummary?.reserveTokens ?? 16384,
+			reserveTokens: this.settings.branchSummary?.reserveTokens ?? DEFAULT_BRANCH_SUMMARY_RESERVE_TOKENS,
 			skipPrompt: this.settings.branchSummary?.skipPrompt ?? false,
 		};
 	}

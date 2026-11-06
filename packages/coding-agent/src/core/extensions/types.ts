@@ -604,6 +604,17 @@ export interface SessionBeforeCompactEvent {
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
 	signal: AbortSignal;
+	/** Resolved context limits used by the host for this model. */
+	effectiveContextWindow?: number;
+	effectiveBudget?: number;
+	firstCostTierBoundary?: number | null;
+	triggerTokens?: number;
+	triggerFraction?: number;
+	reserveTokens?: number;
+	capApplied?: boolean;
+	capValue?: number | null;
+	capSource?: "absolute" | "fraction" | "none";
+	windowSource?: "backend" | "static" | "stored" | "default";
 }
 
 /** Fired after context compaction succeeds */
@@ -615,6 +626,17 @@ export interface SessionCompactEvent {
 	reason: "manual" | "threshold" | "overflow";
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
+	/** Resolved context limits used by the host for this model. */
+	effectiveContextWindow?: number;
+	effectiveBudget?: number;
+	firstCostTierBoundary?: number | null;
+	triggerTokens?: number;
+	triggerFraction?: number;
+	reserveTokens?: number;
+	capApplied?: boolean;
+	capValue?: number | null;
+	capSource?: "absolute" | "fraction" | "none";
+	windowSource?: "backend" | "static" | "stored" | "default";
 }
 
 /** Fired after context compaction fails or is aborted */

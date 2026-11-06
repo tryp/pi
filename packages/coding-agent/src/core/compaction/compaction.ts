@@ -18,6 +18,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import { firstTierBoundary } from "@earendil-works/pi-ai/providers/codex-discovery";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionContext,
@@ -135,17 +136,133 @@ function combineUsage(first: Usage, second: Usage): Usage {
 
 export interface CompactionSettings {
 	enabled: boolean;
-	reserveTokens: number;
+	reserveTokens?: number;
 	keepRecentTokens: number;
 	maxContextTokens?: number;
+	maxContextFraction?: number;
+	triggerFraction?: number;
+	borderlineFraction?: number;
+	triggerFractions?: Record<string, number>;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
-	reserveTokens: 16384,
+	reserveTokens: 16_384,
 	keepRecentTokens: 20000,
 	maxContextTokens: undefined,
+	maxContextFraction: undefined,
+	triggerFraction: 0.88,
+	borderlineFraction: 0.9,
+	triggerFractions: {},
 };
+
+export const DEFAULT_CONTEXT_WINDOW = 128_000;
+
+export interface CompactionTriggerResolution {
+	trigger: number;
+	hardLimit: number;
+	budget: number;
+	contextWindow: number;
+	firstCostTierBoundary: number | null;
+	triggerFraction: number;
+	borderlineFraction: number;
+	reserveTokens: number;
+	capApplied: boolean;
+	capValue: number | null;
+	capSource: "absolute" | "fraction" | "none";
+	uncappedTrigger: number;
+	zeroTriggerCause: "tier_boundary_below_reserve" | "window_below_reserve" | null;
+	usedDefaultWindow: boolean;
+}
+
+/** Resolve the model-relative trigger, with the absolute cap retained as a ceiling. */
+export function resolveCompactionTrigger(
+	model: Model<any> | undefined,
+	contextWindow: number,
+	settings: CompactionSettings,
+): CompactionTriggerResolution {
+	const modelWindow = model?.contextWindow;
+	const validModelWindow = typeof modelWindow === "number" && Number.isFinite(modelWindow) && modelWindow > 0;
+	const validArgumentWindow = Number.isFinite(contextWindow) && contextWindow > 0;
+	const effectiveWindow = validModelWindow
+		? modelWindow
+		: validArgumentWindow
+			? contextWindow
+			: DEFAULT_CONTEXT_WINDOW;
+	const firstCostTierBoundary = model?.cost ? firstTierBoundary(model) : null;
+	const budget = Math.min(effectiveWindow, firstCostTierBoundary ?? effectiveWindow);
+	const override = model ? settings.triggerFractions?.[`${model.provider}/${model.id}`] : undefined;
+	const configuredFraction =
+		typeof override === "number" && Number.isFinite(override) && override > 0 && override <= 1
+			? override
+			: settings.triggerFraction;
+	const fraction =
+		typeof configuredFraction === "number" &&
+		Number.isFinite(configuredFraction) &&
+		configuredFraction > 0 &&
+		configuredFraction <= 1
+			? configuredFraction
+			: DEFAULT_COMPACTION_SETTINGS.triggerFraction!;
+	const borderlineFraction =
+		typeof settings.borderlineFraction === "number" &&
+		Number.isFinite(settings.borderlineFraction) &&
+		settings.borderlineFraction > 0 &&
+		settings.borderlineFraction <= 1
+			? settings.borderlineFraction
+			: DEFAULT_COMPACTION_SETTINGS.borderlineFraction!;
+	const reserveTokens =
+		typeof settings.reserveTokens === "number" &&
+		Number.isFinite(settings.reserveTokens) &&
+		settings.reserveTokens >= 0
+			? settings.reserveTokens
+			: DEFAULT_COMPACTION_SETTINGS.reserveTokens!;
+	const triggerBeforeClamp = Math.min(Math.floor(budget * fraction), budget - reserveTokens);
+	const zeroTriggerCause =
+		triggerBeforeClamp <= 0
+			? firstCostTierBoundary !== null && firstCostTierBoundary <= effectiveWindow
+				? "tier_boundary_below_reserve"
+				: "window_below_reserve"
+			: null;
+	const uncappedTrigger = Math.max(0, triggerBeforeClamp);
+	const absoluteCap =
+		typeof settings.maxContextTokens === "number" &&
+		Number.isFinite(settings.maxContextTokens) &&
+		settings.maxContextTokens >= 0
+			? settings.maxContextTokens
+			: undefined;
+	const fractionalCap =
+		typeof settings.maxContextFraction === "number" &&
+		Number.isFinite(settings.maxContextFraction) &&
+		settings.maxContextFraction > 0 &&
+		settings.maxContextFraction <= 1
+			? Math.floor(budget * settings.maxContextFraction)
+			: undefined;
+	const capValue = absoluteCap ?? fractionalCap;
+	const capApplied = capValue !== undefined && uncappedTrigger > capValue;
+	const capSource: CompactionTriggerResolution["capSource"] = capApplied
+		? absoluteCap !== undefined
+			? "absolute"
+			: "fraction"
+		: "none";
+	const hardLimit = Math.max(0, Math.min(budget - reserveTokens, capValue ?? Number.POSITIVE_INFINITY));
+	const trigger = Math.max(0, Math.min(uncappedTrigger, capValue ?? Number.POSITIVE_INFINITY));
+	return {
+		trigger,
+		hardLimit,
+		budget,
+		contextWindow: effectiveWindow,
+		firstCostTierBoundary,
+		triggerFraction: fraction,
+		borderlineFraction,
+		reserveTokens,
+		capApplied,
+		capValue: capValue ?? null,
+		capSource,
+		uncappedTrigger,
+		zeroTriggerCause,
+		usedDefaultWindow: !validModelWindow && !validArgumentWindow,
+	};
+}
 
 // ============================================================================
 // Token calculation
@@ -288,15 +405,14 @@ export function estimateProviderContextTokens(
 /**
  * Check if compaction should trigger based on context usage.
  */
-export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+export function shouldCompact(
+	contextTokens: number,
+	contextWindow: number,
+	settings: CompactionSettings,
+	model?: Model<any>,
+): boolean {
 	if (!settings.enabled) return false;
-	// If maxContextTokens is set, use it as an absolute threshold (model-independent).
-	// This allows triggering compaction at a fixed token level regardless of the
-	// model's context window (e.g., compact at 180k whether model has 200k or 1M context).
-	if (settings.maxContextTokens != null) {
-		return contextTokens > settings.maxContextTokens;
-	}
-	return contextTokens > contextWindow - settings.reserveTokens;
+	return contextTokens > resolveCompactionTrigger(model, contextWindow, settings).trigger;
 }
 
 // ============================================================================
@@ -743,6 +859,7 @@ export async function generateSummaryWithUsage(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
+	// Hard safety allocation: reserve 20% of the configured output reserve for provider overhead and accounting variance.
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
@@ -953,6 +1070,7 @@ export async function compact(
 		fileOps,
 		settings,
 	} = preparation;
+	const reserveTokens = resolveCompactionTrigger(model, model.contextWindow ?? 0, settings).reserveTokens;
 
 	// Generate summaries and merge into one
 	let summary: string;
@@ -965,7 +1083,7 @@ export async function compact(
 			const historyResult = await generateSummaryWithUsage(
 				messagesToSummarize,
 				model,
-				settings.reserveTokens,
+				reserveTokens,
 				apiKey,
 				headers,
 				signal,
@@ -984,7 +1102,7 @@ export async function compact(
 		const turnPrefixResult = await generateTurnPrefixSummary(
 			turnPrefixMessages,
 			model,
-			settings.reserveTokens,
+			reserveTokens,
 			apiKey,
 			headers,
 			env,
@@ -1003,7 +1121,7 @@ export async function compact(
 		const result = await generateSummaryWithUsage(
 			messagesToSummarize,
 			model,
-			settings.reserveTokens,
+			reserveTokens,
 			apiKey,
 			headers,
 			signal,
@@ -1054,6 +1172,7 @@ async function generateTurnPrefixSummary(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
+	// Hard safety allocation: the turn-prefix summary receives at most half of the reserve so it cannot consume the history summary's budget.
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
