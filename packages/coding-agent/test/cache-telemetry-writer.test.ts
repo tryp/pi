@@ -117,6 +117,16 @@ const optionalRequestFields: Record<OptionalRequestField, unknown> = {
 	comparisonUnavailableCause: "predecessor_not_recorded",
 	comparisonBasis: "bounded_truncated",
 	previousSegmentCount: 128,
+	wirePayloadSha256: "a".repeat(64),
+	previousWirePayloadSha256Match: true,
+	previousTailMatch: "aligned_append",
+	tailChangedFromEnd: 0,
+	segmentCount: 256,
+	keptHead: 64,
+	keptTail: 64,
+	middleSegmentCount: 128,
+	headDroppedForBudget: 0,
+	previousKeptHead: 64,
 };
 
 type OptionalOperationField = Exclude<
@@ -871,6 +881,68 @@ describe("cache miss attribution", () => {
 		noPredecessor.prefixComparable = true;
 		noPredecessor.comparisonUnavailableCause = "no_predecessor";
 		expect(classifyCacheMissComparison(noPredecessor)).toEqual({ kind: "unknown" });
+	});
+
+	it("classifies head-tail comparisons without treating ordinary large appends as rewrites", () => {
+		const segments = Array.from({ length: 128 }, (_, index) => ({
+			name: "message" as const,
+			byteLength: 10,
+			hmacSha256: String(index).padStart(64, "0"),
+		}));
+		const appended = mutableRequestRecord();
+		appended.segments = segments;
+		appended.prefixComparable = true;
+		appended.comparisonBasis = "bounded_truncated";
+		appended.fingerprintStatus = "truncated";
+		appended.previousCommonPrefixSegments = 64;
+		appended.previousSegmentCount = 200;
+		appended.previousKeptHead = 64;
+		appended.keptHead = 64;
+		appended.keptTail = 64;
+		appended.segmentCount = 201;
+		appended.middleSegmentCount = 73;
+		appended.previousTailMatch = "aligned_append";
+		appended.truncatedSegmentCount = 73;
+		expect(classifyCacheMissComparison(appended)).toEqual({ kind: "comparison_truncated" });
+		appended.previousWirePayloadSha256Match = true;
+		expect(classifyCacheMissComparison(appended)).toEqual({ kind: "prefix_identical_provider_side" });
+
+		const identical = mutableRequestRecord();
+		identical.prefixComparable = true;
+		identical.fingerprintStatus = "unavailable";
+		identical.previousWirePayloadSha256Match = true;
+		expect(classifyCacheMissComparison(identical)).toEqual({ kind: "prefix_identical_provider_side" });
+
+		const rewritten = mutableRequestRecord();
+		rewritten.segments = segments.map((segment, index) =>
+			index === 127 ? { ...segment, hmacSha256: "f".repeat(64) } : segment,
+		);
+		rewritten.prefixComparable = true;
+		rewritten.comparisonBasis = "bounded_truncated";
+		rewritten.fingerprintStatus = "truncated";
+		rewritten.previousCommonPrefixSegments = 64;
+		rewritten.previousSegmentCount = 200;
+		rewritten.previousKeptHead = 64;
+		rewritten.keptHead = 64;
+		rewritten.keptTail = 64;
+		rewritten.segmentCount = 200;
+		rewritten.middleSegmentCount = 72;
+		rewritten.previousTailMatch = "aligned_rewrite";
+		rewritten.tailChangedFromEnd = 0;
+		expect(classifyCacheMissComparison(rewritten)).toEqual({ kind: "messages_rewritten", reasons: [] });
+
+		const legacy = mutableRequestRecord();
+		legacy.prefixComparable = true;
+		legacy.previousCommonPrefixSegments = 64;
+		legacy.previousSegmentCount = 128;
+		expect(classifyCacheMissComparison(legacy)).toEqual({ kind: "messages_rewritten", reasons: [] });
+
+		const small = mutableRequestRecord();
+		small.segments = [{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) }];
+		small.prefixComparable = true;
+		small.previousCommonPrefixSegments = 0;
+		small.previousSegmentCount = 1;
+		expect(classifyCacheMissComparison(small)).toEqual({ kind: "system_prompt_changed" });
 	});
 
 	it("joins the newest completed request's comparison to the notice, and expires it", () => {
