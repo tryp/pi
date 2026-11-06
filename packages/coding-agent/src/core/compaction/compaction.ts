@@ -18,7 +18,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
-import { firstTierBoundary } from "@earendil-works/pi-ai/providers/codex-discovery";
+import { firstTierBoundary, isUnpricedZeroCost } from "@earendil-works/pi-ai/providers/codex-discovery";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionContext,
@@ -164,6 +164,13 @@ export interface CompactionTriggerResolution {
 	budget: number;
 	contextWindow: number;
 	firstCostTierBoundary: number | null;
+	/**
+	 * Why `firstCostTierBoundary` is null, when it is. `tiers` means the model publishes a cost tier
+	 * and the boundary came from it; `flat` means the price is known but does not step; `pricing_unknown`
+	 * means the model carries no published price at all, so no boundary can be trusted.
+	 * Only `flat` and `tiers` describe a cost fact.
+	 */
+	costTierBoundarySource: "tiers" | "flat" | "pricing_unknown";
 	triggerFraction: number;
 	borderlineFraction: number;
 	reserveTokens: number;
@@ -190,7 +197,21 @@ export function resolveCompactionTrigger(
 		: validArgumentWindow
 			? contextWindow
 			: DEFAULT_CONTEXT_WINDOW;
-	const firstCostTierBoundary = model?.cost ? firstTierBoundary(model) : null;
+	// A discovered model whose provider publishes no pricing carries an all-zero cost placeholder.
+	// That is not a zero price, so the tier boundary is unknown rather than absent-by-catalog.
+	// The asymmetry is deliberate: calling a genuinely free model "unknown" costs nothing (both
+	// yield no boundary and the same trigger), while labelling unknown pricing as a known cost fact
+	// is exactly what hid gpt-6.1-terra escaping the tier clamp at a 440_000 trigger.
+	const pricingKnown =
+		model !== undefined &&
+		model.costSource !== "unknown" &&
+		(model.costSource === "known" || !isUnpricedZeroCost(model.cost));
+	const firstCostTierBoundary = model !== undefined && pricingKnown ? firstTierBoundary(model) : null;
+	const costTierBoundarySource: CompactionTriggerResolution["costTierBoundarySource"] = !pricingKnown
+		? "pricing_unknown"
+		: firstCostTierBoundary === null
+			? "flat"
+			: "tiers";
 	const budget = Math.min(effectiveWindow, firstCostTierBoundary ?? effectiveWindow);
 	const override = model ? settings.triggerFractions?.[`${model.provider}/${model.id}`] : undefined;
 	const configuredFraction =
@@ -258,6 +279,7 @@ export function resolveCompactionTrigger(
 		budget,
 		contextWindow: effectiveWindow,
 		firstCostTierBoundary,
+		costTierBoundarySource,
 		triggerFraction: fraction,
 		borderlineFraction,
 		reserveTokens,

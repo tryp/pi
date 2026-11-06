@@ -431,6 +431,7 @@ describe("resolveCompactionTrigger", () => {
 			const result = resolveCompactionTrigger(solOrTerra, 0, DEFAULT_COMPACTION_SETTINGS);
 			expect(result.contextWindow).toBe(500_000);
 			expect(result.firstCostTierBoundary).toBe(boundary);
+			expect(result.costTierBoundarySource).toBe("tiers");
 			expect(result.budget).toBe(272_000);
 			expect(result.trigger).toBe(239_360);
 		}
@@ -440,6 +441,61 @@ describe("resolveCompactionTrigger", () => {
 		expect(noTiers.firstCostTierBoundary).toBeNull();
 		expect(noTiers.budget).toBe(200_000);
 		expect(noTiers.trigger).toBe(176_000);
+	});
+
+	it("identifies unknown pricing separately from flat pricing for a terra-sized window", () => {
+		const unknownPricedModel = {
+			...model,
+			id: "gpt-6.1-terra",
+			contextWindow: 500_000,
+			cost: { ...model.cost },
+			costSource: "unknown" as const,
+		};
+		const resolution = resolveCompactionTrigger(unknownPricedModel, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(unknownPricedModel.costSource).toBe("unknown");
+		expect(resolution.firstCostTierBoundary).toBeNull();
+		expect(resolution.costTierBoundarySource).toBe("pricing_unknown");
+		expect(resolution.budget).toBe(500_000);
+		expect(resolution.trigger).toBe(440_000);
+
+		// Flat means "priced, and the price does not step" -- so it needs real rates. A model with
+		// no tiers AND no rates is an unpriced placeholder, which is a different state (tested below).
+		const flatPricedResolution = resolveCompactionTrigger(
+			{ ...model, cost: { ...model.cost, input: 2, output: 10, tiers: undefined } },
+			0,
+			{ ...DEFAULT_COMPACTION_SETTINGS },
+		);
+		expect(flatPricedResolution.firstCostTierBoundary).toBeNull();
+		expect(flatPricedResolution.costTierBoundarySource).toBe("flat");
+	});
+
+	it("treats an unmarked all-zero cost placeholder as unknown pricing, not as a known zero price", () => {
+		// The production shape: a model persisted before discovery marked pricing at all.
+		// ~/.pi/agent/models-store.json holds gpt-6.1-terra exactly like this, so a marker-only
+		// rule would leave the live model mislabelled as cost-known.
+		const unmarkedPlaceholder = {
+			...model,
+			id: "gpt-6.1-terra",
+			contextWindow: 500_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			costSource: undefined,
+		};
+		const resolution = resolveCompactionTrigger(unmarkedPlaceholder, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(resolution.firstCostTierBoundary).toBeNull();
+		expect(resolution.costTierBoundarySource).toBe("pricing_unknown");
+		expect(resolution.budget).toBe(500_000);
+		expect(resolution.trigger).toBe(440_000);
+	});
+
+	it("does not clamp a model whose pricing is known and flat", () => {
+		const flat = resolveCompactionTrigger(
+			{ ...model, contextWindow: 500_000, cost: { ...model.cost, tiers: undefined }, costSource: "known" },
+			0,
+			DEFAULT_COMPACTION_SETTINGS,
+		);
+		expect(flat.costTierBoundarySource).toBe("flat");
+		expect(flat.budget).toBe(500_000);
+		expect(flat.trigger).toBe(440_000);
 	});
 
 	it("clamps the retained tail to the resolved hard limit for small windows", () => {

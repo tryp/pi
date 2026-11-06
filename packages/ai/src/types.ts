@@ -849,6 +849,8 @@ export interface Model<TApi extends Api> {
 	thinkingLevelMap?: ThinkingLevelMap;
 	input: ("text" | "image")[];
 	cost: ModelCost;
+	/** Explicitly marks discovered models whose provider does not publish pricing. */
+	costSource?: "unknown" | "known";
 	contextWindow: number;
 	/** Provenance for dynamic context-window resolution when known. */
 	contextWindowSource?: "backend" | "stored" | "static" | "default";

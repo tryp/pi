@@ -716,6 +716,7 @@ describe("pre-send gate end to end", () => {
 				_compactionEventLimits: (settings: ReturnType<SettingsManager["getCompactionSettings"]>) => {
 					windowSource: string;
 					triggerTokens: number;
+					costTierBoundarySource: "tiers" | "flat" | "pricing_unknown";
 				};
 			};
 			expect(eventLimits._compactionEventLimits(settingsManager.getCompactionSettings()).windowSource).toBe(
@@ -749,6 +750,25 @@ describe("pre-send gate end to end", () => {
 				expect.objectContaining({ kind: "compaction_context_window_fallback", contextWindow: 128_000 }),
 			);
 			expect(session.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
+
+			// A model whose provider publishes no pricing cannot be clamped against a cost tier, so the
+			// host must record that rather than let the unclamped trigger read as a flat price.
+			const unpricedModel = session.model as Model<Api> & { costSource?: "unknown" | "known" };
+			unpricedModel.contextWindow = 500_000;
+			unpricedModel.cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+			unpricedModel.costSource = undefined;
+			const unpricedLimits = eventLimits._compactionEventLimits(settingsManager.getCompactionSettings());
+			expect(unpricedLimits.costTierBoundarySource).toBe("pricing_unknown");
+			const unpricedDiagnostics = session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic")
+				.map((entry) => (entry as { data: Record<string, unknown> }).data);
+			expect(unpricedDiagnostics).toContainEqual(
+				expect.objectContaining({
+					kind: "compaction_trigger_pricing_unknown",
+					costTierBoundarySource: "pricing_unknown",
+				}),
+			);
 		} finally {
 			session.dispose();
 			modelRegistry.unregisterProvider(model.provider);

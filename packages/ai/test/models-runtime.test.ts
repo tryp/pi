@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
 import type { ApiKeyAuth, CredentialStore, OAuthAuth, OAuthCredential, ProviderAuth } from "../src/auth/types.ts";
-import { calculateCost, createModels, createProvider, hasApi, type Provider } from "../src/models.ts";
+import { calculateCost, createModels, createProvider, hasApi, modelPricingStats, type Provider } from "../src/models.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "../src/models-store.ts";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, StreamOptions, Usage } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
@@ -157,6 +157,21 @@ describe("Models runtime", () => {
 		expect(long.output).toBe(4.5);
 		expect(long.cacheRead).toBe(0.072);
 		expect(long.cacheWrite).toBe(0.0000125);
+	});
+
+	it("keeps numeric usage costs and counts calculations for unknown pricing", () => {
+		const model = { ...testModel("codex", "gpt-6.1-terra"), costSource: "unknown" as const };
+		const before = modelPricingStats.unknownPriceCalculations;
+		const cost = calculateCost(model, {
+			input: 12_000,
+			output: 500,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 12_500,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		expect(cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
+		expect(modelPricingStats.unknownPriceCalculations).toBe(before + 1);
 	});
 
 	it("registers, replaces, and deletes providers", () => {

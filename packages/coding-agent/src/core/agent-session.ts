@@ -1421,6 +1421,20 @@ export class AgentSession {
 						| (Model<any> & { contextWindowSource?: "backend" | "stored" | "static" | "default" })
 						| undefined
 				)?.contextWindowSource ?? "static");
+		if (resolution.costTierBoundarySource === "pricing_unknown") {
+			// The cost-tier clamp is the guard against stepping into a provider's higher price band.
+			// A model whose provider publishes no pricing cannot be clamped, so record that fact where
+			// analysis can query it instead of leaving the unclamped trigger to look like a flat price.
+			this._appendDiagnostic({
+				kind: "compaction_trigger_pricing_unknown",
+				message: `No published pricing for ${this.model ? `${this.model.provider}/${this.model.id}` : "this model"}; the cost-tier clamp cannot apply, so the trigger is window-derived (${resolution.trigger} of ${resolution.contextWindow}).`,
+				effectiveContextWindow: resolution.contextWindow,
+				effectiveBudget: resolution.budget,
+				triggerTokens: resolution.trigger,
+				triggerFraction: resolution.triggerFraction,
+				costTierBoundarySource: resolution.costTierBoundarySource,
+			});
+		}
 		if (resolution.capApplied) {
 			const absolute = resolution.capSource === "absolute";
 			const capName = absolute ? "maxContextTokens" : "maxContextFraction";
@@ -1437,6 +1451,7 @@ export class AgentSession {
 			effectiveContextWindow: resolution.contextWindow,
 			effectiveBudget: resolution.budget,
 			firstCostTierBoundary: resolution.firstCostTierBoundary,
+			costTierBoundarySource: resolution.costTierBoundarySource,
 			triggerTokens: resolution.trigger,
 			triggerFraction: resolution.triggerFraction,
 			reserveTokens: resolution.reserveTokens,

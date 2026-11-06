@@ -143,6 +143,77 @@ describe("dynamic model merge", () => {
 		expect(resolved?.cost.tiers).toEqual(curated.cost.tiers);
 	});
 
+	it("preserves curated pricing when reasoning-capable discovery has unknown pricing", async () => {
+		const curated = {
+			...catalogModel(),
+			cost: {
+				...catalogModel().cost,
+				tiers: [{ inputTokensAbove: 272000, input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 }],
+			},
+		};
+		const dynamicProvider = createProvider({
+			id: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			auth,
+			models: [curated],
+			fetchModels: async () => [
+				{
+					...placeholderModel(),
+					reasoning: true,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					costSource: "unknown",
+				},
+			],
+			api: {
+				stream: () => new AssistantMessageEventStream(),
+				streamSimple: () => new AssistantMessageEventStream(),
+			},
+		});
+		const models = createModels({ modelsStore: stubStore });
+		models.setProvider(dynamicProvider);
+		await models.refresh({ providers: ["opencode-go"], allowNetwork: true });
+
+		const resolved = models.getModel("opencode-go", "deepseek-flash");
+		expect(resolved?.cost.tiers).toEqual(curated.cost.tiers);
+		expect(resolved?.cost.input).toBe(curated.cost.input);
+	});
+
+	it("preserves curated pricing when discovery supplies an unmarked all-zero placeholder", async () => {
+		// Backwards compatibility with entries persisted before pricing provenance existed:
+		// the merge must not need the marker to tell a placeholder from a real price.
+		const curated = {
+			...catalogModel(),
+			cost: {
+				...catalogModel().cost,
+				tiers: [{ inputTokensAbove: 272000, input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 }],
+			},
+		};
+		const dynamicProvider = createProvider({
+			id: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			auth,
+			models: [curated],
+			fetchModels: async () => [
+				{
+					...placeholderModel(),
+					reasoning: true,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				},
+			],
+			api: {
+				stream: () => new AssistantMessageEventStream(),
+				streamSimple: () => new AssistantMessageEventStream(),
+			},
+		});
+		const models = createModels({ modelsStore: stubStore });
+		models.setProvider(dynamicProvider);
+		await models.refresh({ providers: ["opencode-go"], allowNetwork: true });
+
+		const resolved = models.getModel("opencode-go", "deepseek-flash");
+		expect(resolved?.cost.tiers).toEqual(curated.cost.tiers);
+		expect(resolved?.cost.input).toBe(curated.cost.input);
+	});
+
 	it("does not let an untrusted dynamic window inflate the curated window", async () => {
 		const dynamicProvider = createProvider({
 			id: "opencode-go",

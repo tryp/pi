@@ -86,6 +86,8 @@ describe("openai-codex dynamic discovery", () => {
 			input: ["text", "image"],
 			contextWindow: 500_000,
 		});
+		expect(latest?.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+		expect(latest?.costSource).toBe("unknown");
 		expect(models.map((model) => model.id)).toContain("codex-auto-review");
 	});
 

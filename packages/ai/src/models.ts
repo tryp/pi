@@ -14,6 +14,7 @@ import type {
 	ProviderAuth,
 } from "./auth/types.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "./models-store.ts";
+import { isUnpricedZeroCost } from "./providers/codex-discovery.ts";
 import {
 	getOpenCodeSessionHeaders,
 	markOpenCodeSessionHeaderTransformed,
@@ -787,18 +788,22 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 	 * as identity aliases (zero cost, reasoning disabled, tiny window)
 	 * alongside the real renames; wholesale replacement silently downgrades
 	 * the model the user selected (e.g. opencode-go/deepseek-flash loses its
-	 * reasoning flag and context window). The curated fields protected here
-	 * are name, reasoning, cost, compat, and either side's larger token
-	 * limits; all other fields pass through from the discovery entry.
+	 * reasoning flag and context window). Curated pricing is protected when
+	 * discovery marks it unknown or supplies an unmarked all-zero placeholder;
+	 * name, reasoning, compat, and token limits retain their existing rules.
 	 */
 	const mergeDynamicModel = (base: Model<TApi>, dynamic: Model<TApi>): Model<TApi> => {
 		const mergedModel = { ...base, ...dynamic };
+		if (dynamic.costSource === "unknown" || (dynamic.costSource !== "known" && isUnpricedZeroCost(dynamic.cost))) {
+			// Missing discovery pricing is not a zero price. Keep curated pricing when available.
+			mergedModel.cost = base.cost;
+			mergedModel.costSource = base.costSource;
+		}
 		if (base.reasoning && !dynamic.reasoning) {
 			// The dynamic entry is a shadow placeholder (or a stray downgrade):
-			// keep the curated identity, capability, and pricing untouched.
+			// keep the curated identity and capability untouched.
 			mergedModel.name = base.name;
 			mergedModel.reasoning = base.reasoning;
-			mergedModel.cost = base.cost;
 		}
 		if (!mergedModel.compat && base.compat) mergedModel.compat = base.compat;
 		mergedModel.maxTokens = Math.max(base.maxTokens, dynamic.maxTokens);
@@ -932,7 +937,10 @@ export function hasApi<TApi extends Api>(model: Model<Api>, api: TApi): model is
 	return model.api === api;
 }
 
+export const modelPricingStats = { unknownPriceCalculations: 0 };
+
 export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
+	if (model.costSource === "unknown") modelPricingStats.unknownPriceCalculations++;
 	const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
 	let rates: ModelCostRates = model.cost;
 	let matchedThreshold = -1;

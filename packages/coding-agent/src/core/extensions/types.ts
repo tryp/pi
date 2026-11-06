@@ -608,6 +608,7 @@ export interface SessionBeforeCompactEvent {
 	effectiveContextWindow?: number;
 	effectiveBudget?: number;
 	firstCostTierBoundary?: number | null;
+	costTierBoundarySource?: "tiers" | "flat" | "pricing_unknown";
 	triggerTokens?: number;
 	triggerFraction?: number;
 	reserveTokens?: number;
@@ -630,6 +631,7 @@ export interface SessionCompactEvent {
 	effectiveContextWindow?: number;
 	effectiveBudget?: number;
 	firstCostTierBoundary?: number | null;
+	costTierBoundarySource?: "tiers" | "flat" | "pricing_unknown";
 	triggerTokens?: number;
 	triggerFraction?: number;
 	reserveTokens?: number;
