@@ -96,6 +96,8 @@ export function classifyCacheMissComparison(
 	request: CacheTelemetryRequestRecord,
 	operations: readonly CacheOperationObservation[] = [],
 ): CacheMissAttribution {
+	if (request.previousWirePayloadSha256Match === true)
+		return { kind: "prefix_identical_provider_side" };
 	if (
 		!request.prefixComparable ||
 		request.fingerprintStatus === "unavailable" ||
@@ -105,12 +107,18 @@ export function classifyCacheMissComparison(
 		return { kind: "unknown" };
 	const segments = request.segments;
 	const common = request.previousCommonPrefixSegments;
-	const changedSegment = segments[common];
-	if (common === 0 && changedSegment?.name === "system") return { kind: "system_prompt_changed" };
+	const previousSegmentCount = request.previousSegmentCount;
+	const headKeptCurrent = request.keptHead ?? segments.length;
+	const headKeptPrevious = request.previousKeptHead ?? previousSegmentCount ?? segments.length;
+	const headLimit = Math.min(headKeptCurrent, headKeptPrevious);
+	const headChanged = common < headLimit;
+	const changedSegment = headChanged ? segments[common] : undefined;
+	if (headChanged && common === 0 && changedSegment?.name === "system")
+		return { kind: "system_prompt_changed" };
 	const operationChanges = request.operationChanges;
 	const changedTools = segments.filter((segment, index) => segment.name === "tools" && index >= common).length;
 	if (
-		changedSegment?.name === "tools" ||
+		(headChanged && changedSegment?.name === "tools") ||
 		operationChanges?.tools === "changed" ||
 		operationChanges?.toolOrder === "changed"
 	) {
@@ -124,26 +132,46 @@ export function classifyCacheMissComparison(
 				.filter((reason) => reason !== undefined && reason !== "unavailable"),
 		),
 	];
-	const previousSegmentCount = request.previousSegmentCount;
-	// An observed difference inside the predecessor is a rewrite of history: an appended segment
-	// always sits *after* the common prefix, so it can never be the one that differs. The
-	// `operationChanges` heuristic only names a rewrite the instrumentation happened to record;
-	// the difference itself is the evidence, and the notice says "history rewritten" when no
-	// annotation explains it.
+	if (headChanged) return { kind: "messages_rewritten", reasons: rewriteReasons };
+	if (rewriteReasons.length) return { kind: "messages_rewritten", reasons: rewriteReasons };
+
+	// The common-prefix count aligns only the head. Tail evidence is computed in the AI
+	// package from both requests, where predecessor digests are available; consume its
+	// explicit verdict rather than comparing head+tail by absolute index here.
+	if (request.previousTailMatch === "aligned_append") {
+		if (
+			(request.middleSegmentCount ?? 0) > 0 ||
+			request.fingerprintStatus === "truncated" ||
+			request.comparisonBasis === "bounded_truncated"
+		)
+			return { kind: "comparison_truncated" };
+		return { kind: "prefix_identical_provider_side" };
+	}
+	if (request.previousTailMatch === "aligned_rewrite") {
+		const tailIndex =
+			(request.keptHead ?? 0) +
+			(request.keptTail ?? 0) -
+			1 -
+			(request.tailChangedFromEnd ?? 0);
+		const tailChange = segments[tailIndex];
+		if (tailChange?.name === "tools")
+			return {
+				kind: "tools_changed",
+				changedTools: Math.max(
+					1,
+					segments.filter((segment, index) => segment.name === "tools" && index >= tailIndex).length,
+				),
+			};
+		if (tailChange?.name === "system") return { kind: "system_prompt_changed" };
+		return { kind: "messages_rewritten", reasons: rewriteReasons };
+	}
+
+	// Old records have no tail verdict. Preserve their original absolute-prefix rules.
 	if (typeof previousSegmentCount === "number" && common < previousSegmentCount)
 		return { kind: "messages_rewritten", reasons: rewriteReasons };
-	if (rewriteReasons.length) return { kind: "messages_rewritten", reasons: rewriteReasons };
-	// Every request that appends a message grows its segment list, so requiring the common
-	// prefix to cover the *current* request made this branch unreachable for anything but a
-	// re-sent identical request. What explains a miss with an unchanged prefix is the prefix
-	// being unchanged: everything the predecessor sent was still identical at the front, and
-	// the extra segments are new content appended after it.
 	const prefixIdentical =
 		typeof previousSegmentCount === "number" && previousSegmentCount > 0 && common >= previousSegmentCount;
 	if (prefixIdentical) {
-		// `complete` means both sides were compared in full. A truncated window compares only the
-		// head, so an identical head does not rule out a change further in: say that instead of
-		// claiming the provider evicted the prefix.
 		if (request.comparisonBasis === "complete" && request.truncatedSegmentCount === 0)
 			return { kind: "prefix_identical_provider_side" };
 		return { kind: "comparison_truncated" };
@@ -477,11 +505,34 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 			if (typeof comparisonBasis !== "string" || !COMPARISON_BASES.has(comparisonBasis)) return undefined;
 			output.comparisonBasis = comparisonBasis;
 		}
-		for (const field of ["previousSegmentCount", "postHookInputCount"] as const) {
+		for (const field of ["previousSegmentCount", "postHookInputCount", "segmentCount", "middleSegmentCount", "headDroppedForBudget"] as const) {
 			const value = data(source, field);
 			if (value === undefined) continue;
 			if (!boundedCount(value, 1_000_000)) return undefined;
 			output[field] = value;
+		}
+		for (const field of ["keptHead", "keptTail", "previousKeptHead", "tailChangedFromEnd"] as const) {
+			const value = data(source, field);
+			if (value === undefined) continue;
+			if (!boundedCount(value, MAX_SEGMENTS)) return undefined;
+			output[field] = value;
+		}
+		const wirePayloadSha256 = data(source, "wirePayloadSha256");
+		if (wirePayloadSha256 !== undefined) {
+			if (typeof wirePayloadSha256 !== "string" || !HEX_64.test(wirePayloadSha256)) return undefined;
+			output.wirePayloadSha256 = wirePayloadSha256;
+		}
+		const previousWirePayloadSha256Match = data(source, "previousWirePayloadSha256Match");
+		if (previousWirePayloadSha256Match !== undefined) {
+			if (previousWirePayloadSha256Match !== null && typeof previousWirePayloadSha256Match !== "boolean")
+				return undefined;
+			output.previousWirePayloadSha256Match = previousWirePayloadSha256Match;
+		}
+		const previousTailMatch = data(source, "previousTailMatch");
+		if (previousTailMatch !== undefined) {
+			if (!new Set(["aligned_append", "aligned_rewrite", "unknown"]).has(String(previousTailMatch)))
+				return undefined;
+			output.previousTailMatch = previousTailMatch;
 		}
 		return output as unknown as CacheTelemetryRecord;
 	}
