@@ -610,6 +610,7 @@ export interface SessionBeforeCompactEvent {
 	firstCostTierBoundary?: number | null;
 	costTierBoundarySource?: "tiers" | "flat" | "pricing_unknown";
 	triggerTokens?: number;
+	triggerBasis?: "fraction" | "reserve" | "absolute_cap" | "fraction_cap";
 	triggerFraction?: number;
 	reserveTokens?: number;
 	capApplied?: boolean;
@@ -633,6 +634,7 @@ export interface SessionCompactEvent {
 	firstCostTierBoundary?: number | null;
 	costTierBoundarySource?: "tiers" | "flat" | "pricing_unknown";
 	triggerTokens?: number;
+	triggerBasis?: "fraction" | "reserve" | "absolute_cap" | "fraction_cap";
 	triggerFraction?: number;
 	reserveTokens?: number;
 	capApplied?: boolean;

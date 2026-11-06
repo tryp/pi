@@ -179,6 +179,7 @@ export interface CompactionTriggerResolution {
 	capSource: "absolute" | "fraction" | "none";
 	uncappedTrigger: number;
 	zeroTriggerCause: "tier_boundary_below_reserve" | "window_below_reserve" | null;
+	triggerBasis: "fraction" | "reserve" | "absolute_cap" | "fraction_cap";
 	usedDefaultWindow: boolean;
 }
 
@@ -238,7 +239,12 @@ export function resolveCompactionTrigger(
 		settings.reserveTokens >= 0
 			? settings.reserveTokens
 			: DEFAULT_COMPACTION_SETTINGS.reserveTokens!;
-	const triggerBeforeClamp = Math.min(Math.floor(budget * fraction), budget - reserveTokens);
+	const fractionCandidate = Math.floor(budget * fraction);
+	const reserveCandidate = budget - reserveTokens;
+	const triggerBeforeClamp = Math.min(fractionCandidate, reserveCandidate);
+	// On an exact tie the fraction wins; reserve is reported only when it is strictly smaller.
+	let triggerBasis: CompactionTriggerResolution["triggerBasis"] =
+		reserveCandidate < fractionCandidate ? "reserve" : "fraction";
 	const zeroTriggerCause =
 		triggerBeforeClamp <= 0
 			? firstCostTierBoundary !== null && firstCostTierBoundary <= effectiveWindow
@@ -273,6 +279,11 @@ export function resolveCompactionTrigger(
 	const trigger = configuredAbsoluteCapIsFallback
 		? absoluteCap
 		: Math.max(0, Math.min(uncappedTrigger, capValue ?? Number.POSITIVE_INFINITY));
+	if (configuredAbsoluteCapIsFallback) {
+		triggerBasis = "absolute_cap";
+	} else if (capValue !== undefined && capValue < uncappedTrigger) {
+		triggerBasis = capSource === "absolute" ? "absolute_cap" : "fraction_cap";
+	}
 	return {
 		trigger,
 		hardLimit,
@@ -288,6 +299,7 @@ export function resolveCompactionTrigger(
 		capSource,
 		uncappedTrigger,
 		zeroTriggerCause,
+		triggerBasis,
 		usedDefaultWindow,
 	};
 }

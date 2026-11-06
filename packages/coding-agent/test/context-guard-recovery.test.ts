@@ -67,6 +67,7 @@ type SessionInternals = {
 	_isRetryableError(message: AssistantMessage): boolean;
 	_transportAbortRetryAllowed(): boolean;
 	compactBeforeSubmit(): Promise<AgentMessage[] | undefined>;
+	_resolveCompactionTrigger(settings: ReturnType<SettingsManager["getCompactionSettings"]>): ReturnType<typeof resolveCompactionTrigger>;
 };
 
 const internals = AgentSession.prototype as unknown as SessionInternals;
@@ -359,7 +360,10 @@ describe("pre-send gate end to end", () => {
 		if (tempDir) rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	async function createRecoverySession(options: { beforeCompact?: "cancel" | "non-reducing" } = {}) {
+	async function createRecoverySession(options: {
+		beforeCompact?: "cancel" | "non-reducing";
+		maxContextTokens?: number | null;
+	} = {}) {
 		const api: Api = "openai-completions";
 		const model: Model<Api> = {
 			id: "capture-model",
@@ -374,7 +378,11 @@ describe("pre-send gate end to end", () => {
 			maxTokens: 4_096,
 		};
 		const settingsManager = SettingsManager.inMemory({
-			compaction: { enabled: true, maxContextTokens: 20_000, keepRecentTokens: 20_000 },
+			compaction: {
+				enabled: true,
+				...(options.maxContextTokens === null ? {} : { maxContextTokens: options.maxContextTokens ?? 20_000 }),
+				keepRecentTokens: 20_000,
+			},
 		});
 		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
@@ -447,6 +455,51 @@ describe("pre-send gate end to end", () => {
 		} as Message);
 		return firstMessageId;
 	}
+
+	it("records reserve-dominated triggers once per model, budget, and trigger", async () => {
+		const { session, modelRegistry, model } = await createRecoverySession({ maxContextTokens: null });
+		model.contextWindow = 204_800;
+		model.cost = {
+			input: 1,
+			output: 1,
+			cacheRead: 1,
+			cacheWrite: 1,
+			tiers: [{ inputTokensAbove: 32_000, input: 2, output: 2, cacheRead: 2, cacheWrite: 2 }],
+		};
+		const settings = session.settingsManager.getCompactionSettings();
+		const reserveDiagnostics = () =>
+			session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic")
+				.map((entry) => (entry as { data: Record<string, unknown> }).data)
+				.filter((data) => data.kind === "compaction_trigger_reserve_dominated");
+		try {
+			const first = internals._resolveCompactionTrigger.call(session as unknown as SessionInternals, settings);
+			expect(first.trigger).toBe(15_616);
+			expect(first.triggerBasis).toBe("reserve");
+			internals._resolveCompactionTrigger.call(session as unknown as SessionInternals, settings);
+			expect(reserveDiagnostics()).toHaveLength(1);
+			expect(reserveDiagnostics()[0]).toMatchObject({
+				contextWindow: 204_800,
+				firstCostTierBoundary: 32_000,
+				costTierBoundarySource: "tiers",
+				budget: 32_000,
+				reserveTokens: 16_384,
+				fractionCandidate: 28_160,
+				reserveCandidate: 15_616,
+				triggerTokens: 15_616,
+			});
+
+			model.cost.tiers = [{ inputTokensAbove: 40_000, input: 2, output: 2, cacheRead: 2, cacheWrite: 2 }];
+			const second = internals._resolveCompactionTrigger.call(session as unknown as SessionInternals, settings);
+			expect(second.trigger).toBe(23_616);
+			expect(second.triggerBasis).toBe("reserve");
+			expect(reserveDiagnostics()).toHaveLength(2);
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider(model.provider);
+		}
+	});
 
 	function recoveryDiagnostics(session: AgentSession): Array<{ kind?: string; outcome?: string }> {
 		return session.sessionManager
@@ -706,6 +759,7 @@ describe("pre-send gate end to end", () => {
 				effectiveBudget: 272_000,
 				firstCostTierBoundary: null,
 				triggerTokens: trigger.trigger,
+				triggerBasis: trigger.triggerBasis,
 				triggerFraction: settingsManager.getCompactionSettings().triggerFraction,
 				reserveTokens: trigger.reserveTokens,
 				capApplied: true,
@@ -716,6 +770,7 @@ describe("pre-send gate end to end", () => {
 				_compactionEventLimits: (settings: ReturnType<SettingsManager["getCompactionSettings"]>) => {
 					windowSource: string;
 					triggerTokens: number;
+					triggerBasis: "fraction" | "reserve" | "absolute_cap" | "fraction_cap";
 					costTierBoundarySource: "tiers" | "flat" | "pricing_unknown";
 				};
 			};

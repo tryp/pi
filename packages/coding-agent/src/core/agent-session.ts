@@ -424,6 +424,7 @@ export class AgentSession {
 	 */
 	private _lastPreSendCompactionLength = -1;
 	private _reportedDefaultCompactionWindows = new Set<string>();
+	private _reportedReserveDominatedCompactionTriggers = new Set<string>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1402,10 +1403,36 @@ export class AgentSession {
 		if (resolution.zeroTriggerCause) {
 			this._appendDiagnostic({
 				kind: "compaction_trigger_clamped_to_zero",
+				triggerBasis: resolution.triggerBasis,
 				cause: resolution.zeroTriggerCause,
 				budget: resolution.budget,
 				reserveTokens: resolution.reserveTokens,
 			});
+		}
+		if (resolution.triggerBasis === "reserve") {
+			const key = JSON.stringify([
+				model?.provider ?? "unknown",
+				model?.id ?? "unknown",
+				resolution.budget,
+				resolution.trigger,
+			]);
+			if (!this._reportedReserveDominatedCompactionTriggers.has(key)) {
+				this._reportedReserveDominatedCompactionTriggers.add(key);
+				this._appendDiagnostic({
+					kind: "compaction_trigger_reserve_dominated",
+					triggerBasis: resolution.triggerBasis,
+					provider: model?.provider,
+					model: model?.id,
+					contextWindow: resolution.contextWindow,
+					firstCostTierBoundary: resolution.firstCostTierBoundary,
+					costTierBoundarySource: resolution.costTierBoundarySource,
+					budget: resolution.budget,
+					reserveTokens: resolution.reserveTokens,
+					fractionCandidate: Math.floor(resolution.budget * resolution.triggerFraction),
+					reserveCandidate: resolution.budget - resolution.reserveTokens,
+					triggerTokens: resolution.trigger,
+				});
+			}
 		}
 		return resolution;
 	}
@@ -1431,6 +1458,7 @@ export class AgentSession {
 				effectiveContextWindow: resolution.contextWindow,
 				effectiveBudget: resolution.budget,
 				triggerTokens: resolution.trigger,
+				triggerBasis: resolution.triggerBasis,
 				triggerFraction: resolution.triggerFraction,
 				costTierBoundarySource: resolution.costTierBoundarySource,
 			});
@@ -1440,6 +1468,7 @@ export class AgentSession {
 			const capName = absolute ? "maxContextTokens" : "maxContextFraction";
 			this._appendDiagnostic({
 				kind: absolute ? "compaction_trigger_capped_by_absolute" : "compaction_trigger_capped_by_fraction",
+				triggerBasis: resolution.triggerBasis,
 				message: `Compaction trigger capped by ${capName}=${resolution.capValue}; derived trigger=${resolution.uncappedTrigger}, effective trigger=${resolution.trigger}.`,
 				capValue: resolution.capValue,
 				capSource: resolution.capSource,
@@ -1453,6 +1482,7 @@ export class AgentSession {
 			firstCostTierBoundary: resolution.firstCostTierBoundary,
 			costTierBoundarySource: resolution.costTierBoundarySource,
 			triggerTokens: resolution.trigger,
+			triggerBasis: resolution.triggerBasis,
 			triggerFraction: resolution.triggerFraction,
 			reserveTokens: resolution.reserveTokens,
 			capApplied: resolution.capApplied,

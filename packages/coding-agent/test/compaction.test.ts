@@ -362,9 +362,25 @@ describe("resolveCompactionTrigger", () => {
 		const result = resolveCompactionTrigger(luna, 0, DEFAULT_COMPACTION_SETTINGS);
 		expect(result.contextWindow).toBe(272_000);
 		expect(result.trigger).toBe(239_360);
+		expect(result.triggerBasis).toBe("fraction");
 		expect(result.triggerFraction).toBe(DEFAULT_COMPACTION_SETTINGS.triggerFraction);
 		expect(result.reserveTokens).toBe(DEFAULT_COMPACTION_SETTINGS.reserveTokens);
 		expect(result.capApplied).toBe(false);
+	});
+
+	it("reports a reserve-dominated trigger for a 32k tier on a 204.8k window", () => {
+		const tiered = {
+			...model,
+			contextWindow: 204_800,
+			cost: {
+				...model.cost,
+				tiers: [{ inputTokensAbove: 32_000, input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }],
+			},
+		};
+		const result = resolveCompactionTrigger(tiered, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(result.budget).toBe(32_000);
+		expect(result.trigger).toBe(15_616);
+		expect(result.triggerBasis).toBe("reserve");
 	});
 
 	it("uses an explicit absolute cap as the trigger only when the context window is unknown", () => {
@@ -402,6 +418,7 @@ describe("resolveCompactionTrigger", () => {
 		expect(bindingCap.trigger).toBe(170_000);
 		expect(bindingCap.capApplied).toBe(true);
 		expect(bindingCap.capSource).toBe("absolute");
+		expect(bindingCap.triggerBasis).toBe("absolute_cap");
 	});
 
 	it("scales the trigger with triggerFraction", () => {
@@ -527,6 +544,14 @@ describe("resolveCompactionTrigger", () => {
 		expect(result.trigger).toBe(107_073);
 	});
 
+	it("lets the fraction win when the reserve and fraction candidates tie exactly", () => {
+		// floor(136_533 * 0.88) = 120_149 = 136_533 - 16_384.
+		// Equality belongs to fraction: reserve is reported only when strictly smaller.
+		const result = resolveCompactionTrigger({ ...model, contextWindow: 136_533 }, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(result.trigger).toBe(120_149);
+		expect(result.triggerBasis).toBe("fraction");
+	});
+
 	it("clamps to non-negative thresholds and identifies a reserve-driven zero", () => {
 		const windowNearReserve = resolveCompactionTrigger({ ...model, contextWindow: 32_000 }, 0, {
 			...DEFAULT_COMPACTION_SETTINGS,
@@ -567,6 +592,7 @@ describe("resolveCompactionTrigger", () => {
 		expect(result.capApplied).toBe(true);
 		expect(result.capValue).toBe(136_000);
 		expect(result.capSource).toBe("fraction");
+		expect(result.triggerBasis).toBe("fraction_cap");
 	});
 
 	it("applies an absolute cap before a percentage cap and reports whether it binds", () => {
