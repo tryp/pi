@@ -715,6 +715,7 @@ describe("pre-send gate end to end", () => {
 			const eventLimits = session as unknown as {
 				_compactionEventLimits: (settings: ReturnType<SettingsManager["getCompactionSettings"]>) => {
 					windowSource: string;
+					triggerTokens: number;
 				};
 			};
 			expect(eventLimits._compactionEventLimits(settingsManager.getCompactionSettings()).windowSource).toBe(
@@ -735,6 +736,17 @@ describe("pre-send gate end to end", () => {
 					derivedTrigger: 239_360,
 					triggerTokens: 170_000,
 				}),
+			);
+			const missingWindowModel = session.model as Model<Api> & { contextWindowSource?: "backend" };
+			missingWindowModel.contextWindow = 0;
+			const fallbackLimits = eventLimits._compactionEventLimits(settingsManager.getCompactionSettings());
+			expect(fallbackLimits).toMatchObject({ windowSource: "default", triggerTokens: 170_000 });
+			const diagnosticsAfterFallback = session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic")
+				.map((entry) => (entry as { data: Record<string, unknown> }).data);
+			expect(diagnosticsAfterFallback).toContainEqual(
+				expect.objectContaining({ kind: "compaction_context_window_fallback", contextWindow: 128_000 }),
 			);
 			expect(session.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
 		} finally {

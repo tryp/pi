@@ -8,8 +8,10 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type CompactionSettings,
 	calculateContextTokens,
+	clampKeepRecentTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	DEFAULT_CONTEXT_WINDOW,
 	estimateContextTokens,
 	findCutPoint,
 	getLastAssistantUsage,
@@ -355,12 +357,51 @@ describe("resolveCompactionTrigger", () => {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tiers: [] },
 	} as unknown as NonNullable<Parameters<typeof resolveCompactionTrigger>[0]>;
 
-	it("uses the configurable default and preserves today's derived trigger", () => {
-		const result = resolveCompactionTrigger(model, 0, DEFAULT_COMPACTION_SETTINGS);
+	it("resolves luna's 272k window to the literal 239,360-token trigger", () => {
+		const luna = { ...model, provider: "openai-codex", id: "gpt-6-luna" };
+		const result = resolveCompactionTrigger(luna, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(result.contextWindow).toBe(272_000);
 		expect(result.trigger).toBe(239_360);
 		expect(result.triggerFraction).toBe(DEFAULT_COMPACTION_SETTINGS.triggerFraction);
 		expect(result.reserveTokens).toBe(DEFAULT_COMPACTION_SETTINGS.reserveTokens);
 		expect(result.capApplied).toBe(false);
+	});
+
+	it("uses an explicit absolute cap as the trigger only when the context window is unknown", () => {
+		const unknownWindow = resolveCompactionTrigger(undefined, 0, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			maxContextTokens: 170_000,
+		});
+		expect(unknownWindow.usedDefaultWindow).toBe(true);
+		expect(unknownWindow.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
+		expect(unknownWindow.uncappedTrigger).toBe(111_616);
+		expect(unknownWindow.trigger).toBe(170_000);
+		expect(unknownWindow.hardLimit).toBe(170_000);
+
+		const noConfiguredCap = resolveCompactionTrigger(undefined, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(noConfiguredCap.usedDefaultWindow).toBe(true);
+		expect(noConfiguredCap.trigger).toBe(111_616);
+	});
+
+	it("keeps a known-window trigger derived and applies absolute caps only when they bind", () => {
+		const knownModel = { ...model, contextWindow: 200_000 };
+		const largerCap = resolveCompactionTrigger(knownModel, 0, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			maxContextTokens: 180_000,
+		});
+		expect(largerCap.usedDefaultWindow).toBe(false);
+		expect(largerCap.uncappedTrigger).toBe(176_000);
+		expect(largerCap.trigger).toBe(176_000);
+		expect(largerCap.capApplied).toBe(false);
+
+		const bindingCap = resolveCompactionTrigger(knownModel, 0, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			maxContextTokens: 170_000,
+		});
+		expect(bindingCap.uncappedTrigger).toBe(176_000);
+		expect(bindingCap.trigger).toBe(170_000);
+		expect(bindingCap.capApplied).toBe(true);
+		expect(bindingCap.capSource).toBe("absolute");
 	});
 
 	it("scales the trigger with triggerFraction", () => {
@@ -378,24 +419,34 @@ describe("resolveCompactionTrigger", () => {
 	});
 
 	it("uses curated cost tiers to clamp sol and terra-sized windows", () => {
-		const solOrTerra = {
-			...model,
-			id: "gpt-6.1-sol",
-			contextWindow: 500_000,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tiers: [{ inputTokensAbove: 272_000 }] },
-		} as unknown as NonNullable<Parameters<typeof resolveCompactionTrigger>[0]>;
-		const boundary = firstTierBoundary(solOrTerra);
-		expect(boundary).toBe(272_000);
-		const result = resolveCompactionTrigger(solOrTerra, 0, DEFAULT_COMPACTION_SETTINGS);
-		expect(result.firstCostTierBoundary).toBe(boundary);
-		expect(result.budget).toBe(272_000);
-		expect(result.trigger).toBe(239_360);
+		for (const id of ["gpt-6.1-sol", "gpt-6.1-terra"]) {
+			const solOrTerra = {
+				...model,
+				id,
+				contextWindow: 500_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, tiers: [{ inputTokensAbove: 272_000 }] },
+			} as unknown as NonNullable<Parameters<typeof resolveCompactionTrigger>[0]>;
+			const boundary = firstTierBoundary(solOrTerra);
+			expect(boundary).toBe(272_000);
+			const result = resolveCompactionTrigger(solOrTerra, 0, DEFAULT_COMPACTION_SETTINGS);
+			expect(result.contextWindow).toBe(500_000);
+			expect(result.firstCostTierBoundary).toBe(boundary);
+			expect(result.budget).toBe(272_000);
+			expect(result.trigger).toBe(239_360);
+		}
 
 		const noTierModel = { ...model, contextWindow: 200_000 };
 		const noTiers = resolveCompactionTrigger(noTierModel, 0, DEFAULT_COMPACTION_SETTINGS);
 		expect(noTiers.firstCostTierBoundary).toBeNull();
 		expect(noTiers.budget).toBe(200_000);
 		expect(noTiers.trigger).toBe(176_000);
+	});
+
+	it("clamps the retained tail to the resolved hard limit for small windows", () => {
+		const smallWindow = resolveCompactionTrigger({ ...model, contextWindow: 32_000 }, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(smallWindow.hardLimit).toBe(15_616);
+		expect(DEFAULT_COMPACTION_SETTINGS.keepRecentTokens).toBe(20_000);
+		expect(clampKeepRecentTokens(DEFAULT_COMPACTION_SETTINGS.keepRecentTokens, smallWindow.hardLimit)).toBe(15_616);
 	});
 
 	it("uses the model's curated tier boundary instead of a fixed token threshold", () => {
@@ -416,12 +467,8 @@ describe("resolveCompactionTrigger", () => {
 		expect(curatedBoundary).toBe(tierBoundary);
 		expect(result.firstCostTierBoundary).toBe(curatedBoundary);
 		expect(result.budget).toBe(curatedBoundary);
-		expect(result.trigger).toBe(
-			Math.min(
-				Math.floor(curatedBoundary! * DEFAULT_COMPACTION_SETTINGS.triggerFraction!),
-				curatedBoundary! - DEFAULT_COMPACTION_SETTINGS.reserveTokens!,
-			),
-		);
+		expect(curatedBoundary).toBe(123_457);
+		expect(result.trigger).toBe(107_073);
 	});
 
 	it("clamps to non-negative thresholds and identifies a reserve-driven zero", () => {

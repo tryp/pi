@@ -1010,6 +1010,7 @@ export class SettingsManager {
 	}
 
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
+		// Branch-summary requests keep an independent response reserve policy rather than following the compaction input budget.
 		return {
 			reserveTokens: this.settings.branchSummary?.reserveTokens ?? DEFAULT_BRANCH_SUMMARY_RESERVE_TOKENS,
 			skipPrompt: this.settings.branchSummary?.skipPrompt ?? false,

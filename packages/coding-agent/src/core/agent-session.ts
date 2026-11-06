@@ -57,6 +57,7 @@ import {
 	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
+	clampKeepRecentTokens,
 	collectEntriesForBranchSummary,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
@@ -1409,14 +1410,17 @@ export class AgentSession {
 		return resolution;
 	}
 
-	private _compactionEventLimits(settings: ReturnType<SettingsManager["getCompactionSettings"]>) {
-		const resolution = this._resolveCompactionTrigger(settings);
-		const windowSource =
-			(
-				this.model as
-					| (Model<any> & { contextWindowSource?: "backend" | "stored" | "static" | "default" })
-					| undefined
-			)?.contextWindowSource ?? "static";
+	private _compactionEventLimits(
+		settings: ReturnType<SettingsManager["getCompactionSettings"]>,
+		resolution = this._resolveCompactionTrigger(settings),
+	) {
+		const windowSource = resolution.usedDefaultWindow
+			? "default"
+			: ((
+					this.model as
+						| (Model<any> & { contextWindowSource?: "backend" | "stored" | "static" | "default" })
+						| undefined
+				)?.contextWindowSource ?? "static");
 		if (resolution.capApplied) {
 			const absolute = resolution.capSource === "absolute";
 			const capName = absolute ? "maxContextTokens" : "maxContextFraction";
@@ -2632,8 +2636,13 @@ export class AgentSession {
 
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
-			const compactionLimits = this._compactionEventLimits(settings);
-			const effectiveSettings = { ...settings, reserveTokens: compactionLimits.reserveTokens };
+			const resolution = this._resolveCompactionTrigger(settings);
+			const compactionLimits = this._compactionEventLimits(settings, resolution);
+			const effectiveSettings = {
+				...settings,
+				reserveTokens: resolution.reserveTokens,
+				keepRecentTokens: clampKeepRecentTokens(settings.keepRecentTokens, resolution.hardLimit),
+			};
 
 			const preparation = prepareCompaction(pathEntries, effectiveSettings);
 			if (!preparation) {
@@ -2978,8 +2987,13 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
-		const compactionLimits = this._compactionEventLimits(settings);
-		const effectiveSettings = { ...settings, reserveTokens: compactionLimits.reserveTokens };
+		const resolution = this._resolveCompactionTrigger(settings);
+		const compactionLimits = this._compactionEventLimits(settings, resolution);
+		const effectiveSettings = {
+			...settings,
+			reserveTokens: resolution.reserveTokens,
+			keepRecentTokens: clampKeepRecentTokens(settings.keepRecentTokens, resolution.hardLimit),
+		};
 		const isGuardRecovery = reason === "threshold" && willRetry;
 		let started = false;
 		let fromExtension = false;

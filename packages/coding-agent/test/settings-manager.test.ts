@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DEFAULT_BRANCH_SUMMARY_RESERVE_TOKENS } from "../src/core/compaction/branch-summarization.ts";
 import { DEFAULT_COMPACTION_SETTINGS } from "../src/core/compaction/compaction.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS } from "../src/core/http-dispatcher.ts";
 import { type Settings, SettingsManager } from "../src/core/settings-manager.ts";
@@ -634,6 +635,12 @@ describe("SettingsManager", () => {
 			expect(manager.getCompactionReserveTokens()).toBe(DEFAULT_COMPACTION_SETTINGS.reserveTokens);
 			expect(settings.triggerFraction).toBe(DEFAULT_COMPACTION_SETTINGS.triggerFraction);
 			expect(settings.borderlineFraction).toBe(DEFAULT_COMPACTION_SETTINGS.borderlineFraction);
+		});
+
+		it("keeps branch-summary response reserve independent from compaction input reserve", () => {
+			const manager = SettingsManager.inMemory({ compaction: { reserveTokens: 2_048 } });
+			expect(manager.getCompactionSettings().reserveTokens).toBe(2_048);
+			expect(manager.getBranchSummarySettings().reserveTokens).toBe(DEFAULT_BRANCH_SUMMARY_RESERVE_TOKENS);
 		});
 
 		it("returns configured absolute and fractional caps", () => {

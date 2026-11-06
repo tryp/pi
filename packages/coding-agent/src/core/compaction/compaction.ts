@@ -184,6 +184,7 @@ export function resolveCompactionTrigger(
 	const modelWindow = model?.contextWindow;
 	const validModelWindow = typeof modelWindow === "number" && Number.isFinite(modelWindow) && modelWindow > 0;
 	const validArgumentWindow = Number.isFinite(contextWindow) && contextWindow > 0;
+	const usedDefaultWindow = !validModelWindow && !validArgumentWindow;
 	const effectiveWindow = validModelWindow
 		? modelWindow
 		: validArgumentWindow
@@ -244,8 +245,13 @@ export function resolveCompactionTrigger(
 			? "absolute"
 			: "fraction"
 		: "none";
-	const hardLimit = Math.max(0, Math.min(budget - reserveTokens, capValue ?? Number.POSITIVE_INFINITY));
-	const trigger = Math.max(0, Math.min(uncappedTrigger, capValue ?? Number.POSITIVE_INFINITY));
+	const configuredAbsoluteCapIsFallback = usedDefaultWindow && absoluteCap !== undefined;
+	const hardLimit = configuredAbsoluteCapIsFallback
+		? absoluteCap
+		: Math.max(0, Math.min(budget - reserveTokens, capValue ?? Number.POSITIVE_INFINITY));
+	const trigger = configuredAbsoluteCapIsFallback
+		? absoluteCap
+		: Math.max(0, Math.min(uncappedTrigger, capValue ?? Number.POSITIVE_INFINITY));
 	return {
 		trigger,
 		hardLimit,
@@ -260,8 +266,13 @@ export function resolveCompactionTrigger(
 		capSource,
 		uncappedTrigger,
 		zeroTriggerCause,
-		usedDefaultWindow: !validModelWindow && !validArgumentWindow,
+		usedDefaultWindow,
 	};
+}
+
+/** Keep the requested post-compaction tail within the model's reserved input budget. */
+export function clampKeepRecentTokens(keepRecentTokens: number, hardLimit: number): number {
+	return Math.max(0, Math.min(keepRecentTokens, hardLimit));
 }
 
 // ============================================================================
