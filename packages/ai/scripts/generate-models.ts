@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSy
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import { getEffortThinkingLevelMap, type ModelsDevReasoningOption } from "./models-dev-reasoning-options.ts";
+import { getModelsDevCost, type ModelsDevCost } from "./models-dev-cost.ts";
 import {
 	getOpenRouterThinkingLevelMap,
 	type OpenRouterReasoningMetadata,
@@ -97,22 +98,7 @@ interface ModelsDevModel {
 		context?: number;
 		output?: number;
 	};
-	cost?: {
-		input?: number;
-		output?: number;
-		cache_read?: number;
-		cache_write?: number;
-		tiers?: {
-			input?: number;
-			output?: number;
-			cache_read?: number;
-			cache_write?: number;
-			tier?: {
-				type?: string;
-				size?: number;
-			};
-		}[];
-	};
+	cost?: ModelsDevCost;
 	modalities?: {
 		input?: string[];
 		output?: string[];
@@ -1084,30 +1070,6 @@ function roundCost(value: number): number {
 	return Number(value.toFixed(6));
 }
 
-function getModelsDevCost(cost: ModelsDevModel["cost"]): ModelCost {
-	const tiers = cost?.tiers?.flatMap((tier) => {
-		const context = tier.tier;
-		if (context?.type !== "context" || context.size === undefined) return [];
-		return [
-			{
-				inputTokensAbove: context.size,
-				input: tier.input || 0,
-				output: tier.output || 0,
-				cacheRead: tier.cache_read || 0,
-				cacheWrite: tier.cache_write || 0,
-			},
-		];
-	});
-
-	return {
-		input: cost?.input || 0,
-		output: cost?.output || 0,
-		cacheRead: cost?.cache_read || 0,
-		cacheWrite: cost?.cache_write || 0,
-		...(tiers && tiers.length > 0 ? { tiers } : {}),
-	};
-}
-
 async function fetchNvidiaNimModelIds(): Promise<Map<string, string>> {
 	try {
 		console.log("Fetching models from NVIDIA NIM API...");
@@ -1292,12 +1254,7 @@ function processZaiModels(data: ModelsDevCatalog): Model<Api>[] {
 				reasoning: m.reasoning === true,
 				...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 				input: supportsImage ? ["text", "image"] : ["text"],
-				cost: {
-					input: referenceCost?.input || 0,
-					output: referenceCost?.output || 0,
-					cacheRead: referenceCost?.cache_read || 0,
-					cacheWrite: referenceCost?.cache_write || 0,
-				},
+				cost: getModelsDevCost(referenceCost),
 				compat: {
 					supportsDeveloperRole: false,
 					thinkingFormat: "zai",
@@ -1393,12 +1350,7 @@ function processBasetenModels(provider: ModelsDevProvider | undefined): Model<Ap
 			reasoning,
 			...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 			input: model.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-			cost: {
-				input: model.cost?.input || 0,
-				output: model.cost?.output || 0,
-				cacheRead: model.cost?.cache_read || 0,
-				cacheWrite: model.cost?.cache_write || 0,
-			},
+			cost: getModelsDevCost(model.cost),
 			compat,
 			contextWindow: model.limit?.context || 4096,
 			maxTokens: model.limit?.output || 4096,
@@ -1443,12 +1395,7 @@ function processFireworksModels(provider: ModelsDevProvider | undefined): Model<
 			provider: "fireworks",
 			reasoning: model.reasoning === true,
 			input,
-			cost: {
-				input: model.cost?.input || 0,
-				output: model.cost?.output || 0,
-				cacheRead: model.cost?.cache_read || 0,
-				cacheWrite: model.cost?.cache_write || 0,
-			},
+			cost: getModelsDevCost(model.cost),
 			contextWindow: model.limit?.context || 4096,
 			maxTokens: model.limit?.output || 4096,
 		};
@@ -1524,12 +1471,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: getBedrockBaseUrl(id),
 					reasoning: m.reasoning === true,
 					input: (m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 					...(m.structured_output === true && { compat: { supportsStrictMode: true } }),
@@ -1552,12 +1494,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.anthropic.com",
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -1586,12 +1523,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://generativelanguage.googleapis.com/v1beta",
 					reasoning: source.reasoning === true,
 					input: source.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: source.cost?.input || 0,
-						output: source.cost?.output || 0,
-						cacheRead: source.cost?.cache_read || 0,
-						cacheWrite: source.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(source.cost),
 					contextWindow: source.limit?.context || 4096,
 					maxTokens: source.limit?.output || 4096,
 				});
@@ -1629,8 +1561,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					reasoning: source.reasoning === true,
 					input: source.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
-						input: source.cost?.input || 0,
-						output: source.cost?.output || 0,
+						...getModelsDevCost(source.cost),
 						cacheRead,
 						cacheWrite: 0,
 					},
@@ -1657,12 +1588,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.openai.com/v1",
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -1684,12 +1610,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.groq.com/openai/v1",
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -1711,12 +1632,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.cerebras.ai/v1",
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -1738,12 +1654,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: CLOUDFLARE_WORKERS_AI_BASE_URL,
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 					compat: { sendSessionAffinityHeaders: true },
@@ -1797,12 +1708,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl,
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 					...(compat ? { compat } : {}),
@@ -1832,12 +1738,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL,
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 					compat: { sendSessionAffinityHeaders: true },
@@ -1861,12 +1762,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					compat: { ...XAI_RESPONSES_COMPAT },
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -1891,10 +1787,8 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
+						...getModelsDevCost(m.cost),
 						cacheRead: m.cost?.cache_read ?? (m.cost?.input ? roundCost(m.cost.input * 0.1) : 0),
-						cacheWrite: m.cost?.cache_write || 0,
 					},
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
@@ -1917,12 +1811,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://router.huggingface.co/v1",
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					compat: {
 						supportsDeveloperRole: false,
 					},
@@ -1956,12 +1845,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					headers: { ...NVIDIA_HEADERS },
 					reasoning: m.reasoning === true,
 					input: m.modalities.input.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					compat: NVIDIA_OPENAI_COMPAT,
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
@@ -1989,12 +1873,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					reasoning,
 					...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					compat: getTogetherCompat(modelId, reasoning),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
@@ -2051,12 +1930,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl,
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					...(compat ? { compat } : {}),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
@@ -2140,12 +2014,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						baseUrl,
 						reasoning: m.reasoning === true,
 						input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-						cost: {
-							input: m.cost?.input || 0,
-							output: m.cost?.output || 0,
-							cacheRead: m.cost?.cache_read || 0,
-							cacheWrite: m.cost?.cache_write || 0,
-						},
+						cost: getModelsDevCost(m.cost),
 						contextWindow: m.limit?.context || 4096,
 						maxTokens: m.limit?.output || 4096,
 					});
@@ -2193,6 +2062,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					reasoning: isKimiK3 || m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
+						...getModelsDevCost(m.cost),
 						input: m.cost?.input || impliedCost?.input || 0,
 						output: m.cost?.output || impliedCost?.output || 0,
 						cacheRead: m.cost?.cache_read || impliedCost?.cacheRead || 0,
@@ -2248,6 +2118,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					reasoning: isKimiK3 || m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
+						...getModelsDevCost(m.cost),
 						input: m.cost?.input || (isKimiK3 ? KIMI_K3_COST.input : 0),
 						output: m.cost?.output || (isKimiK3 ? KIMI_K3_COST.output : 0),
 						cacheRead: m.cost?.cache_read || (isKimiK3 ? KIMI_K3_COST.cacheRead : 0),
@@ -2306,12 +2177,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					compat: xiaomiCompat,
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -2381,12 +2247,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						: {}),
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
