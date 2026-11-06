@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OAuthCredential } from "../src/auth/types.ts";
-import { MODELS } from "../src/models.generated.ts";
 import type { RefreshModelsContext } from "../src/models.ts";
 import {
 	codexCatalogDiscoveryStats,
@@ -8,12 +7,68 @@ import {
 	firstTierBoundary,
 	resetCodexCatalogDiscoveryStats,
 } from "../src/providers/codex-discovery.ts";
-import { joinPublishedLimits, limitJoinStats, resetLimitJoinStats } from "../src/providers/limit-join.ts";
+import {
+	joinPublishedLimits,
+	limitJoinStats,
+	resetLimitJoinIndex,
+	resetLimitJoinStats,
+} from "../src/providers/limit-join.ts";
 import type { Model, ModelCost } from "../src/types.ts";
 
-/** The window the catalog publishes for an id under a provider, read from the same source the join uses. */
-function catalogWindow(provider: "openai", id: string): number {
-	return (MODELS[provider] as Record<string, { contextWindow: number }>)[id]!.contextWindow;
+/**
+ * A fixture catalog, installed through the join's test seam.
+ *
+ * The real catalog is hydrated from models.dev into a gitignored `src/providers/data/*.json` at
+ * build time, so its rows move with a network fetch: `gpt-6.1-terra` carried a zero-cost
+ * placeholder and no tiers until models.dev published its price, and every assertion below that
+ * named a tier or a window became a test of how recently someone had hydrated. These rows fix the
+ * shapes the join reasons about (an aliased vendor, a proxy pair that disagrees, a unique id) so a
+ * change in the data is a data change, not a code regression.
+ */
+const FIXTURE = {
+	openai: {
+		"gpt-6.1-terra": {
+			cost: {
+				input: 10,
+				output: 50,
+				cacheRead: 1,
+				cacheWrite: 12.5,
+				tiers: [{ inputTokensAbove: 272_000, input: 20, output: 75, cacheRead: 2, cacheWrite: 25 }],
+			},
+			maxTokens: 128_000,
+			contextWindow: 1_050_000,
+		},
+		"gpt-6-luna": {
+			cost: {
+				input: 0.1,
+				output: 0.5,
+				cacheRead: 0.01,
+				cacheWrite: 0.125,
+				tiers: [{ inputTokensAbove: 272_000, input: 0.2, output: 0.75, cacheRead: 0.02, cacheWrite: 0.25 }],
+			},
+			maxTokens: 64_000,
+			contextWindow: 1_050_000,
+		},
+	},
+	anthropic: {
+		"claude-sonnet-4-5": {
+			cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+			maxTokens: 64_000,
+			contextWindow: 200_000,
+		},
+	},
+	opencode: {
+		"claude-sonnet-4-5": {
+			cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+			maxTokens: 64_000,
+			contextWindow: 200_000,
+		},
+	},
+} as unknown as Record<string, Record<string, Model<never>>>;
+
+/** The window the fixture catalog publishes for an id under a provider. */
+function catalogWindow(provider: keyof typeof FIXTURE & string, id: string): number {
+	return (FIXTURE[provider] as Record<string, { contextWindow: number }>)[id]!.contextWindow;
 }
 
 const UNPRICED: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -39,8 +94,12 @@ function context(overrides: Partial<RefreshModelsContext> = {}): RefreshModelsCo
 beforeEach(() => {
 	resetLimitJoinStats();
 	resetCodexCatalogDiscoveryStats();
+	resetLimitJoinIndex(FIXTURE);
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+	vi.restoreAllMocks();
+	resetLimitJoinIndex();
+});
 
 describe("joinPublishedLimits", () => {
 	it("prices a discovered codex model from the catalog row under the aliased vendor", () => {

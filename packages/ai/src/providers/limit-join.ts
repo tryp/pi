@@ -134,10 +134,23 @@ type CatalogEntry = { provider: string; cost: ModelCost; maxTokens: number; cont
 /** Index over the compiled catalog: model id -> every provider that publishes it. */
 let index: Map<string, CatalogEntry[]> | undefined;
 
+/**
+ * The catalog the index is built from.
+ *
+ * Production reads the compiled catalog. Tests replace this with a fixture, because that catalog
+ * is assembled at import time from `src/providers/data/*.json` -- a gitignored file hydrated from
+ * models.dev by `npm run hydrate-model-data`, which the build runs. A test that asserts "the
+ * catalog publishes a 272,000 tier for this id" therefore asserts a fact about a network data
+ * fetch, and goes red when that fetch is stale or when models.dev changes the row. Both happened
+ * on 2026-11-06: the same checkout passed with a fresh hydrate and failed with a 44-minute-old
+ * one, for a reason that had nothing to do with the code under test.
+ */
+let catalogSource: Record<string, Record<string, Model<Api>>> = MODELS as Record<string, Record<string, Model<Api>>>;
+
 function catalogIndex(): Map<string, CatalogEntry[]> {
 	if (index) return index;
 	const built = new Map<string, CatalogEntry[]>();
-	for (const [provider, catalog] of Object.entries(MODELS as Record<string, Record<string, Model<Api>>>)) {
+	for (const [provider, catalog] of Object.entries(catalogSource)) {
 		for (const [id, model] of Object.entries(catalog)) {
 			const entry: CatalogEntry = {
 				provider,
@@ -154,9 +167,16 @@ function catalogIndex(): Map<string, CatalogEntry[]> {
 	return built;
 }
 
-/** Test seam: forget the index so a fixture catalog can replace it. */
-export function resetLimitJoinIndex(): void {
+/**
+ * Test seam: forget the index, and optionally replace the catalog it is built from.
+ *
+ * Called with no argument (or with `MODELS`) it restores production behaviour.
+ */
+export function resetLimitJoinIndex(
+	catalog: Record<string, Record<string, Model<Api>>> = MODELS as Record<string, Record<string, Model<Api>>>,
+): void {
 	index = undefined;
+	catalogSource = catalog;
 }
 
 function tiersEqual(a: ModelCostTier[] | undefined, b: ModelCostTier[] | undefined): boolean {

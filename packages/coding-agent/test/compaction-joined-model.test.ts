@@ -1,7 +1,36 @@
 import type { Model } from "@earendil-works/pi-ai";
-import { joinPublishedLimits, resetLimitJoinStats } from "@earendil-works/pi-ai/providers/limit-join";
+import {
+	joinPublishedLimits,
+	resetLimitJoinIndex,
+	resetLimitJoinStats,
+} from "@earendil-works/pi-ai/providers/limit-join";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_COMPACTION_SETTINGS, resolveCompactionTrigger } from "../src/core/compaction/compaction.ts";
+
+/**
+ * The catalog row this test joins from, installed through the join's test seam.
+ *
+ * It is a fixture rather than the shipped catalog on purpose: the shipped row is hydrated from
+ * models.dev into a gitignored file at build time and did not carry a price at all until
+ * models.dev published one, which made this test's verdict depend on network data freshness.
+ * The shape that matters here -- a 272,000 request-wide tier under a 500,000 window -- is stated
+ * locally so the assertion is about the guard, not about a vendor's data entry.
+ */
+const OPENAI_TERRA_CATALOG = {
+	openai: {
+		"gpt-6.1-terra": {
+			cost: {
+				input: 10,
+				output: 50,
+				cacheRead: 1,
+				cacheWrite: 12.5,
+				tiers: [{ inputTokensAbove: 272_000, input: 20, output: 75, cacheRead: 2, cacheWrite: 25 }],
+			},
+			maxTokens: 128_000,
+			contextWindow: 1_050_000,
+		},
+	},
+} as unknown as Record<string, Record<string, Model<never>>>;
 
 /** A discovered Codex model before any join: backend window, all-zero cost placeholder. */
 const DISCOVERED_TERRA: Model<"openai-codex-responses"> = {
@@ -20,6 +49,7 @@ const DISCOVERED_TERRA: Model<"openai-codex-responses"> = {
 };
 
 function joinedTerra(): Model<"openai-codex-responses"> {
+	resetLimitJoinIndex(OPENAI_TERRA_CATALOG);
 	const fill = joinPublishedLimits({
 		provider: "openai-codex",
 		id: DISCOVERED_TERRA.id,
