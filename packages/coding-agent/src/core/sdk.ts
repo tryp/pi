@@ -11,6 +11,7 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, ContextGuardError } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
+import { runBootModelRefresh } from "./boot-model-refresh.ts";
 import {
 	type CacheOperationContextSnapshot,
 	type CacheOperationObservation,
@@ -359,6 +360,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
 	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
+
+	// SDK boot without createAgentSessionServices: refresh once before the model is resolved.
+	// When services already ran for this session, the per-session guard makes this a no-op.
+	await runBootModelRefresh({ runtime: modelRuntime, sink: sessionManager });
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 

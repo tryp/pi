@@ -3,6 +3,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
+import { runBootModelRefresh } from "./boot-model-refresh.ts";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import {
@@ -40,6 +41,12 @@ export interface CreateAgentSessionServicesOptions {
 	settingsManager?: SettingsManager;
 	modelRuntime?: ModelRuntime;
 	modelRuntimeSignal?: AbortSignal;
+	/**
+	 * Session that owns the once-per-session boot model refresh. The refresh runs here because
+	 * callers resolve a model against `services.modelRuntime` before the AgentSession exists,
+	 * and a model resolved earlier would keep the pre-refresh context window.
+	 */
+	sessionManager?: SessionManager;
 	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
 	resourceLoaderReloadOptions?: ResourceLoaderReloadOptions;
@@ -180,6 +187,10 @@ export async function createAgentSessionServices(
 	}
 	extensionsResult.runtime.pendingNativeProviderRegistrations = [];
 	await modelRuntime.refresh({ allowNetwork: false });
+	// Session boot: one bounded network pass, so a window a provider lowered between sessions
+	// replaces the stale value restored from models-store.json. Guarded per session, so the
+	// call from createAgentSession for the same session is a no-op.
+	await runBootModelRefresh({ runtime: modelRuntime, sink: options.sessionManager });
 	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
 
 	return {

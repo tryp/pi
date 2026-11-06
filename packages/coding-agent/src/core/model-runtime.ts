@@ -400,6 +400,11 @@ export class ModelRuntime implements Models {
 		return this.models.getProvider(providerId);
 	}
 
+	/** False when the runtime was created with `PI_OFFLINE` set: `refresh()` will not fetch. */
+	get networkEnabled(): boolean {
+		return this.modelNetworkEnabled;
+	}
+
 	getModels(providerId?: string): readonly Model<Api>[] {
 		return this.models.getModels(providerId);
 	}
