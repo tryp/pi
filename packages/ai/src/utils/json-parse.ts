@@ -197,16 +197,22 @@ export function parseStreamingJson<T = Record<string, unknown>>(partialJson: str
  * provider socket stuck at its receive-buffer ceiling, and no session journal writes at all.
  *
  * Previews only feed the UI, while the value handed to the tool is always the exact parse at
- * finalization, so previews are recomputed only when the buffer has grown enough to be worth
- * another full pass: at least PREVIEW_MIN_GROWTH_BYTES, and at least a PREVIEW_GROWTH_SHIFT
- * fraction of the buffer once it is large. The stream therefore costs O(N log N) instead of
- * O(N^2), and a small tool call still gets its first preview immediately.
+ * finalization, so above PREVIEW_FREE_BYTES previews are recomputed only when the buffer has
+ * grown by a PREVIEW_GROWTH_SHIFT fraction of itself. The stream therefore costs O(N log N)
+ * instead of O(N^2), while a call small enough for a parse to be free still updates on every
+ * delta.
  *
- * The growth rule is deliberate: it is deterministic (no clock), bounds the number of parses
- * by the byte size alone, and still updates at least every ~6% of growth, which is what the
- * UI needs.
+ * The free window is not an optimization detail, it is what keeps the UI smooth. The displayed
+ * arguments come from these previews (a tool's call renderer draws from the parsed value, not
+ * from the raw delta), so throttling a small call does not merely save work: with a 1 KB floor a
+ * 200-byte `bash` call parsed once at its first 4-byte delta and then showed nothing until the
+ * arguments completed. Per-parse cost is ~0.014 ms at 1 KB and ~0.07 ms at 8 KB, so every delta
+ * below PREVIEW_FREE_BYTES is affordable and is parsed.
+ *
+ * The growth rule is deliberate: it is deterministic (no clock), bounds the number of parses by
+ * the byte size alone, and still updates at least every ~6% of growth above the free window.
  */
-const PREVIEW_MIN_GROWTH_BYTES = 1024;
+export const PREVIEW_FREE_BYTES = 8192;
 const PREVIEW_GROWTH_SHIFT = 4;
 
 interface StreamingPreviewState {
@@ -254,11 +260,19 @@ export function parseStreamingJsonPreview<T = Record<string, unknown>>(
 	}
 
 	const previous = previewStateFor(owner);
-	const growth = previous === undefined ? partialJson.length : partialJson.length - previous.bytes;
-	const threshold =
-		previous === undefined ? 0 : Math.max(PREVIEW_MIN_GROWTH_BYTES, previous.bytes >> PREVIEW_GROWTH_SHIFT);
 
-	if (growth < threshold) {
+	if (previous === undefined) {
+		streamingJsonPreviewStats.parses++;
+		setPreviewState(owner, { bytes: partialJson.length });
+		return parseStreamingJson<T>(partialJson);
+	}
+
+	const growth = partialJson.length - previous.bytes;
+	// Inside the free window every delta is parsed, so the rendered arguments grow with the
+	// stream. Above it, one parse per 1/16 of growth keeps the total O(N log N).
+	const threshold = previous.bytes <= PREVIEW_FREE_BYTES ? 1 : previous.bytes >> PREVIEW_GROWTH_SHIFT;
+
+	if (growth < threshold || growth === 0) {
 		streamingJsonPreviewStats.skipped++;
 		return undefined;
 	}

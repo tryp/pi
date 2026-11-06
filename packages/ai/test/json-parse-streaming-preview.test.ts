@@ -6,6 +6,7 @@ import { stream as streamOpenAICompletions } from "../src/api/openai-completions
 import type { AssistantMessageEvent, Context, Model, OpenAICompletionsCompat } from "../src/types.ts";
 import {
 	forgetStreamingJsonPreview,
+	PREVIEW_FREE_BYTES,
 	parseStreamingJson,
 	parseStreamingJsonPreview,
 	repairJson,
@@ -173,10 +174,41 @@ describe("parseStreamingJsonPreview", () => {
 		}
 
 		expect(streamingJsonPreviewStats.parses).toBe(previews);
-		expect(previews).toBeLessThanOrEqual(96);
+		// Bounded by the free window (one parse per 4-byte delta below it) plus the logarithmic
+		// tail above it -- not by the payload size.
+		expect(previews).toBeLessThanOrEqual(PREVIEW_FREE_BYTES / 4 + 96);
 		expect(streamingJsonPreviewStats.skipped).toBeGreaterThan(payload.length / 8);
 		// The value the tool receives comes from a final unthrottled parse.
 		expect(parseStreamingJson(buffer)).toEqual(JSON.parse(payload));
+	});
+
+	it("updates on every delta while the call is small enough to parse for free", () => {
+		// The tool renderers draw the parsed value, so a throttle that is too coarse does not just
+		// save work: it freezes the on-screen arguments. A 200-byte `bash` call used to preview
+		// once at its first 4-byte delta and then show nothing until completion.
+		const payload = JSON.stringify({ command: 'rg -n "x" src | head -20' });
+		const deltaSize = 4;
+		const owner = {};
+		let buffer = "";
+		let parses = 0;
+		let lastShown = -1;
+
+		resetStreamingJsonPreviewStats();
+		for (let index = 0; index < payload.length; index += deltaSize) {
+			buffer += payload.slice(index, index + deltaSize);
+			const preview = parseStreamingJsonPreview<{ command?: string }>(owner, buffer);
+			parses++;
+			if (preview === undefined) continue;
+			const shown = preview.command?.length ?? 0;
+			// Monotonic growth of what the UI would render, never a smaller fragment later.
+			expect(shown).toBeGreaterThanOrEqual(lastShown);
+			lastShown = shown;
+		}
+
+		expect(buffer.length).toBeLessThan(PREVIEW_FREE_BYTES);
+		expect(streamingJsonPreviewStats.parses).toBe(parses);
+		expect(streamingJsonPreviewStats.skipped).toBe(0);
+		expect(lastShown).toBe(JSON.parse(payload).command.length);
 	});
 
 	it("gives small tool calls a preview immediately and updates them", () => {
@@ -191,16 +223,19 @@ describe("parseStreamingJsonPreview", () => {
 	it("keys object owners in a WeakMap and string owners in a Map, both clearable", () => {
 		const objectOwner = {};
 		resetStreamingJsonPreviewStats();
-		parseStreamingJsonPreview(objectOwner, '{"a":1');
-		expect(parseStreamingJsonPreview(objectOwner, '{"a":1}')).toBeUndefined();
+		// A repeat of the same buffer is not re-parsed: that is the state being keyed per owner.
+		expect(parseStreamingJsonPreview(objectOwner, '{"a":1')).toEqual({ a: 1 });
+		expect(parseStreamingJsonPreview(objectOwner, '{"a":1')).toBeUndefined();
+		// A different owner has its own state, even for the identical buffer.
+		expect(parseStreamingJsonPreview({}, '{"a":1')).toEqual({ a: 1 });
 		forgetStreamingJsonPreview(objectOwner);
-		expect(parseStreamingJsonPreview(objectOwner, '{"a":1}')).toEqual({ a: 1 });
+		expect(parseStreamingJsonPreview(objectOwner, '{"a":1')).toEqual({ a: 1 });
 
 		// Callers that re-clone the block on every delta (proxy transport) key by tool-call id.
-		parseStreamingJsonPreview("call_1", '{"b":2');
-		expect(parseStreamingJsonPreview("call_1", '{"b":2}')).toBeUndefined();
+		expect(parseStreamingJsonPreview("call_1", '{"b":2')).toEqual({ b: 2 });
+		expect(parseStreamingJsonPreview("call_1", '{"b":2')).toBeUndefined();
 		forgetStreamingJsonPreview("call_1");
-		expect(parseStreamingJsonPreview("call_1", '{"b":2}')).toEqual({ b: 2 });
+		expect(parseStreamingJsonPreview("call_1", '{"b":2')).toEqual({ b: 2 });
 	});
 });
 
@@ -336,8 +371,9 @@ describe("openai-completions streaming tool-call arguments", () => {
 			expect(toolCall).toBeDefined();
 			// The tool receives the exact parse, regardless of how many previews were skipped.
 			expect(toolCall && toolCall.type === "toolCall" ? toolCall.arguments : undefined).toEqual(JSON.parse(args));
-			// ...but the UI preview was recomputed a bounded number of times instead of once per delta.
-			expect(streamingJsonPreviewStats.parses).toBeLessThanOrEqual(96);
+			// ...but the UI preview was recomputed a bounded number of times instead of once per delta:
+			// once per delta inside the free window, then one per ~6% of growth.
+			expect(streamingJsonPreviewStats.parses).toBeLessThanOrEqual(PREVIEW_FREE_BYTES / deltaSize + 96);
 			expect(streamingJsonPreviewStats.skipped).toBeGreaterThan(args.length / deltaSize / 2);
 			// Sanity: the stream really did arrive in many small deltas.
 			expect(events.filter((event) => event.type === "toolcall_delta").length).toBeGreaterThan(
