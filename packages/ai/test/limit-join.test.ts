@@ -133,6 +133,29 @@ describe("joinPublishedLimits", () => {
 		expect(limitJoinStats.noMatch).toBe(1);
 	});
 
+	it("counts a row that adds nothing as nothingToFill, not as missing coverage", () => {
+		// Every field the catalog row carries is already published by the provider, so this is a
+		// catalog hit with no fill. Reporting it as `noMatch` would make a complete catalog look
+		// like a coverage gap, which is the opposite of what the counter is for.
+		const published: ModelCost = {
+			input: 9,
+			output: 9,
+			cacheRead: 1,
+			cacheWrite: 1,
+			tiers: [{ inputTokensAbove: 272_000, input: 18, output: 27, cacheRead: 2, cacheWrite: 2 }],
+		};
+		const fill = joinPublishedLimits({
+			provider: "openai-codex",
+			id: "gpt-6.1-terra",
+			model: { cost: published, maxTokens: 65_536, costSource: "known" },
+			providerMaxTokens: 65_536,
+		});
+
+		expect(fill).toBeNull();
+		expect(limitJoinStats.nothingToFill).toBe(1);
+		expect(limitJoinStats.noMatch).toBe(0);
+	});
+
 	it("fills only the tier list when the provider already published a price", () => {
 		const published: ModelCost = { input: 9, output: 9, cacheRead: 1, cacheWrite: 1 };
 		const fill = joinPublishedLimits({

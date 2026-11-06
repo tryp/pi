@@ -1,7 +1,8 @@
 import type { OAuthCredential } from "../auth/types.ts";
 import type { RefreshModelsContext } from "../models.ts";
-import type { Api, Model, ModelCost } from "../types.ts";
+import type { Api, Model } from "../types.ts";
 import { joinPublishedLimits } from "./limit-join.ts";
+import { isUnpricedZeroCost } from "./pricing.ts";
 
 /**
  * The catalog is version-gated by Codex client version: pi's own 0.84.3 version returns an empty list,
@@ -41,26 +42,12 @@ export const codexCatalogDiscoveryStats = {
 
 /**
  * True when every published rate is zero AND no cost tier is declared, i.e. the entry carries a
- * placeholder rather than a price. The Codex catalog publishes no pricing at all, so this is the
- * normal shape for a freshly discovered model and must never be read as "this model is free".
+ * placeholder rather than a price.
  *
- * A declared tier counts as a pricing fact even when its rates round to zero, because the two
- * error directions are not symmetric: reading a placeholder as priced clamps the budget at the
- * declared boundary (compacts earlier, costs nothing), while reading a declared tier as unknown
- * suppresses the clamp and lets the trigger run to the full window (the terra exposure).
+ * Re-exported from `./pricing.ts` so the existing importers (`models.ts`, and the compaction guard
+ * in the coding agent) keep resolving, while the body lives in one place.
  */
-export function isUnpricedZeroCost(cost: ModelCost | undefined): boolean {
-	// A model with no cost object at all carries no price information either. Callers build partly
-	// synthetic models (tests, extension-provided models), so this must not throw.
-	if (!cost) return true;
-	return (
-		cost.input === 0 &&
-		cost.output === 0 &&
-		cost.cacheRead === 0 &&
-		cost.cacheWrite === 0 &&
-		(cost.tiers ?? []).length === 0
-	);
-}
+export { isUnpricedZeroCost } from "./pricing.ts";
 
 export function firstTierBoundary<TApi extends Api>(model: Model<TApi>): number | null {
 	const boundaries = (model.cost.tiers ?? [])

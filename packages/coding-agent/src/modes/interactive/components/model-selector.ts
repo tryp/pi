@@ -1,4 +1,5 @@
 import { type Model, modelsAreEqual } from "@earendil-works/pi-ai";
+import { isUnpricedZeroCost } from "@earendil-works/pi-ai/providers/pricing";
 import {
 	Container,
 	type Focusable,
@@ -45,13 +46,10 @@ type ModelScope = "all" | "scoped";
  */
 export function describeModelFacts(model: Model<any>): string {
 	const cost = model.cost;
-	const unpriced =
-		model.costSource === "unknown" ||
-		(cost.input === 0 &&
-			cost.output === 0 &&
-			cost.cacheRead === 0 &&
-			cost.cacheWrite === 0 &&
-			!(cost.tiers ?? []).length);
+	// The shared predicate, not a local copy: the guard and this line must agree on whether a
+	// zero cost object is a placeholder or a price, or the selector claims "free" for a model the
+	// guard calls unknown-priced.
+	const unpriced = model.costSource === "unknown" || isUnpricedZeroCost(cost);
 	const parts: string[] = [];
 	if (unpriced) {
 		parts.push("price: not published by provider");

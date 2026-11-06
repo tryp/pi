@@ -10,9 +10,15 @@
  *   prices come from models.dev, which carries no request-wide price tiers.
  * - `zai` maps models.dev entries but its live payload type drops `cost.tiers`.
  *
- * The compiled catalog (`models.generated.ts`, generated from models.dev at build time)
- * usually has a row for the same model id under some provider. This module joins that row
- * onto the discovered model.
+ * The compiled catalog (`models.generated.ts`, generated from models.dev at build time) may
+ * have a row for the same model id under some provider. This module joins that row onto the
+ * discovered model.
+ *
+ * Coverage is versioned, so do not assume a row exists: of the 25 ids the three providers
+ * actually served on 2026-11-06, 10 joined and 12 had no catalog row at all (`noMatch`) --
+ * every `zai` glm-4.5/4.6/5.x id and every `deepseek` id, because the compiled catalog
+ * carries an older id set (`glm-4.7`, `glm-5-turbo`, `deepseek-v4-flash`). Where the join is
+ * inert it is inert silently by design, which is why `noMatch` is counted.
  *
  * Two rules make the join safe to run unconditionally:
  *
@@ -28,13 +34,19 @@
  *    absent one because it looks like a fact.
  *
  * Provenance travels with the fill (`costSource: "catalog:<provider>"`), so a reader can
- * always tell a backend price from a joined one. Pricing here is informative: nothing in
- * this module decides behaviour beyond supplying the number. Where the number reaches a
- * cost guard (`firstCostTierBoundary`) that is the guard's decision, not the join's.
+ * always tell a backend price from a joined one. This module decides nothing itself, but the
+ * number it supplies is not inert: a fill replaces an all-zero placeholder, which flips the
+ * compaction guard's `pricingKnown` from false to true, so the joined tier boundary starts
+ * bounding the trigger. That is the intended reading -- a model whose tier the backend
+ * withholds is exactly the case the guard was fixed for -- but it is a behaviour change
+ * carried by a price, not merely a display change. Concretely: `gpt-6.1-terra` moves from a
+ * 440,000 trigger (88% of its 500,000 window, above every request-wide tier) to 239,360
+ * (88% of the 272,000 tier openai publishes for it).
  */
 
 import { MODELS } from "../models.generated.ts";
 import type { Api, Model, ModelCost, ModelCostTier, ProviderId } from "../types.ts";
+import { isUnpricedZeroCost } from "./pricing.ts";
 
 /**
  * Vendor aliases: a runtime-discovery provider id whose models are published under another
@@ -55,16 +67,21 @@ const VENDOR_ALIASES: Record<string, readonly string[]> = {
 /**
  * Counters, one per silent path.
  *
- * `joined`, `noMatch`, `ambiguous`, `windowDisagreement` and `refusedWindowOverride` are
- * cumulative events: a zero means "has not happened", never "worked". `byProvider` names
- * which catalog provider supplied each fill, so the provenance of the price currently in the
- * store is a query rather than a re-derivation.
+ * `joined`, `noMatch`, `nothingToFill`, `ambiguous`, `windowDisagreement` and
+ * `refusedWindowOverride` are cumulative events: a zero means "has not happened", never
+ * "worked". `noMatch` and `nothingToFill` are separate on purpose: the first says the catalog
+ * cannot answer for this id, the second says it answered and had nothing the model lacks. One
+ * counter for both would make a coverage gap indistinguishable from a complete catalog.
+ * `byProvider` names which catalog provider supplied each fill, so the provenance of the price
+ * currently in the store is a query rather than a re-derivation.
  */
 export const limitJoinStats = {
 	/** A fill was found and applied by the caller. */
 	joined: 0,
 	/** No catalog row for this id under this provider or any alias. */
 	noMatch: 0,
+	/** A catalog row was found and published nothing the model lacks (no fill). */
+	nothingToFill: 0,
 	/** Rows exist but disagree on price and no alias resolved which one to trust. */
 	ambiguous: 0,
 	/** The catalog's window differs from the window the provider published. */
@@ -78,6 +95,7 @@ export const limitJoinStats = {
 export function resetLimitJoinStats(): void {
 	limitJoinStats.joined = 0;
 	limitJoinStats.noMatch = 0;
+	limitJoinStats.nothingToFill = 0;
 	limitJoinStats.ambiguous = 0;
 	limitJoinStats.windowDisagreement = 0;
 	limitJoinStats.refusedWindowOverride = 0;
@@ -168,17 +186,8 @@ function ratesEqual(a: ModelCost, b: ModelCost): boolean {
 	);
 }
 
-/** An all-zero cost with no tiers is a placeholder, not a price. Mirrors `isUnpricedZeroCost`. */
-function isPlaceholder(cost: ModelCost | undefined): boolean {
-	if (!cost) return true;
-	return (
-		cost.input === 0 &&
-		cost.output === 0 &&
-		cost.cacheRead === 0 &&
-		cost.cacheWrite === 0 &&
-		(cost.tiers ?? []).length === 0
-	);
-}
+/** Picked up from the one shared definition in `pricing.ts`. */
+const isPlaceholder = isUnpricedZeroCost;
 
 /**
  * Pick the catalog row to trust.
@@ -254,7 +263,7 @@ export function joinPublishedLimits<TApi extends Api>(input: JoinPublishedLimits
 
 	if (!cost && maxTokens === undefined && !windowDisagreement) {
 		// A row existed but published nothing the model lacks; that is not a fill.
-		limitJoinStats.noMatch += 1;
+		limitJoinStats.nothingToFill += 1;
 		return null;
 	}
 

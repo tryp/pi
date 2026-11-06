@@ -853,8 +853,9 @@ export interface Model<TApi extends Api> {
 	 * Where the price came from. `unknown` marks a discovered model whose provider publishes no
 	 * pricing (the all-zero cost object is then a placeholder, not a price); `known` marks a price
 	 * the provider or the curated catalog states; `catalog:<provider>` marks a price joined at
-	 * runtime from the compiled catalog row for the same id under another provider, which is
-	 * informative rather than authoritative.
+	 * runtime from the compiled catalog row for the same id under another provider -- a different
+	 * source, not a weaker one: the compaction guard treats any non-placeholder price as known
+	 * pricing, so a joined tier boundary does bound the trigger.
 	 */
 	costSource?: "unknown" | "known" | `catalog:${string}`;
 	contextWindow: number;
