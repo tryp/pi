@@ -9,8 +9,9 @@ import {
 	type AssistantMessageEvent,
 	type Context,
 	EventStream,
+	forgetStreamingJsonPreview,
 	type Model,
-	parseStreamingJson,
+	parseStreamingJsonPreview,
 	type SimpleStreamOptions,
 	type StopReason,
 	type ToolCall,
@@ -323,7 +324,11 @@ function processProxyEvent(
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "toolCall") {
 				(content as any).partialJson += proxyEvent.delta;
-				content.arguments = parseStreamingJson((content as any).partialJson) || {};
+				// This block object is re-cloned on every delta, so throttle by tool-call id.
+				const preview = parseStreamingJsonPreview(content.id, (content as any).partialJson);
+				if (preview !== undefined) {
+					content.arguments = preview || {};
+				}
 				partial.content[proxyEvent.contentIndex] = { ...content }; // Trigger reactivity
 				return {
 					type: "toolcall_delta",
@@ -339,6 +344,7 @@ function processProxyEvent(
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "toolCall") {
 				Object.assign(content, proxyEvent.toolCall);
+				forgetStreamingJsonPreview(content.id);
 				delete (content as any).partialJson;
 				return {
 					type: "toolcall_end",
