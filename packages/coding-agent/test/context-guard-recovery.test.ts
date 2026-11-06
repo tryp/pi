@@ -456,16 +456,9 @@ describe("pre-send gate end to end", () => {
 		return firstMessageId;
 	}
 
-	it("records reserve-dominated triggers once per model, budget, and trigger", async () => {
+	it("records only structurally reserve-dominated triggers and deduplicates each budget", async () => {
 		const { session, modelRegistry, model } = await createRecoverySession({ maxContextTokens: null });
-		model.contextWindow = 204_800;
-		model.cost = {
-			input: 1,
-			output: 1,
-			cacheRead: 1,
-			cacheWrite: 1,
-			tiers: [{ inputTokensAbove: 32_000, input: 2, output: 2, cacheRead: 2, cacheWrite: 2 }],
-		};
+		model.cost = { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 };
 		const settings = session.settingsManager.getCompactionSettings();
 		const reserveDiagnostics = () =>
 			session.sessionManager
@@ -473,27 +466,39 @@ describe("pre-send gate end to end", () => {
 				.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic")
 				.map((entry) => (entry as { data: Record<string, unknown> }).data)
 				.filter((data) => data.kind === "compaction_trigger_reserve_dominated");
+		const resolve = (contextWindow: number) => {
+			model.contextWindow = contextWindow;
+			return internals._resolveCompactionTrigger.call(session as unknown as SessionInternals, settings);
+		};
 		try {
-			const first = internals._resolveCompactionTrigger.call(session as unknown as SessionInternals, settings);
-			expect(first.trigger).toBe(15_616);
-			expect(first.triggerBasis).toBe("reserve");
-			internals._resolveCompactionTrigger.call(session as unknown as SessionInternals, settings);
+			const ordinary = resolve(131_072);
+			expect(ordinary.triggerBasis).toBe("reserve");
+			expect(ordinary.trigger).toBe(114_688);
+			expect(reserveDiagnostics()).toHaveLength(0);
+
+			const small = resolve(24_000);
+			expect(small.trigger).toBe(7_616);
+			expect(small.triggerBasis).toBe("reserve");
 			expect(reserveDiagnostics()).toHaveLength(1);
 			expect(reserveDiagnostics()[0]).toMatchObject({
-				contextWindow: 204_800,
-				firstCostTierBoundary: 32_000,
-				costTierBoundarySource: "tiers",
-				budget: 32_000,
+				contextWindow: 24_000,
+				budget: 24_000,
 				reserveTokens: 16_384,
-				fractionCandidate: 28_160,
-				reserveCandidate: 15_616,
-				triggerTokens: 15_616,
+				fractionCandidate: 21_120,
+				reserveCandidate: 7_616,
+				triggerTokens: 7_616,
 			});
+			resolve(24_000);
+			expect(reserveDiagnostics()).toHaveLength(1);
 
-			model.cost.tiers = [{ inputTokensAbove: 40_000, input: 2, output: 2, cacheRead: 2, cacheWrite: 2 }];
-			const second = internals._resolveCompactionTrigger.call(session as unknown as SessionInternals, settings);
-			expect(second.trigger).toBe(23_616);
-			expect(second.triggerBasis).toBe("reserve");
+			const thirtyTwoK = resolve(32_000);
+			expect(thirtyTwoK.trigger).toBe(15_616);
+			expect(thirtyTwoK.triggerBasis).toBe("reserve");
+			expect(reserveDiagnostics()).toHaveLength(2);
+
+			const halfBudget = resolve(32_768);
+			expect(halfBudget.triggerBasis).toBe("reserve");
+			expect(halfBudget.trigger).toBe(16_384);
 			expect(reserveDiagnostics()).toHaveLength(2);
 		} finally {
 			session.dispose();

@@ -1409,7 +1409,9 @@ export class AgentSession {
 				reserveTokens: resolution.reserveTokens,
 			});
 		}
-		if (resolution.triggerBasis === "reserve") {
+		// Record only structurally reserve-dominated budgets: once output reserve exceeds half
+		// the context budget, it has grown too large for the fractional trigger to be meaningful.
+		if (resolution.triggerBasis === "reserve" && resolution.reserveTokens > resolution.budget / 2) {
 			const key = JSON.stringify([
 				model?.provider ?? "unknown",
 				model?.id ?? "unknown",
