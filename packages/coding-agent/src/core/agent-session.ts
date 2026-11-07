@@ -41,6 +41,7 @@ import {
 	isContextOverflow,
 	isRecoverableLength,
 	isRetryableAssistantError,
+	isUnrecordedAbortFailure,
 	modelsAreEqual,
 	type RetryCallbacks,
 	resetApiProviders,
@@ -450,6 +451,11 @@ export class AgentSession {
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
 	private _pendingAbortReason: "user" | "stream_inactivity" | undefined;
+	/**
+	 * Assistant messages already reported as unattributable aborts, so a message
+	 * that reaches the retry decision twice is counted once.
+	 */
+	private readonly _reportedUnrecordedAborts = new WeakSet<AssistantMessage>();
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -3904,6 +3910,20 @@ export class AgentSession {
 		// shared retryable pattern matches a bare `500` inside a threshold like
 		// `5000`, which would retry a request that was never sent.
 		if (isContextGuardRefusal(message)) return false;
+		// An abort-shaped failure with no recorded origin is the class the origin
+		// work exists to remove. It stays non-retryable (the wording says an abort
+		// happened, not who aborted it), but it is counted: a silent "not retryable"
+		// verdict is how a gap in origin recording would stay invisible.
+		if (isUnrecordedAbortFailure(message) && !this._reportedUnrecordedAborts.has(message)) {
+			this._reportedUnrecordedAborts.add(message);
+			this._appendDiagnostic({
+				kind: "unrecorded_abort_failure",
+				api: message.api,
+				provider: message.provider,
+				model: message.model,
+				errorMessage: message.errorMessage.slice(0, 200),
+			});
+		}
 		return isRetryableAssistantError(message, { retryTransportAborts: this._transportAbortRetryAllowed() });
 	}
 

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentEvent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
+import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel, lazyStream } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession, ContextGuardError } from "../src/core/agent-session.ts";
@@ -77,6 +77,8 @@ describe("AgentSession retry", () => {
 		streamInactivityTimeoutMs?: number;
 		onStreamInactivity?: "notify" | "abort";
 		hangUntilAbort?: boolean;
+		/** Replaces the default mock stream entirely; `callCount` still tracks calls. */
+		streamFn?: ConstructorParameters<typeof Agent>[0]["streamFn"];
 	}) {
 		const failCount = options?.failCount ?? 1;
 		const maxRetries = options?.maxRetries ?? 3;
@@ -90,6 +92,9 @@ describe("AgentSession retry", () => {
 			streamInactivityTimeoutMs: options?.streamInactivityTimeoutMs,
 			streamFn: (_model, _context, streamOptions) => {
 				callCount++;
+				if (options?.streamFn) {
+					return options.streamFn(_model, _context, streamOptions);
+				}
 				const stream = new MockAssistantStream();
 				if (options?.hangUntilAbort) {
 					const partial = createAssistantMessage("", {
@@ -494,5 +499,83 @@ describe("AgentSession retry", () => {
 		// A follow-up prompt must work (no "Agent is already processing" error)
 		await session.prompt("Follow-up");
 		expect(callCount).toBe(4);
+	});
+
+	/** Diagnostic kinds persisted for the session, in order. */
+	function diagnosticKinds(target: AgentSession): string[] {
+		return target.sessionManager.getEntries().flatMap((entry) =>
+			entry.type === "custom" && entry.customType === "pi.session_diagnostic"
+				? [(entry.data as { kind?: string }).kind ?? ""]
+				: [],
+		);
+	}
+
+	it("does not retry a setup-phase abort and does not count it as unattributable", async () => {
+		const caller = new AbortController();
+		const created = await createSession({
+			failCount: 0,
+			streamFn: () =>
+				lazyStream(
+					getModel("anthropic", "claude-sonnet-4-5")!,
+					() => Promise.reject(new DOMException("This operation was aborted", "AbortError")),
+					// The caller's signal is untouched: the abort happened during setup
+					// (credential resolution), before any request existed.
+					caller.signal,
+				),
+		});
+
+		await created.session.prompt("private prompt text");
+
+		// Exactly one call: a setup abort is terminal, so nothing is resubmitted even
+		// though the transport-abort retry budget is available for this session.
+		expect(created.getCallCount()).toBe(1);
+
+		const last = created.session.messages.at(-1) as AssistantMessage;
+		expect(last.stopReason).toBe("error");
+		expect(last.errorMessage).toBe("This operation was aborted");
+		expect(last.usage.totalTokens).toBe(0);
+		const failure = (last.diagnostics ?? []).find((entry) => entry.type === "provider_request_failure");
+		expect(failure?.details).toMatchObject({
+			failureCode: "abort_transport",
+			phase: "setup",
+			transport: "none",
+			retryVerdict: "do_not_retry",
+		});
+
+		const kinds = diagnosticKinds(created.session);
+		expect(kinds).not.toContain("auto_retry_start");
+		// The origin was recorded, so this is not the unattributable class.
+		expect(kinds).not.toContain("unrecorded_abort_failure");
+	});
+
+	it("counts an abort-shaped failure that carries no recorded origin", async () => {
+		const created = await createSession({
+			failCount: 0,
+			streamFn: () => {
+				// Thrown out of the stream, so the run-failure message is built without a
+				// request-failure origin: the shape every pre-origin session wrote.
+				throw new DOMException("This operation was aborted", "AbortError");
+			},
+		});
+
+		await created.session.prompt("private prompt text");
+
+		expect(created.getCallCount()).toBe(1);
+		const counted = created.session.sessionManager.getEntries().flatMap((entry) =>
+			entry.type === "custom" &&
+			entry.customType === "pi.session_diagnostic" &&
+			(entry.data as { kind?: string }).kind === "unrecorded_abort_failure"
+				? [entry.data as { kind: string; provider?: string; errorMessage?: string }]
+				: [],
+		);
+		// Counted once: the message reaches the retry decision from both
+		// `agent_end` and the post-run handler.
+		expect(counted).toHaveLength(1);
+		expect(counted[0]).toMatchObject({
+			kind: "unrecorded_abort_failure",
+			provider: "anthropic",
+			errorMessage: "This operation was aborted",
+		});
+		expect(JSON.stringify(counted)).not.toContain("private prompt text");
 	});
 });
