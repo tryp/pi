@@ -31,7 +31,7 @@ function requestFailure(message: AssistantMessage) {
 }
 
 describe("lazy setup-failure origin", () => {
-	it("records a transport abort raised during setup and keeps the display message unchanged", async () => {
+	it("records a setup-phase abort without a transport as non-retryable and keeps the display message unchanged", async () => {
 		const controller = new AbortController();
 		const message = await setupFailure(abortError(), controller.signal);
 
@@ -51,11 +51,13 @@ describe("lazy setup-failure origin", () => {
 				phase: "setup",
 				transport: "none",
 				signalAborted: false,
-				retryVerdict: "retry",
+				// Credential refresh or an auth lock aborted while the caller's signal was
+				// untouched. No transport existed, so no request was dropped and the
+				// recoverable transport verdict does not apply.
+				retryVerdict: "do_not_retry",
 			}),
 		);
-		// The retry policy can now decide from the origin instead of the wording.
-		expect(isRetryableAssistantError(message, { retryTransportAborts: true })).toBe(true);
+		expect(isRetryableAssistantError(message, { retryTransportAborts: true })).toBe(false);
 		expect(isRetryableAssistantError(message, { retryTransportAborts: false })).toBe(false);
 	});
 

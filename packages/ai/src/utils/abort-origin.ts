@@ -71,7 +71,11 @@ export type RetryVerdict = "retry" | "do_not_retry" | "indeterminate";
 export interface RequestFailureOrigin {
 	failureCode: RequestFailureCode;
 	phase: RequestFailurePhase;
-	/** Transport under test when the failure was observed, e.g. `sse`. */
+	/**
+	 * Transport the failure was observed on, e.g. `sse`, `websocket`. `none` means
+	 * no transport existed yet (setup), and it is the one value that cannot carry
+	 * the recoverable transport-abort verdict.
+	 */
 	transport: string;
 	signalAborted: boolean;
 	/** True when the local abort was a local timeout rather than a cancellation. */
@@ -235,7 +239,15 @@ export function classifyRequestFailure(input: RequestFailureInput): RequestFailu
 		failureCode = "request_construction";
 	}
 
-	// A transport abort with the local signal untouched is the recoverable class.
+	// A transport abort with the local signal untouched is the recoverable class,
+	// but only when a transport existed to drop. Setup failures record
+	// `transport: "none"` (`api/lazy.ts`): the abort came out of credential
+	// resolution or an auth lock while the caller's signal was untouched, so no
+	// request was lost and re-sending re-runs the same local race. Treating that
+	// as recoverable was the difference between "a dropped request, retry it" and
+	// "we aborted ourselves before the wire"; the verdict must not be inherited
+	// from `abort_transport`'s name alone.
+	//
 	// A local abort is only retryable when it was a local timeout, which preserves
 	// the pre-existing (message-matched) behaviour for `AbortSignal.timeout`; an
 	// explicit cancellation is never retried. Every other class is
@@ -243,7 +255,7 @@ export function classifyRequestFailure(input: RequestFailureInput): RequestFailu
 	// verdict from the message classifier.
 	let retryVerdict: RetryVerdict = "indeterminate";
 	if (failureCode === "abort_transport") {
-		retryVerdict = "retry";
+		retryVerdict = input.transport === "none" ? "do_not_retry" : "retry";
 	} else if (failureCode === "abort_signal") {
 		retryVerdict = signal.timeout || isTimeoutAbort(abortLike) ? "retry" : "do_not_retry";
 	} else if (failureCode === "request_construction") {

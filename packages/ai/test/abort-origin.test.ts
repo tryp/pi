@@ -136,6 +136,22 @@ describe("classifyRequestFailure", () => {
 		});
 	});
 
+	it("does not let a setup abort inherit the recoverable transport verdict", () => {
+		// Setup failures (credential resolution, auth lock contention) record
+		// `transport: "none"`. The abort happened before any request existed, so
+		// nothing was dropped and the failure must not become retryable just because
+		// its code path is named after transport aborts.
+		const origin = classifyRequestFailure(input({ phase: "setup", transport: "none" }));
+
+		expect(origin).toMatchObject({
+			failureCode: "abort_transport",
+			phase: "setup",
+			transport: "none",
+			signalAborted: false,
+			retryVerdict: "do_not_retry",
+		});
+	});
+
 	it("classifies an SDK-wrapped abort as a transport abort", () => {
 		const wrapped = new Error("Connection error.");
 		wrapped.name = "APIConnectionError";
