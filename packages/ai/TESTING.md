@@ -1,3 +1,12 @@
 # Testing
 
-The model-data directory is gitignored, so every fresh worktree starts without it. The Vitest global setup validates this data before any test file runs; it covers `npm test`, direct Vitest invocations, and Bun test commands that use this Vitest config, and Bun test when run from `packages/ai`; `bun test packages/ai/test/...` from the repository root is not covered because Bun loads config from the current directory. The guard says to run `npm run hydrate:model-data` at the repository root. If network hydration is unavailable, run `npm run bootstrap:model-data` from `packages/ai`; it copies the data and manifest from the primary checkout inferred from Git's common directory, then validates the copy and reports its generation time and age.
+The model-data directory is gitignored, so every fresh worktree starts without it. Two guards catch that before a test file can fail on a missing JSON file:
+
+- **Vitest** (`npm test`, or a single-file `npx vitest --run test/x.test.ts`): `globalSetup` runs `scripts/vitest-model-data-setup.ts`, which fully validates the data against the committed shards.
+- **Bun from `packages/ai`**: `bunfig.toml` preloads `scripts/bun-model-data-preload.ts`, which checks manifest presence and schema only, so it costs nothing on a warm run.
+
+Both print `Model data is missing or stale. Run \`npm run hydrate:model-data\` from the repository root.` and exit non-zero before any test runs.
+
+Not covered: `bun test packages/ai/test/...` invoked from the repository root, because Bun loads its config from the current directory.
+
+If network hydration is unavailable, run `npm run bootstrap:model-data` from `packages/ai`. It copies the data and manifest from the primary checkout inferred from Git's common directory, validates the copy, and prints its generation time and age so a stale copy cannot be mistaken for a fresh one.
