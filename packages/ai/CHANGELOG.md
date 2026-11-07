@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed every `lazyStream` call site in the `Models` surface (stream, streamSimple, deferred fetch, and no-implementation dispatch) to forward the caller's signal into setup, so a cancellation raised during auth resolution is attributed to the caller instead of a transport.
 - Fixed a setup-phase abort being classified as a recoverable transport abort. Setup failures (credential resolution, auth lock contention) record `transport: "none"` because no request existed yet, so the structured verdict is now `do_not_retry`: retrying re-ran the same local cancellation while the caller's signal was untouched. Transport aborts observed on a real transport keep their `retry` verdict.
 - Dropped orphaned OpenAI Responses tool results after errors or context compaction to prevent unmatched function-call outputs.
 - Fixed OpenAI Codex cached WebSocket continuations to retry when function-call outputs report a missing tool call.
