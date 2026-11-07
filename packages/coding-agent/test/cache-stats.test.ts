@@ -4,6 +4,7 @@ import {
 	CACHE_TTL_MS,
 	collectCacheMisses,
 	computeCacheWaste,
+	createCacheTelemetryHealthRecorder,
 	detectCacheMiss,
 	getCacheMissLabel,
 	type ModelPriceSource,
@@ -279,6 +280,45 @@ describe("detectCacheMiss", () => {
 		});
 	});
 
+	it("writes one bounded cache-telemetry health diagnostic per session", () => {
+		const appendCustomEntry = vi.fn();
+		const recordHealth = createCacheTelemetryHealthRecorder({ appendCustomEntry });
+		const stats = {
+			queueDrops: Number.MAX_SAFE_INTEGER,
+			serializationErrors: 1,
+			missVerdictsSkipped: 2,
+			missComparisonOperationDrops: 3,
+			writeErrors: 4,
+			pruneFailures: 5,
+		};
+		const fallback = {
+			fallbackReason: "no_request_record".repeat(20),
+			requestsWithoutWireTelemetry: 6,
+			provider: "provider".repeat(20),
+			model: "model",
+		};
+
+		expect(recordHealth(stats, fallback)).toBe(true);
+		expect(recordHealth(stats, fallback)).toBe(false);
+		expect(appendCustomEntry).toHaveBeenCalledTimes(1);
+		const data = appendCustomEntry.mock.calls[0]?.[1] as Record<string, unknown>;
+		expect(data).toMatchObject({
+			schemaVersion: 1,
+			kind: "cache_telemetry_health",
+			writer: {
+				queueDrops: 1_000_000_000,
+				serializationErrors: 1,
+				missVerdictsSkipped: 2,
+				missComparisonOperationDrops: 3,
+				writeErrors: 4,
+				pruneFailures: 5,
+			},
+		});
+		const attributionFallback = data.attributionFallback as Record<string, unknown>;
+		expect(attributionFallback.fallbackReason).toHaveLength(100);
+		expect(attributionFallback.provider).toHaveLength(100);
+	});
+
 	it("labels unexplained misses with known telemetry attribution", () => {
 		const base = { cacheWrite: 110_000, cost: { cacheWrite: 0.4125 }, timestamp: 120_000 };
 		const labels = [
@@ -293,8 +333,22 @@ describe("detectCacheMiss", () => {
 				"Cache miss (prefix identical: provider eviction or routing)",
 			],
 			[
+				{ kind: "prefix_unchanged_client_side" as const, evidence: "operations" as const },
+				"Cache miss (system prompt/tools unchanged; messages appended; wire comparison unavailable)",
+			],
+			[
 				{ kind: "comparison_truncated" as const },
 				"Cache miss (prefix identical in the compared window; remainder truncated)",
+			],
+			[
+				{
+					kind: "telemetry_unavailable" as const,
+					fallbackReason: "no_operation_records" as const,
+					provider: "ollama-cloud",
+					model: "deepseek-v4.1-flash:1017",
+					requestCount: 2,
+				},
+				"Cache miss (no request telemetry recorded for this provider)",
 			],
 		] as const;
 		for (const [attribution, label] of labels) {

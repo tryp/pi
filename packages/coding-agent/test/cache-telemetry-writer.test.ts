@@ -510,7 +510,7 @@ describe("local cache telemetry writer", () => {
 		const entries = await readdir(directory);
 		const saved = (await readFile(join(directory, entries[0]!), "utf8"))
 			.trim()
-			.split("\\n")
+			.split("\n")
 			.map((line: string) => JSON.parse(line) as { data: { kind: string; provider?: string; model?: string } });
 		const requestRecords = saved.filter((record) => record.data.kind === "cache_request");
 		expect(requestRecords.slice(0, CACHE_TELEMETRY_PROVIDER_LABELS.length).map((record) => record.data.provider)).toEqual(
@@ -545,7 +545,7 @@ describe("local cache telemetry writer", () => {
 		const entries = await readdir(directory);
 		const saved = (await readFile(join(directory, entries[0]!), "utf8"))
 			.trim()
-			.split("\\n")
+			.split("\n")
 			.map((line: string) => JSON.parse(line) as { data: { kind: string } });
 		expect(saved.map((record) => record.data.kind)).toEqual(["cache_request_outcome", "cache_request"]);
 		expect(writer.getStats().serializationErrors).toBe(2);
@@ -1090,6 +1090,84 @@ describe("cache miss attribution", () => {
 		// A provider that records no request telemetry never completes, so the last
 		// instrumented request must not label a later message from a different one.
 		expect(tracker.getLatest(1_000 + 10_001)).toEqual({ kind: "unknown" });
+	});
+
+	it("classifies operation-only append comparisons as provider-side cache misses", () => {
+		const tracker = new CacheMissAttributionTracker();
+		const requestId = "d".repeat(32);
+		const common = {
+			operation: "final_context" as const,
+			durationMs: 0,
+			comparisonScope: "across_requests" as const,
+			comparisonBasis: "prior_available" as const,
+		};
+		tracker.recordOperations(
+			requestId,
+			[
+				{ ...common, surface: "messages", reason: "append", beforeCount: 4, afterCount: 7 },
+				{ ...common, surface: "system_prompt", reason: "unchanged", beforeCount: 49_865, afterCount: 49_865 },
+				{ ...common, surface: "tools", reason: "unchanged", beforeCount: 48, afterCount: 48 },
+			],
+			{ provider: "ollama-cloud", model: "deepseek-v4.1-flash:1017" },
+		);
+		tracker.complete(requestId, 1_000);
+
+		expect(tracker.getLatest(1_000)).toEqual({
+			kind: "prefix_unchanged_client_side",
+			evidence: "operations",
+		});
+	});
+
+	it("keeps operation-only history rewrites attributed as rewrites", () => {
+		const tracker = new CacheMissAttributionTracker();
+		const requestId = "e".repeat(32);
+		tracker.recordOperations(
+			requestId,
+			[
+				{
+					surface: "messages",
+					operation: "final_context",
+					reason: "history_rewrite",
+					durationMs: 0,
+					beforeCount: 7,
+					afterCount: 7,
+					comparisonScope: "across_requests",
+					comparisonBasis: "prior_available",
+					annotation: { reason: "auto_continue_filter" },
+				},
+				{
+					surface: "system_prompt",
+					operation: "final_context",
+					reason: "unchanged",
+					durationMs: 0,
+					beforeCount: 100,
+					afterCount: 100,
+					comparisonScope: "across_requests",
+					comparisonBasis: "prior_available",
+				},
+			],
+			{ provider: "ollama-cloud", model: "deepseek-v4.1-flash:1017" },
+		);
+		tracker.complete(requestId, 2_000);
+
+		expect(tracker.getLatest(2_000)).toEqual({ kind: "messages_rewritten", reasons: ["auto_continue_filter"] });
+	});
+
+	it("reports telemetry unavailable when no operation evidence exists and counts affected requests", () => {
+		const tracker = new CacheMissAttributionTracker();
+		for (const requestId of ["f".repeat(32), "a".repeat(32)]) {
+			tracker.recordOperations(requestId, [], { provider: "ollama-cloud", model: "deepseek-v4.1-flash:1017" });
+			tracker.complete(requestId);
+			tracker.getLatest();
+		}
+
+		expect(tracker.getLatest()).toEqual({
+			kind: "telemetry_unavailable",
+			fallbackReason: "no_operation_records",
+			provider: "ollama-cloud",
+			model: "deepseek-v4.1-flash:1017",
+			requestCount: 2,
+		});
 	});
 
 	it("joins the messages-surface rewrite reasons recorded for the completing request", () => {

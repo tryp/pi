@@ -20,6 +20,7 @@ import {
 	createCacheOperationInstrumentation,
 	createCacheOperationRecord,
 } from "./cache-operations.ts";
+import { createCacheTelemetryHealthRecorder } from "./cache-stats.ts";
 import { CacheMissAttributionTracker, createLocalCacheTelemetryWriter } from "./cache-telemetry.ts";
 import { estimateProviderContextTokens, resolveCompactionTrigger } from "./compaction/compaction.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -292,11 +293,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				},
 				(records: Parameters<typeof writer.appendBatch>[0]) => writer.appendBatch(records),
 			);
+			const recordCacheTelemetryHealth = createCacheTelemetryHealthRecorder(sessionManager);
 			disposeCacheTelemetry = async () => {
 				try {
 					await observer.flush();
 				} finally {
 					await writer.flush();
+					recordCacheTelemetryHealth(writer.getStats(), cacheMissAttributionTracker!.getHealth());
 				}
 			};
 			cacheOperationInstrumentation = createCacheOperationInstrumentation((observation) => {
@@ -327,7 +330,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						for (const observation of pending) observation.priorSuccessfulRequest = priorSuccessfulRequest;
 					}
 					const sequence = cacheOperationInstrumentation?.nextSequence() ?? 0;
-					cacheMissAttributionTracker?.recordOperations(ids.requestId, pending);
+					cacheMissAttributionTracker?.recordOperations(ids.requestId, pending, {
+						provider: input.provider,
+						model: input.model,
+					});
 					for (const observation of pending) {
 						writer.appendOperation(
 							createCacheOperationRecord(
