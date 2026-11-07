@@ -3,12 +3,11 @@ import type { Api, Model, ModelsRefreshOptions, ModelsRefreshResult } from "@ear
 /**
  * Bound for the once-per-session model refresh at boot.
  *
- * `ModelRuntime.refresh()` issues one catalog request per reachable provider and then runs
- * an availability pass, so the pass is the unit to bound, not each request. Measured on
- * 2026-11-06 with `tmp/measure-refresh.mts` against the four providers this machine holds
- * credentials for (openai-codex, opencode-go, zai, ollama-cloud): one pass issued four
- * catalog requests; n=30 passes gave p50=335ms, p95=433ms, max=525ms. 2x p95 is 866ms, so
- * the bound is 1000ms (~2.3x p95, 1.9x the observed max).
+ * `ModelRuntime.refresh()` issues one catalog request per reachable provider concurrently;
+ * the pass is the unit to bound, not each request. Measured 2026-11-06 with
+ * `node tmp/measure-refresh.mts 30` against the four credentialed providers (openai-codex,
+ * opencode-go x2, ollama-cloud): 30 complete refresh passes, each with four fetch calls,
+ * p50=354ms, p95=463ms, max=507ms. 2x p95=926ms, rounded up to a 1000ms bound.
  */
 export const BOOT_MODEL_REFRESH_TIMEOUT_MS = 1000;
 
@@ -35,7 +34,7 @@ export type BootModelRefreshOutcome =
 
 /** The persisted shape, written as a `pi.session_diagnostic` custom entry. */
 export interface BootModelRefreshDiagnostic {
-	schemaVersion: 1;
+	schemaVersion: 2;
 	kind: "boot_model_refresh";
 	outcome: BootModelRefreshOutcome;
 	/** The bound this pass ran under, so a timeout can be read without knowing the constant. */
@@ -181,9 +180,10 @@ function persistDiagnostic(sink: BootModelRefreshDiagnosticSink | undefined, dia
  * Refresh provider catalogs once at session boot so a window lowered between sessions does
  * not survive in a stale in-memory runtime.
  *
- * The pass is bounded by `timeoutMs` and degrades to the persisted store: an aborted refresh
- * publishes nothing (`publishProviderModels` gates both the store write and `update` on the
- * signal), so the values restored from `models-store.json` at runtime creation stand.
+ * The pass is bounded by `timeoutMs`. On timeout, already completed provider publications can
+ * remain alongside old catalogs for providers still in flight. This is safe because
+ * FileModelsStore writes and deletes use FileAuthStorageBackend.withLockAsync and re-parse the
+ * file before merging each provider, so cross-provider writes serialize and preserve both entries.
  */
 export async function runBootModelRefresh(options: {
 	runtime: BootModelRefreshRuntime;
@@ -194,7 +194,7 @@ export async function runBootModelRefresh(options: {
 	const timeoutMs = options.timeoutMs ?? BOOT_MODEL_REFRESH_TIMEOUT_MS;
 	const key: object = sink ?? runtime;
 	const base: BootModelRefreshDiagnostic = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		kind: "boot_model_refresh",
 		outcome: "completed",
 		timeoutMs,

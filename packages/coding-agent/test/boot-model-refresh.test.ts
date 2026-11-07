@@ -144,6 +144,23 @@ describe("boot model refresh", () => {
 		expect(bootModelRefreshStats.attempted).toBe(1);
 		expect(bootModelRefreshStats.completed).toBe(1);
 		expect(bootDiagnostics(sessionManager)).toHaveLength(1);
+		const [diagnostic] = bootDiagnostics(sessionManager);
+		expect(Object.keys(diagnostic).sort()).toEqual([
+			"contextWindowChanges",
+			"durationMs",
+			"kind",
+			"outcome",
+			"providerErrors",
+			"providersConfigured",
+			"providersRequested",
+			"schemaVersion",
+			"timeoutMs",
+			"timestamp",
+		].sort());
+		expect(diagnostic.schemaVersion).toBe(2);
+		expect(diagnostic.kind).toBe("boot_model_refresh");
+		expect(diagnostic.outcome).toBe("completed");
+		expect(diagnostic.durationMs).toEqual(expect.any(Number));
 	});
 
 	it("skips and counts a refresh when the runtime is offline", async () => {

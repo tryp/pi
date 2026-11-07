@@ -37,6 +37,26 @@ function model(provider: string, id: string): Model<"openai-completions"> {
 }
 
 describe("FileModelsStore", () => {
+	it("preserves concurrent provider publishes and prior data when another pass aborts", async () => {
+		const store = new FileModelsStore(sharedModelsPath);
+		await store.write("slow", { models: [model("slow", "old")], checkedAt: 1 });
+		const aborted = new AbortController();
+		aborted.abort();
+
+		await Promise.all([
+			store.write("fast", { models: [model("fast", "new-fast")], checkedAt: 2 }),
+			store.write("other", { models: [model("other", "new-other")], checkedAt: 3 }),
+		]);
+		await expect(
+			store.write("slow", { models: [model("slow", "partial")], checkedAt: 4 }, { signal: aborted.signal }),
+		).rejects.toThrow();
+
+		const reloaded = new FileModelsStore(sharedModelsPath);
+		expect((await reloaded.read("fast"))?.models.map((entry) => entry.id)).toEqual(["new-fast"]);
+		expect((await reloaded.read("other"))?.models.map((entry) => entry.id)).toEqual(["new-other"]);
+		expect((await reloaded.read("slow"))?.models.map((entry) => entry.id)).toEqual(["old"]);
+	});
+
 	it("persists provider catalogs without replacing unrelated providers", async () => {
 		const store = new FileModelsStore(sharedModelsPath);
 
