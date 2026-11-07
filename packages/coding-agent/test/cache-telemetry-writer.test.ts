@@ -15,7 +15,11 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CacheTelemetryRecord, CacheTelemetryRequestRecord } from "../../ai/src/cache-telemetry.ts";
+import {
+	createCacheTelemetrySession,
+	type CacheTelemetryRecord,
+	type CacheTelemetryRequestRecord,
+} from "../../ai/src/cache-telemetry.ts";
 import type { CacheOperationObservation, CacheOperationRecord } from "../src/core/cache-operations.ts";
 import {
 	CacheMissAttributionTracker,
@@ -418,6 +422,47 @@ describe("local cache telemetry writer", () => {
 		expect(JSON.parse(saved).data.requestId).toBe(requestRecord().requestId);
 		expect((await stat(directory)).mode & 0o777).toBe(0o700);
 		expect(writer.getStats().serializationErrors).toBe(3);
+	});
+
+	it("persists ollama-cloud attempts with colon-tagged model ids", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-ollama-cloud-"));
+		tempDirs.push(root);
+		const writer = await createLocalCacheTelemetryWriter(root);
+		const acceptedBatches: boolean[] = [];
+		const observer = createCacheTelemetrySession(
+			() => {},
+			(records) => {
+				const accepted = writer.appendBatch(records);
+				acceptedBatches.push(accepted);
+				return accepted;
+			},
+		);
+		const ids = observer.observeRequest({
+			provider: "ollama-cloud",
+			model: "deepseek-v4.1-flash:1017",
+			phase: "final_wire_body",
+			transport: "sse",
+			payload: { messages: [{ role: "user", content: "hello" }] },
+			wirePayload: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+		});
+		observer.observeOutcome({ ...ids, outcome: "success" });
+		await observer.flush();
+		await writer.flush();
+
+		expect(acceptedBatches).toEqual([true]);
+		const directory = join(root, "cache-telemetry");
+		const entries = await readdir(directory);
+		const saved = (await readFile(join(directory, entries[0]!), "utf8"))
+			.trim()
+			.split("\n")
+			.map(
+				(line: string) =>
+					JSON.parse(line) as { data: { kind: string; provider?: string; model?: string } },
+			);
+		expect(saved.map((record) => record.data.kind)).toEqual(["cache_request", "cache_request_outcome"]);
+		expect(saved[0].data.provider).toBe("ollama-cloud");
+		expect(saved[0].data.model).toMatch(/^model-sha256:[a-f0-9]{64}$/);
+		expect(writer.getStats().serializationErrors).toBe(0);
 	});
 
 	it("accepts the producer's hashed provider and model labels", async () => {

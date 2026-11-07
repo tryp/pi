@@ -254,6 +254,7 @@ const OPERATION_UNAVAILABLE_CAUSES = new Set([
 ]);
 const OPERATION_COMPARISON_BASES = new Set(["first_request", "prior_available", "prior_unavailable"]);
 const OUTCOMES = new Set(["success", "failed", "aborted"]);
+// Keep dynamic provider labels in sync with the producer's raw-label allowlist in packages/ai.
 const PROVIDERS = new Set([
 	"anthropic",
 	"openai",
@@ -262,6 +263,8 @@ const PROVIDERS = new Set([
 	"opencode",
 	"opencode-go",
 	"zai",
+	"radius",
+	"ollama-cloud",
 	"custom",
 ]);
 const MODELS = new Set([
