@@ -119,6 +119,23 @@ describe("isRetryableAssistantError with structured request-failure origin", () 
 		}
 	});
 
+	it("does not treat a bare 400 as a request-size rejection", () => {
+		// 413 and 431 are unambiguous; 400 is the status of every malformed request,
+		// including tool-schema and content-policy refusals. Classifying those as size
+		// failures makes the caller compact a conversation with no size problem.
+		const schemaFailure = recordRequestFailure(
+			assistantError("Invalid tool schema"),
+			Object.assign(new Error("Invalid tool schema"), { status: 400 }),
+		);
+		const sizedFailure = recordRequestFailure(
+			assistantError("maximum context length exceeded"),
+			Object.assign(new Error("maximum context length exceeded"), { status: 400 }),
+		);
+
+		expect(isRequestSizeFailure(schemaFailure)).toBe(false);
+		expect(isRequestSizeFailure(sizedFailure)).toBe(true);
+	});
+
 	it("ignores an unrelated diagnostic type", () => {
 		const message = assistantError("This operation was aborted");
 		message.diagnostics = [

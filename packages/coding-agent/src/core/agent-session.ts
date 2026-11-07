@@ -40,6 +40,7 @@ import {
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	isRecoverableLength,
+	isRequestSizeFailure,
 	isRetryableAssistantError,
 	isUnrecordedAbortFailure,
 	modelsAreEqual,
@@ -3948,22 +3949,12 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
-	 * Check if an error is retryable (overloaded, rate limit, server errors).
-	 * Context overflow errors are NOT retryable (handled by compaction instead).
+	 * Whether the failure was an explicit request-size rejection. Delegates to the
+	 * shared classifier so the size wording lives in one place: a second copy here
+	 * drifted the moment the status list changed.
 	 */
 	private _isRequestSizeFailure(message: AssistantMessage): boolean {
-		if (message.stopReason !== "error" || !message.errorMessage) return false;
-		const diagnostic = [...(message.diagnostics ?? [])]
-			.reverse()
-			.find((entry) => entry.type === "provider_request_failure");
-		const details = diagnostic?.details;
-		const status = details?.httpStatus;
-		if (status === 400 || status === 413 || status === 431) return true;
-		const providerMessage =
-			typeof details?.formattedError === "string" ? details.formattedError : message.errorMessage;
-		return /\b413\b|\b431\b|request (?:entity )?too large|payload too large|prompt (?:is )?too long|input (?:is )?too long|maximum context length|context length (?:is )?exceeded|maximum input tokens|token limit exceeded|context window.{0,24}(?:exceed|limit)/i.test(
-			providerMessage,
-		);
+		return isRequestSizeFailure(message);
 	}
 
 	private _isTransportAbortFailure(message: AssistantMessage): boolean {
@@ -3974,6 +3965,10 @@ export class AgentSession {
 		return details?.failureCode === "abort_transport" && details?.retryVerdict === "retry";
 	}
 
+	/**
+	 * Check if an error is retryable (overloaded, rate limit, server errors).
+	 * Context overflow errors are NOT retryable (handled by compaction instead).
+	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;

@@ -52,10 +52,10 @@ function createAssistantMessage(text: string, overrides?: Partial<AssistantMessa
 	};
 }
 
-function createFailureMessage(kind: "transport" | "size", status?: number): AssistantMessage {
+function createFailureMessage(kind: "transport" | "size", status?: number, errorMessage?: string): AssistantMessage {
 	const message = createAssistantMessage("", {
 		stopReason: "error",
-		errorMessage: kind === "transport" ? "This operation was aborted" : "Request rejected",
+		errorMessage: errorMessage ?? (kind === "transport" ? "This operation was aborted" : "Request rejected"),
 	});
 	message.diagnostics = [
 		{
@@ -373,6 +373,58 @@ describe("AgentSession retry", () => {
 		expect(created.getCallCount()).toBe(1);
 	});
 
+	it("does not compact or retry an unrelated 400", async () => {
+		// A 400 is not a size rejection by itself: invalid tool schemas, bad image
+		// payloads and content-policy refusals all arrive as 400. Compacting on one
+		// rewrites the conversation for no reason and re-sends a request that cannot
+		// succeed, and it spends the single overflow-recovery budget doing it. The
+		// prompt is deliberately over the borderline so this test fails if 400 alone
+		// is enough to trigger the compact-first path.
+		const created = await createSession({
+			maxContextTokens: 6_000,
+			streamFn: () => streamFailure(createFailureMessage("size", 400, "Invalid tool schema for tool 'jobs'")),
+		});
+		const compact = vi.spyOn(created.session, "compactBeforeSubmit");
+
+		await created.session.prompt("token ".repeat(5_700));
+
+		expect(compact).not.toHaveBeenCalled();
+		expect(created.getCallCount()).toBe(1);
+	});
+
+	it("compacts a 400 whose body names a size limit before its single retry", async () => {
+		let calls = 0;
+		const created = await createSession({
+			maxContextTokens: 6_000,
+			streamFn: () => {
+				calls++;
+				if (calls === 1) return streamFailure(createFailureMessage("size", 400, "maximum context length exceeded"));
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message = createAssistantMessage("Recovered");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		let compactionCalls = 0;
+		created.agent.state.messages = [];
+		vi.spyOn(created.session, "compactBeforeSubmit").mockImplementation(async () => {
+			compactionCalls++;
+			const reduced = created.agent.state.messages.map((message) =>
+				message.role === "user" ? { ...message, content: [{ type: "text" as const, text: "summary" }] } : message,
+			);
+			created.agent.state.messages = reduced;
+			return reduced;
+		});
+
+		await created.session.prompt("token ".repeat(5_700));
+
+		expect(compactionCalls).toBe(1);
+		expect(created.getCallCount()).toBe(2);
+	});
+
 	it("does not retry a structured transport drop when compaction is disabled", async () => {
 		const created = await createSession({
 			compactionEnabled: false,
@@ -666,11 +718,13 @@ describe("AgentSession retry", () => {
 
 	/** Diagnostic kinds persisted for the session, in order. */
 	function diagnosticKinds(target: AgentSession): string[] {
-		return target.sessionManager.getEntries().flatMap((entry) =>
-			entry.type === "custom" && entry.customType === "pi.session_diagnostic"
-				? [(entry.data as { kind?: string }).kind ?? ""]
-				: [],
-		);
+		return target.sessionManager
+			.getEntries()
+			.flatMap((entry) =>
+				entry.type === "custom" && entry.customType === "pi.session_diagnostic"
+					? [(entry.data as { kind?: string }).kind ?? ""]
+					: [],
+			);
 	}
 
 	it("does not retry a setup-phase abort and does not count it as unattributable", async () => {
@@ -724,13 +778,15 @@ describe("AgentSession retry", () => {
 		await created.session.prompt("private prompt text");
 
 		expect(created.getCallCount()).toBe(1);
-		const counted = created.session.sessionManager.getEntries().flatMap((entry) =>
-			entry.type === "custom" &&
-			entry.customType === "pi.session_diagnostic" &&
-			(entry.data as { kind?: string }).kind === "unrecorded_abort_failure"
-				? [entry.data as { kind: string; provider?: string; errorMessage?: string }]
-				: [],
-		);
+		const counted = created.session.sessionManager
+			.getEntries()
+			.flatMap((entry) =>
+				entry.type === "custom" &&
+				entry.customType === "pi.session_diagnostic" &&
+				(entry.data as { kind?: string }).kind === "unrecorded_abort_failure"
+					? [entry.data as { kind: string; provider?: string; errorMessage?: string }]
+					: [],
+			);
 		// Counted once: the message reaches the retry decision from both
 		// `agent_end` and the post-run handler.
 		expect(counted).toHaveLength(1);

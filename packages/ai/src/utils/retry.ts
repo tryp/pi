@@ -272,8 +272,12 @@ export interface RetryClassificationOptions {
 export function isRequestSizeFailure(message: AssistantMessage): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
 	const origin = readRequestFailureOrigin(message);
+	// 413 and 431 are unambiguous by definition (payload too large / header fields too
+	// large). A 400 is not: invalid tool schemas, bad image payloads, malformed
+	// parameters and content-policy refusals all arrive as 400, and treating every one
+	// of them as a size rejection makes the caller compact a conversation that has no
+	// size problem and then re-send a request that will fail again.
 	if (origin?.httpStatus === 413 || origin?.httpStatus === 431) return true;
-	if (origin?.httpStatus === 400) return true;
 	const providerMessage = readRequestFailureBaseMessage(message) ?? message.errorMessage;
 	return EXPLICIT_REQUEST_SIZE_LIMIT_PATTERN.test(providerMessage);
 }
