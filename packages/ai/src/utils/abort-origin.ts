@@ -45,8 +45,17 @@ export type RequestFailureCode =
 	| "request_construction"
 	| "unknown";
 
-/** How far the request got before it failed. */
-export type RequestFailurePhase = "before_headers" | "streaming";
+/**
+ * How far the request got before it failed.
+ *
+ * `setup` is failure before any transport existed: lazy module loading,
+ * credential/auth resolution, and request construction all run inside the
+ * stream's setup promise (`api/lazy.ts`). Those failures used to produce an
+ * unrecorded assistant message, so a run aborted during auth resolution was
+ * indistinguishable from a provider error and fell through to the message
+ * classifier as the bare string `This operation was aborted`.
+ */
+export type RequestFailurePhase = "setup" | "before_headers" | "streaming";
 
 /**
  * Structured retry verdict. Deliberately tri-state: `indeterminate` means the
