@@ -66,6 +66,7 @@ type SessionInternals = {
 	_runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean>;
 	_isRetryableError(message: AssistantMessage): boolean;
 	_transportAbortRetryAllowed(): boolean;
+	_transportAbortRetryHasCompactionBudget(): boolean;
 	compactBeforeSubmit(): Promise<AgentMessage[] | undefined>;
 	_resolveCompactionTrigger(settings: ReturnType<SettingsManager["getCompactionSettings"]>): ReturnType<typeof resolveCompactionTrigger>;
 	_compactionEventLimits(settings: ReturnType<SettingsManager["getCompactionSettings"]>, resolution: ReturnType<typeof resolveCompactionTrigger>): Record<string, unknown>;
@@ -193,7 +194,14 @@ describe("transport abort retry gate", () => {
 	function gateAt(maxContextTokens: number | undefined, enabled = true) {
 		const messages = [userMessage("m".repeat(400))];
 		const { session } = fakeSession({ messages, maxContextTokens, enabled });
-		return internals._transportAbortRetryAllowed.call(session as unknown as SessionInternals);
+		const target = session as unknown as SessionInternals;
+		// The gate delegates its budget question to a second private method, and a
+		// plain-object fake does not inherit it from the prototype. Bind the real one
+		// so this test still exercises production code rather than restating it.
+		Object.assign(target, {
+			_transportAbortRetryHasCompactionBudget: internals._transportAbortRetryHasCompactionBudget.bind(target),
+		});
+		return internals._transportAbortRetryAllowed.call(target);
 	}
 
 	it("allows a retry only when the failed request was comfortably under the limit", () => {
