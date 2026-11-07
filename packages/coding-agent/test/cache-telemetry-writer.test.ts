@@ -981,7 +981,10 @@ describe("cache miss attribution", () => {
 		);
 		tracker.complete(requestId, 1_000);
 
-		expect(tracker.getLatest(1_000)).toEqual({ kind: "prefix_identical_provider_side" });
+		expect(tracker.getLatest(1_000)).toEqual({
+			kind: "prefix_unchanged_client_side",
+			evidence: "operations",
+		});
 	});
 
 	it("keeps operation-only history rewrites attributed as rewrites", () => {

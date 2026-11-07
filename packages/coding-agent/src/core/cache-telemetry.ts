@@ -10,6 +10,7 @@ export type CacheMissAttribution =
 	| { kind: "tools_changed"; changedTools: number }
 	| { kind: "messages_rewritten"; reasons: readonly string[] }
 	| { kind: "prefix_identical_provider_side" }
+	| { kind: "prefix_unchanged_client_side"; evidence: "operations" }
 	| { kind: "comparison_truncated" }
 	| {
 			kind: "telemetry_unavailable";
@@ -88,13 +89,13 @@ export class CacheMissAttributionTracker {
 	recordOperations(
 		requestId: string,
 		observations: readonly CacheOperationObservation[],
-		model?: { provider: string; model: string },
+		identity?: { provider: string; model: string },
 	): void {
 		const comparison = this.ensure(requestId);
 		comparison.operations.push(...observations);
-		if (model) {
-			comparison.provider = model.provider.slice(0, 100);
-			comparison.model = model.model.slice(0, 100);
+		if (identity) {
+			comparison.provider = identity.provider.slice(0, 100);
+			comparison.model = identity.model.slice(0, 100);
 		}
 	}
 
@@ -204,7 +205,7 @@ function classifyOperationOnlyComparison(
 		!tools.every((operation) => operation.reason === "unchanged")
 	)
 		return undefined;
-	return { kind: "prefix_identical_provider_side" };
+	return { kind: "prefix_unchanged_client_side", evidence: "operations" };
 }
 
 export function classifyCacheMissComparison(

@@ -58,6 +58,8 @@ export function getCacheMissLabel(miss: CacheMiss): string {
 						: "Cache miss (history rewritten)";
 				case "prefix_identical_provider_side":
 					return "Cache miss (prefix identical: provider eviction or routing)";
+				case "prefix_unchanged_client_side":
+					return "Cache miss (system prompt/tools unchanged; messages appended; wire comparison unavailable)";
 				case "comparison_truncated":
 					return "Cache miss (prefix identical in the compared window; remainder truncated)";
 				case "telemetry_unavailable":

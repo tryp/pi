@@ -333,6 +333,10 @@ describe("detectCacheMiss", () => {
 				"Cache miss (prefix identical: provider eviction or routing)",
 			],
 			[
+				{ kind: "prefix_unchanged_client_side" as const, evidence: "operations" as const },
+				"Cache miss (system prompt/tools unchanged; messages appended; wire comparison unavailable)",
+			],
+			[
 				{ kind: "comparison_truncated" as const },
 				"Cache miss (prefix identical in the compared window; remainder truncated)",
 			],
