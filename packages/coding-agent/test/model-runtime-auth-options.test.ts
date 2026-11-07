@@ -328,9 +328,7 @@ describe("ModelRuntime auth options", () => {
 		const model = runtime.getModel("abort-oauth", "abort-model");
 		expect(model).toBeDefined();
 
-		const message = await runtime
-			.streamSimple(model!, { messages: [] }, { signal: controller.signal })
-			.result();
+		const message = await runtime.streamSimple(model!, { messages: [] }, { signal: controller.signal }).result();
 
 		// Same shape the run ended with in the field: no content, zero usage, the raw
 		// transport wording. The point of the change is the diagnostic beside it.

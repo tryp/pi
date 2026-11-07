@@ -16,11 +16,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
  * The display string is left byte-identical to the pre-existing behaviour; only
  * the structured diagnostic is new.
  */
-function createSetupErrorMessage(
-	model: Model<Api>,
-	error: unknown,
-	signal: AbortSignal | undefined,
-): AssistantMessage {
+function createSetupErrorMessage(model: Model<Api>, error: unknown, signal: AbortSignal | undefined): AssistantMessage {
 	const normalized = normalizeProviderError(error);
 	const origin = classifyRequestFailure({
 		error,
@@ -114,17 +110,9 @@ export interface LazyApiCapabilities {
 export function lazyApi(load: () => Promise<ProviderStreams>, capabilities?: LazyApiCapabilities): ProviderStreams {
 	const api: ProviderStreams = {
 		stream: (model, context, options) =>
-			lazyStream(
-				model,
-				async () => (await load()).stream(model, context, options),
-				options?.signal,
-			),
+			lazyStream(model, async () => (await load()).stream(model, context, options), options?.signal),
 		streamSimple: (model, context, options) =>
-			lazyStream(
-				model,
-				async () => (await load()).streamSimple(model, context, options),
-				options?.signal,
-			),
+			lazyStream(model, async () => (await load()).streamSimple(model, context, options), options?.signal),
 	};
 
 	if (capabilities?.fetchDeferred) {
