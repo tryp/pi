@@ -61,4 +61,26 @@ describe("models.dev cost mapping", () => {
 			},
 		]);
 	});
+
+	it("includes Codex GPT-6 Luna with its short-context price and long-context tier", () => {
+		const luna = MODELS["openai-codex"]["gpt-6-luna"];
+		expect(luna).toMatchObject({
+			contextWindow: 272_000,
+			cost: {
+				input: 0.1,
+				output: 0.5,
+				cacheRead: 0.01,
+				cacheWrite: 0.125,
+				tiers: [
+					{
+						inputTokensAbove: 272_000,
+						input: 0.2,
+						output: 0.75,
+						cacheRead: 0.02,
+						cacheWrite: 0.25,
+					},
+				],
+			},
+		});
+	});
 });
