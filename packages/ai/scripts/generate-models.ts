@@ -2641,6 +2641,14 @@ async function generateModels() {
 			maxTokens: CODEX_MAX_TOKENS,
 		},
 		{
+			// Offline/static baseline only: discovery already publishes gpt-6-luna
+			// with the backend's own 272,000 window, and a backend window always
+			// wins over this row. The price is luna-6's own, half of gpt-5.6-luna
+			// (0.1/0.5 vs 0.2/1.2), so this is not a rename of the 5.6 row.
+			// No tool-search metadata is claimed here on purpose: gpt-6-luna is in
+			// neither OPENAI_TOOL_SEARCH_MODEL_IDS nor
+			// OPENAI_CODEX_ADDITIONAL_TOOLS_MODEL_IDS, and no source yet says it
+			// supports additional_tools. Add it there only with evidence.
 			id: "gpt-6-luna",
 			name: "GPT-6 Luna",
 			api: "openai-codex-responses",
