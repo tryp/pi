@@ -159,7 +159,7 @@ describe("InteractiveMode compaction events", () => {
 			this: typeof fakeThis,
 			event: {
 				type: "compaction_end";
-				reason: "manual" | "threshold" | "overflow";
+				reason: "manual" | "threshold" | "overflow" | "extension";
 				result: { tokensBefore: number; summary: string; usage?: Usage } | undefined;
 				aborted: boolean;
 				willRetry: boolean;
@@ -195,6 +195,34 @@ describe("InteractiveMode compaction events", () => {
 			usage,
 		});
 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason: "extension",
+			result: undefined,
+			aborted: true,
+			willRetry: false,
+		});
+		expect(fakeThis.showError).toHaveBeenCalledWith("Extension-requested compaction cancelled");
+
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason: "extension",
+			result: undefined,
+			aborted: false,
+			willRetry: false,
+			errorMessage: "extension compaction failed",
+		});
+		expect(fakeThis.showError).toHaveBeenCalledWith("extension compaction failed");
+
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason: "threshold",
+			result: undefined,
+			aborted: true,
+			willRetry: false,
+		});
+		expect(fakeThis.showStatus).toHaveBeenCalledWith("Auto-compaction cancelled");
 	});
 
 	test("preserves steering behavior when flushing into an active agent run", async () => {

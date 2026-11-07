@@ -3462,6 +3462,8 @@ export class InteractiveMode {
 				if (event.aborted) {
 					if (event.reason === "manual") {
 						this.showError("Compaction cancelled");
+					} else if (event.reason === "extension") {
+						this.showError("Extension-requested compaction cancelled");
 					} else {
 						this.showStatus("Auto-compaction cancelled");
 					}
@@ -3490,7 +3492,7 @@ export class InteractiveMode {
 					}
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
-					if (event.reason === "manual") {
+					if (event.reason === "manual" || event.reason === "extension") {
 						this.showError(event.errorMessage);
 					} else {
 						this.chatContainer.addChild(new Spacer(1));
