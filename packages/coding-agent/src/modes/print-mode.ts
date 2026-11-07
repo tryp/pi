@@ -140,7 +140,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		// request can still be running (or waiting for idle) after the last
 		// `prompt()` returns. Exiting now would drop the summary and leave the
 		// transcript uncompacted.
-		await session.waitForPendingCompaction();
+		await session.waitForPendingCompactionBeforeExit();
 
 		if (mode === "text") {
 			const state = session.state;

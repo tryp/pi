@@ -27,22 +27,104 @@ describe("extension-requested compaction during a turn", () => {
 		});
 	};
 
-	it("does not reject the prompt when turn_end requests a compaction", async () => {
+	it("does not abort the run when turn_end requests a compaction mid-run", async () => {
+		const echoTool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text back",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async (_toolCallId, params) => ({
+				content: [
+					{
+						type: "text",
+						text: `echo:${typeof params === "object" && params !== null && "text" in params ? String(params.text) : ""}`,
+					},
+				],
+				details: {},
+			}),
+		};
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },
+			tools: [echoTool],
 			extensionFactories: [{ name: "turn-end-compaction", factory: registerTurnEndCompaction }],
 		});
 		harnesses.push(harness);
 
-		harness.setResponses([fauxAssistantMessage("done"), fauxAssistantMessage("summary of the conversation")]);
+		// Turn 1 ends inside the run (a tool call keeps it going), so the request
+		// lands while the agent that fired `turn_end` is still working. Compacting
+		// straight away aborts that run and turn 2 never completes.
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("echo", { text: "hi" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+			fauxAssistantMessage("summary of the conversation"),
+		]);
 
-		await expect(harness.session.prompt("hi")).resolves.toBeUndefined();
-
+		await expect(harness.session.prompt("run the tool")).resolves.toBeUndefined();
 		await harness.session.waitForPendingCompaction();
 
-		const compactions = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
-		expect(compactions).toHaveLength(1);
-		expect(harness.eventsOfType("compaction_end")[0]?.aborted).toBe(false);
+		const lastAssistant = harness.session.messages.filter((message) => message.role === "assistant").at(-1);
+		expect(lastAssistant?.stopReason).toBe("stop");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		expect(harness.eventsOfType("compaction_start")[0]?.reason).toBe("extension");
+	});
+
+	it("waits for every request when a hook asks twice", async () => {
+		let releaseCompaction: (() => void) | undefined;
+		const compactionBlocked = new Promise<void>((resolve) => {
+			releaseCompaction = resolve;
+		});
+		let blockedOnce = false;
+		const errors: string[] = [];
+
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				{
+					name: "double-compaction-request",
+					factory: (pi: ExtensionAPI) => {
+						pi.on("turn_end", (_event, ctx) => {
+							ctx.compact({
+								onError: (error) => errors.push(error.message),
+							});
+							ctx.compact({
+								onError: (error) => errors.push(error.message),
+							});
+						});
+						pi.on("session_before_compact", async () => {
+							if (blockedOnce) return undefined;
+							blockedOnce = true;
+							await compactionBlocked;
+							return undefined;
+						});
+					},
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage("done"),
+			fauxAssistantMessage("summary of the conversation"),
+			fauxAssistantMessage("second summary"),
+		]);
+
+		await harness.session.prompt("hi");
+
+		const waited = harness.session.waitForPendingCompaction();
+		let waitSettled = false;
+		void waited.then(() => {
+			waitSettled = true;
+		});
+		// Give microtasks and one macrotask a chance to run; the first compaction is
+		// still blocked on the hook, so a waiter that returns now returned early.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(waitSettled).toBe(false);
+
+		releaseCompaction?.();
+		await waited;
+
+		expect(errors.filter((message) => /already in progress/i.test(message))).toEqual([]);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
 	});
 
 	it("does not abort a turn when a mid-run hook requests a compaction", async () => {

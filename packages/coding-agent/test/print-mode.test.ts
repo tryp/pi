@@ -1,7 +1,10 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionAPI } from "../src/core/extensions/index.ts";
 import type { SessionShutdownEvent } from "../src/index.ts";
 import { runPrintMode } from "../src/modes/print-mode.ts";
+import { createHarness } from "./suite/harness.ts";
 
 type EmitEvent = SessionShutdownEvent;
 
@@ -19,7 +22,7 @@ type FakeSession = {
 	subscribe: ReturnType<typeof vi.fn>;
 	prompt: ReturnType<typeof vi.fn>;
 	reload: ReturnType<typeof vi.fn>;
-	waitForPendingCompaction: ReturnType<typeof vi.fn>;
+	waitForPendingCompactionBeforeExit: ReturnType<typeof vi.fn>;
 };
 
 type FakeRuntimeHost = {
@@ -73,7 +76,7 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 		subscribe: vi.fn(() => () => {}),
 		prompt: vi.fn(async () => {}),
 		reload: vi.fn(async () => {}),
-		waitForPendingCompaction: vi.fn(async () => {}),
+		waitForPendingCompactionBeforeExit: vi.fn(async () => {}),
 	};
 
 	return {
@@ -125,15 +128,20 @@ describe("runPrintMode", () => {
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
 
-	it("waits for a pending extension compaction before returning", async () => {
+	it("waits for a pending extension compaction before disposing", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
 		const { session } = runtimeHost;
-		let compactionSettled = false;
+		const order: string[] = [];
 		// A turn-scoped extension hook can request a compaction after the last
-		// prompt resolves; the process must not exit with that summary half written.
-		session.waitForPendingCompaction = vi.fn(async () => {
+		// prompt resolves; the process must not dispose with that summary half
+		// written, so the wait has to happen before dispose, not after it.
+		session.waitForPendingCompactionBeforeExit = vi.fn(async () => {
 			await Promise.resolve();
-			compactionSettled = true;
+			order.push("wait");
+		});
+		runtimeHost.dispose = vi.fn(async () => {
+			order.push("dispose");
+			await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		});
 
 		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
@@ -142,8 +150,59 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(session.waitForPendingCompaction).toHaveBeenCalledTimes(1);
-		expect(compactionSettled).toBe(true);
+		expect(session.waitForPendingCompactionBeforeExit).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["wait", "dispose"]);
+	});
+
+	it("compacts at turn_end without truncating the next message", async () => {
+		// Real session, real print mode: a turn-scoped hook compacts after the first
+		// message, and the second message must still run to completion instead of
+		// being aborted by that compaction (or refused while it is in progress).
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				{
+					name: "turn-end-compaction",
+					factory: (pi: ExtensionAPI) => {
+						pi.on("turn_end", (_event, ctx) => {
+							ctx.compact({});
+						});
+					},
+				},
+			],
+		});
+		const dispose = vi.fn(async () => {});
+		const runtimeHost = {
+			get session() {
+				return harness.session;
+			},
+			setRebindSession: () => {},
+			newSession: async () => ({}),
+			fork: async () => ({ cancelled: false }),
+			switchSession: async () => ({}),
+			dispose,
+		} as unknown as Parameters<typeof runPrintMode>[0];
+
+		try {
+			harness.setResponses([
+				fauxAssistantMessage("first answer"),
+				fauxAssistantMessage("summary of the conversation"),
+				fauxAssistantMessage("second answer"),
+			]);
+
+			const exitCode = await runPrintMode(runtimeHost, { mode: "text", messages: ["first", "second"] });
+
+			expect(exitCode).toBe(0);
+			const assistantMessages = harness.session.messages.filter((message) => message.role === "assistant");
+			expect(assistantMessages.map((message) => (message.role === "assistant" ? message.stopReason : ""))).toEqual([
+				"stop",
+				"stop",
+			]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+			expect(dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			harness.cleanup();
+		}
 	});
 
 	it("emits session_shutdown and returns non-zero on assistant error", async () => {

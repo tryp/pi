@@ -417,11 +417,20 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _manualCompactionPending = false;
 	/**
-	 * An extension-requested compaction that has been scheduled but may not have
-	 * started yet. Headless modes await it before exiting so a summary the run
-	 * asked for is never cut off mid-write.
+	 * Extension-requested compactions that have been scheduled and have not
+	 * finished yet, whether or not they have started. A single slot is not enough:
+	 * a second `ctx.compact()` would overwrite the first, and a waiter would then
+	 * return while the first request was still writing its summary.
 	 */
-	private _extensionCompaction: Promise<CompactionResult> | undefined = undefined;
+	private readonly _extensionCompactions = new Set<Promise<CompactionResult>>();
+	/** Tail of the extension-compaction chain, so two hooks cannot race into `compact()`. */
+	private _extensionCompactionTail: Promise<void> = Promise.resolve();
+	/**
+	 * Extension compactions reserved but not finished. Incremented synchronously so
+	 * a prompt submitted in the gap between the idle wait and `compact()` cannot be
+	 * truncated by the abort `compact()` starts with.
+	 */
+	private _extensionCompactionReservations = 0;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	private _overflowRecoveryOutcome: "none" | "attempting" | "compacted" | "no-op" | "cancelled" | "failed" = "none";
@@ -1820,6 +1829,14 @@ export class AgentSession {
 				}
 			}
 
+			// An extension-requested compaction is reserved but may still be waiting for
+			// the session to settle. `compact()` aborts whatever operation is current,
+			// so submitting now would truncate this prompt; wait for the request
+			// instead of racing it.
+			if (!this.isStreaming && !this._isAgentSettling) {
+				await this._awaitReservedExtensionCompaction();
+			}
+
 			if (this._compactionAbortController !== undefined) {
 				throw new Error(
 					"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
@@ -2883,14 +2900,80 @@ export class AgentSession {
 	 * run asked for and leaves the transcript uncompacted.
 	 */
 	async waitForPendingCompaction(): Promise<void> {
-		while (true) {
-			const pending = this._extensionCompaction;
-			if (!pending) return;
-			await pending.catch(() => undefined);
-			if (this._extensionCompaction === pending) {
-				this._extensionCompaction = undefined;
+		while (this._extensionCompactions.size > 0) {
+			const pending = [...this._extensionCompactions];
+			await Promise.all(pending.map((promise) => promise.catch(() => undefined)));
+			for (const promise of pending) {
+				this._extensionCompactions.delete(promise);
 			}
 		}
+	}
+
+	/**
+	 * Resolve once no extension-requested compaction is pending, unless a run is
+	 * still in flight.
+	 *
+	 * Headless modes call this before disposing. A live run is cancelled by
+	 * disposal anyway, and waiting for it to become idle first would block shutdown
+	 * on the run; a compaction requested by the turn that just ended is the case
+	 * this exists for.
+	 */
+	async waitForPendingCompactionBeforeExit(): Promise<void> {
+		if (!this.isIdle) return;
+		await this.waitForPendingCompaction();
+	}
+
+	/**
+	 * Schedule an extension-requested compaction.
+	 *
+	 * Reserved synchronously, then run once the session is idle and every earlier
+	 * extension request has finished. `compact()` starts by aborting the current
+	 * operation, and an extension asks for a compaction from a turn-scoped hook
+	 * while the turn that fired the hook is still in flight; the abort is what
+	 * killed the calling run. Requests are serialized because `compact()` refuses to
+	 * run concurrently with itself.
+	 */
+	private _requestExtensionCompaction(customInstructions?: string): Promise<CompactionResult> {
+		this._extensionCompactionReservations += 1;
+		const previous = this._extensionCompactionTail;
+		const scheduled = (async () => {
+			try {
+				await previous.catch(() => undefined);
+				while (
+					!this.isIdle ||
+					this._isAgentSettling ||
+					this._queuedMessageWakePending ||
+					this.agent.hasQueuedMessages()
+				) {
+					await this.waitForIdle();
+				}
+				return await this.compact(customInstructions, { reason: "extension" });
+			} finally {
+				this._extensionCompactionReservations -= 1;
+			}
+		})();
+		this._extensionCompactionTail = scheduled.then(
+			() => undefined,
+			() => undefined,
+		);
+		this._extensionCompactions.add(scheduled);
+		void scheduled.then(
+			() => this._extensionCompactions.delete(scheduled),
+			() => this._extensionCompactions.delete(scheduled),
+		);
+		return scheduled;
+	}
+
+	/**
+	 * Wait for a reserved extension compaction before letting a prompt start a run.
+	 *
+	 * Skipped while a run or its settlement is in flight: there the reservation's
+	 * own idle wait already accounts for queued input, and awaiting would deadlock a
+	 * hook that delivers a message from inside the run it belongs to.
+	 */
+	private async _awaitReservedExtensionCompaction(): Promise<void> {
+		if (this._extensionCompactionReservations === 0) return;
+		await this.waitForPendingCompaction();
 	}
 
 	/**
@@ -3584,21 +3667,11 @@ export class AgentSession {
 					// with "This operation was aborted" and the caller reports a
 					// failed step although every turn completed. Let the run settle
 					// and compact against a quiet session instead.
-					const pending = (async () => {
-						await this.waitForIdle();
-						return this.compact(options?.customInstructions, { reason: "extension" });
-					})();
-					this._extensionCompaction = pending;
-					void pending
-						.then(
-							(result) => options?.onComplete?.(result),
-							(error: unknown) => options?.onError?.(error instanceof Error ? error : new Error(String(error))),
-						)
-						.finally(() => {
-							if (this._extensionCompaction === pending) {
-								this._extensionCompaction = undefined;
-							}
-						});
+					const scheduled = this._requestExtensionCompaction(options?.customInstructions);
+					void scheduled.then(
+						(result) => options?.onComplete?.(result),
+						(error: unknown) => options?.onError?.(error instanceof Error ? error : new Error(String(error))),
+					);
 				},
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
