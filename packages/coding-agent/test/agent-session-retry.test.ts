@@ -2,9 +2,15 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentEvent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel, lazyStream } from "@earendil-works/pi-ai/compat";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	EventStream,
+	getModel,
+	lazyStream,
+} from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession, ContextGuardError } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -44,6 +50,41 @@ function createAssistantMessage(text: string, overrides?: Partial<AssistantMessa
 		timestamp: Date.now(),
 		...overrides,
 	};
+}
+
+function createFailureMessage(kind: "transport" | "size", status?: number): AssistantMessage {
+	const message = createAssistantMessage("", {
+		stopReason: "error",
+		errorMessage: kind === "transport" ? "This operation was aborted" : "Request rejected",
+	});
+	message.diagnostics = [
+		{
+			type: "provider_request_failure",
+			timestamp: Date.now(),
+			details: {
+				failureCode: kind === "transport" ? "abort_transport" : "http_status",
+				phase: "streaming",
+				transport: "sse",
+				signalAborted: false,
+				signalTimedOut: false,
+				httpStatus: status,
+				usageTokens: 0,
+				abortShaped: kind === "transport",
+				retryVerdict: kind === "transport" ? "retry" : "indeterminate",
+				formattedError: message.errorMessage,
+			},
+		},
+	];
+	return message;
+}
+
+function streamFailure(message: AssistantMessage): MockAssistantStream {
+	const stream = new MockAssistantStream();
+	queueMicrotask(() => {
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
 }
 
 type SessionWithExtensionEmitHook = {
@@ -176,7 +217,7 @@ describe("AgentSession retry", () => {
 			};
 		}
 
-		return { session, getCallCount: () => callCount };
+		return { session, agent, getCallCount: () => callCount };
 	}
 
 	it("persists retry lifecycle diagnostics without prompt text", async () => {
@@ -241,6 +282,128 @@ describe("AgentSession retry", () => {
 			});
 		}
 		expect(JSON.stringify(diagnostics)).not.toContain("private prompt text");
+	});
+
+	it("retries a structured transport drop once even above the context borderline", async () => {
+		let calls = 0;
+		const created = await createSession({
+			maxContextTokens: 6_000,
+			streamFn: () => {
+				calls++;
+				if (calls === 1) return streamFailure(createFailureMessage("transport"));
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message = createAssistantMessage("Recovered");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+
+		await created.session.prompt("token ".repeat(5_700));
+
+		const gate = (
+			created.session as unknown as { _transportAbortRetryAllowed: () => boolean }
+		)._transportAbortRetryAllowed();
+		expect(gate).toBe(false);
+		expect(created.getCallCount()).toBe(2);
+	});
+
+	it("compacts a size rejection above the borderline before its single retry", async () => {
+		let calls = 0;
+		const created = await createSession({
+			maxContextTokens: 6_000,
+			streamFn: () => {
+				calls++;
+				if (calls === 1) return streamFailure(createFailureMessage("size", 413));
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message = createAssistantMessage("Recovered");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const gate = vi.spyOn(
+			created.session as unknown as { _transportAbortRetryAllowed: () => boolean },
+			"_transportAbortRetryAllowed",
+		);
+		let compactionCalls = 0;
+		vi.spyOn(created.session, "compactBeforeSubmit").mockImplementation(async () => {
+			compactionCalls++;
+			const reduced = created.agent.state.messages.map((message) =>
+				message.role === "user" ? { ...message, content: [{ type: "text" as const, text: "summary" }] } : message,
+			);
+			created.agent.state.messages = reduced;
+			return reduced;
+		});
+
+		await created.session.prompt("token ".repeat(5_700));
+
+		expect(gate).toHaveReturnedWith(false);
+		expect(compactionCalls).toBe(1);
+		expect(created.getCallCount()).toBe(2);
+	});
+
+	it("does not retry a size rejection when compaction changes no messages", async () => {
+		const created = await createSession({
+			maxContextTokens: 6_000,
+			streamFn: () => streamFailure(createFailureMessage("size", 413)),
+		});
+		const compact = vi.spyOn(created.session, "compactBeforeSubmit").mockResolvedValue(undefined);
+
+		await created.session.prompt("token ".repeat(5_700));
+
+		expect(compact).toHaveBeenCalledTimes(1);
+		expect(created.getCallCount()).toBe(1);
+	});
+
+	it("does not compact or retry a size rejection when compaction is disabled", async () => {
+		const created = await createSession({
+			compactionEnabled: false,
+			streamFn: () => streamFailure(createFailureMessage("size", 413)),
+		});
+		const compact = vi.spyOn(created.session, "compactBeforeSubmit");
+
+		await created.session.prompt("Test");
+
+		expect(compact).not.toHaveBeenCalled();
+		expect(created.getCallCount()).toBe(1);
+	});
+
+	it("does not retry a structured transport drop when compaction is disabled", async () => {
+		const created = await createSession({
+			compactionEnabled: false,
+			streamFn: () => streamFailure(createFailureMessage("transport")),
+		});
+
+		await created.session.prompt("Test");
+
+		expect(created.getCallCount()).toBe(1);
+	});
+
+	it("does not retry a structured transport drop when compaction has no threshold", async () => {
+		const created = await createSession({ streamFn: () => streamFailure(createFailureMessage("transport")) });
+		const model = created.agent.state.model;
+		if (!model) throw new Error("test model missing");
+		created.agent.state.model = { ...model, contextWindow: 0 };
+
+		await created.session.prompt("Test");
+
+		expect(created.getCallCount()).toBe(1);
+	});
+
+	it("never retries two consecutive structured transport drops more than once", async () => {
+		const created = await createSession({
+			maxRetries: 3,
+			streamFn: () => streamFailure(createFailureMessage("transport")),
+		});
+
+		await created.session.prompt("Test");
+
+		expect(created.getCallCount()).toBe(2);
 	});
 
 	it("retries after a transient error and succeeds", async () => {

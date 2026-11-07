@@ -1640,7 +1640,7 @@ export class AgentSession {
 	 */
 	private _transportAbortRetryAllowed(): boolean {
 		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled) return false;
+		if (!this._transportAbortRetryHasCompactionBudget()) return false;
 		const { trigger, borderlineFraction } = resolveCompactionTrigger(
 			this.model,
 			this.model?.contextWindow ?? 0,
@@ -1651,7 +1651,48 @@ export class AgentSession {
 			this.agent.state.systemPrompt,
 			this.agent.state.tools,
 		).tokens;
+		// This now answers only whether a size-class failure may be retried without
+		// compacting first. Structured transport drops are handled independently.
 		return estimatedTokens < borderlineFraction * trigger;
+	}
+
+	private _transportAbortRetryHasCompactionBudget(): boolean {
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled) return false;
+		const hasModelWindow = typeof this.model?.contextWindow === "number" && this.model.contextWindow > 0;
+		const hasExplicitLimit =
+			(typeof settings.maxContextTokens === "number" && settings.maxContextTokens > 0) ||
+			(typeof settings.maxContextFraction === "number" && settings.maxContextFraction > 0);
+		if (!hasModelWindow && !hasExplicitLimit) return false;
+		const { trigger } = resolveCompactionTrigger(this.model, this.model?.contextWindow ?? 0, settings);
+		return Number.isFinite(trigger) && trigger > 0;
+	}
+
+	private async _prepareSizeFailureRetry(message: AssistantMessage): Promise<boolean> {
+		if (this._retryAttempt > 0 || this._overflowRecoveryAttempted) return false;
+		const retrySettings = this.settingsManager.getRetrySettings();
+		if (!retrySettings.enabled || retrySettings.maxRetries < 1) return false;
+		if (this._transportAbortRetryAllowed()) return false;
+		if (!this._transportAbortRetryHasCompactionBudget()) return false;
+
+		const originalMessages = this.agent.state.messages;
+		const lastMessage = originalMessages[originalMessages.length - 1];
+		if (lastMessage?.role === "assistant") {
+			this.agent.state.messages = originalMessages.slice(0, -1);
+		}
+		let compacted: AgentMessage[] | undefined;
+		try {
+			compacted = await this.compactBeforeSubmit();
+		} catch (error) {
+			this.agent.state.messages = originalMessages;
+			throw error;
+		}
+		if (!compacted) {
+			this.agent.state.messages = originalMessages;
+			return false;
+		}
+		this._overflowRecoveryAttempted = true;
+		return this._prepareRetry(message);
 	}
 
 	/** All messages including custom types like BashExecutionMessage */
@@ -1783,6 +1824,15 @@ export class AgentSession {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
 		if (!msg) {
+			return this.agent.hasQueuedMessages();
+		}
+
+		// A size rejection must never be sent again unchanged. Near the threshold,
+		// compact first and continue only if the conversation actually changed.
+		// This is separate from transport retries: a dropped transport is safe to
+		// retry regardless of context size, while an explicit size rejection is not.
+		if (this._isRequestSizeFailure(msg)) {
+			if (await this._prepareSizeFailureRetry(msg)) return true;
 			return this.agent.hasQueuedMessages();
 		}
 
@@ -3901,6 +3951,29 @@ export class AgentSession {
 	 * Check if an error is retryable (overloaded, rate limit, server errors).
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
+	private _isRequestSizeFailure(message: AssistantMessage): boolean {
+		if (message.stopReason !== "error" || !message.errorMessage) return false;
+		const diagnostic = [...(message.diagnostics ?? [])]
+			.reverse()
+			.find((entry) => entry.type === "provider_request_failure");
+		const details = diagnostic?.details;
+		const status = details?.httpStatus;
+		if (status === 400 || status === 413 || status === 431) return true;
+		const providerMessage =
+			typeof details?.formattedError === "string" ? details.formattedError : message.errorMessage;
+		return /\b413\b|\b431\b|request (?:entity )?too large|payload too large|prompt (?:is )?too long|input (?:is )?too long|maximum context length|context length (?:is )?exceeded|maximum input tokens|token limit exceeded|context window.{0,24}(?:exceed|limit)/i.test(
+			providerMessage,
+		);
+	}
+
+	private _isTransportAbortFailure(message: AssistantMessage): boolean {
+		const diagnostic = [...(message.diagnostics ?? [])]
+			.reverse()
+			.find((entry) => entry.type === "provider_request_failure");
+		const details = diagnostic?.details;
+		return details?.failureCode === "abort_transport" && details?.retryVerdict === "retry";
+	}
+
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
@@ -3924,7 +3997,14 @@ export class AgentSession {
 				errorMessage: message.errorMessage.slice(0, 200),
 			});
 		}
-		return isRetryableAssistantError(message, { retryTransportAborts: this._transportAbortRetryAllowed() });
+		if (this._isTransportAbortFailure(message)) {
+			// A structured transport drop is retried at any context size, but only
+			// once and only when compaction has a usable trigger. This keeps the
+			// existing no-compaction/no-threshold safety gate intact.
+			if (this._retryAttempt > 0 || !this._transportAbortRetryHasCompactionBudget()) return false;
+			return isRetryableAssistantError(message, { retryTransportAborts: true });
+		}
+		return isRetryableAssistantError(message);
 	}
 
 	/**

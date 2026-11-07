@@ -1,14 +1,12 @@
 import type { AssistantMessage } from "../types.ts";
 import { isAbortWording, readRequestFailureBaseMessage, readRequestFailureOrigin } from "./abort-origin.ts";
 
-// Only veto a structured transport-abort retry when the provider-formatted
-// message explicitly identifies a request-size/context limit. There is no
-// reliable token-size measurement on an AssistantMessage (and guessing from the
-// prompt or the configured window can reject legitimate transport retries), so
-// opaque aborts stay retryable once transport-abort retries are enabled.
+// Provider wording that explicitly identifies a request-size/context limit.
+// Status codes are classified separately because the provider body may be empty.
 const EXPLICIT_REQUEST_SIZE_LIMIT_PATTERN = new RegExp(
 	[
 		"\\b413\\b",
+		"\\b431\\b",
 		"request (?:entity )?too large",
 		"payload too large",
 		"prompt (?:is )?too long",
@@ -250,12 +248,9 @@ export interface RetryClassificationOptions {
 	/**
 	 * Retry aborts positively classified as transport interruptions (an
 	 * `AbortError` from the transport while the local signal was untouched).
-	 *
-	 * Deliberately off. `issues/2026-10-07-provider-abort-origin/report.md` §6-7
-	 * orders the change as: record the origin first, then re-measure, and only
-	 * then decide whether a retry is safe. Until the origin data separates a
-	 * dropped transport from a request-size rejection, retrying can re-send the
-	 * exact size that just failed. Enabling this is the entire flip.
+	 * The caller must enforce a single retry and ensure compaction is available;
+	 * request-size failures are vetoed by `isRequestSizeFailure` and handled by
+	 * compacting before any retry.
 	 */
 	retryTransportAborts?: boolean;
 }
@@ -273,6 +268,16 @@ export interface RetryClassificationOptions {
  * Retry stays off for this class: the wording says an abort happened, not who
  * aborted it, and re-sending into a deliberate cancellation reproduces it.
  */
+/** True when a provider failure is explicitly classed as a request-size rejection. */
+export function isRequestSizeFailure(message: AssistantMessage): boolean {
+	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	const origin = readRequestFailureOrigin(message);
+	if (origin?.httpStatus === 413 || origin?.httpStatus === 431) return true;
+	if (origin?.httpStatus === 400) return true;
+	const providerMessage = readRequestFailureBaseMessage(message) ?? message.errorMessage;
+	return EXPLICIT_REQUEST_SIZE_LIMIT_PATTERN.test(providerMessage);
+}
+
 export function isUnrecordedAbortFailure(
 	message: AssistantMessage,
 ): message is AssistantMessage & { errorMessage: string } {
@@ -292,6 +297,7 @@ export function isRetryableAssistantError(message: AssistantMessage, options?: R
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
 	const errorMessage = message.errorMessage;
 	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
+	if (isRequestSizeFailure(message)) return false;
 
 	const origin = readRequestFailureOrigin(message);
 	if (origin !== undefined) {
@@ -302,8 +308,7 @@ export function isRetryableAssistantError(message: AssistantMessage, options?: R
 		if (origin.retryVerdict === "do_not_retry") return false;
 		if (origin.retryVerdict === "retry") {
 			if (origin.failureCode !== "abort_transport") return true;
-			if (options?.retryTransportAborts !== true) return false;
-			return !EXPLICIT_REQUEST_SIZE_LIMIT_PATTERN.test(providerMessage);
+			return options?.retryTransportAborts === true;
 		}
 		// An indeterminate origin means "not an abort and no HTTP status": the
 		// verdict has to come from the provider's own wording.

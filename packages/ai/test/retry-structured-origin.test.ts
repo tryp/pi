@@ -3,7 +3,7 @@ import { fauxAssistantMessage } from "../src/providers/faux.ts";
 import type { AssistantMessage } from "../src/types.ts";
 import { appendRequestFailureDiagnostic, classifyRequestFailure } from "../src/utils/abort-origin.ts";
 import { normalizeProviderError } from "../src/utils/error-body.ts";
-import { isRetryableAssistantError } from "../src/utils/retry.ts";
+import { isRequestSizeFailure, isRetryableAssistantError } from "../src/utils/retry.ts";
 
 function assistantError(errorMessage: string): AssistantMessage {
 	return fauxAssistantMessage("", { stopReason: "error", errorMessage });
@@ -99,12 +99,22 @@ describe("isRetryableAssistantError with structured request-failure origin", () 
 		expect(isRetryableAssistantError(ordinaryMessage)).toBe(false);
 	});
 
-	it("does not retry structured transport aborts with explicit request-size limit messages", () => {
-		for (const errorMessage of [
-			"This operation was aborted (413 payload too large)",
-			"This operation was aborted: maximum context length exceeded",
-		]) {
-			const message = recordRequestFailure(assistantError(errorMessage), transportAbort(errorMessage));
+	it("classifies request-size failures from status or provider wording and never retries them unchanged", () => {
+		const statusFailure = recordRequestFailure(
+			assistantError("Request rejected"),
+			Object.assign(new Error("Request rejected"), { status: 413 }),
+		);
+		const lengthFailure = recordRequestFailure(
+			assistantError("maximum context length exceeded"),
+			new Error("maximum context length exceeded"),
+		);
+		const transportAbortWithSizeText = recordRequestFailure(
+			assistantError("This operation was aborted: maximum context length exceeded"),
+			transportAbort("This operation was aborted: maximum context length exceeded"),
+		);
+
+		for (const message of [statusFailure, lengthFailure, transportAbortWithSizeText]) {
+			expect(isRequestSizeFailure(message)).toBe(true);
 			expect(isRetryableAssistantError(message, { retryTransportAborts: true })).toBe(false);
 		}
 	});
