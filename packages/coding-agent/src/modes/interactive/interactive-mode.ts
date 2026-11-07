@@ -3897,7 +3897,8 @@ export class InteractiveMode {
 	/**
 	 * Show a transcript notice when a completed assistant message paid for a
 	 * significant cache miss. The reason is classified as compaction, model
-	 * switch, idle expiry, or unexplained from the available session history.
+	 * switch, a first cached request after a cold start, idle expiry, or
+	 * unexplained from the available session history.
 	 */
 	private maybeShowCacheMissNotice(message: AssistantMessage): void {
 		if (!this.settingsManager.getShowCacheMissNotices()) return;

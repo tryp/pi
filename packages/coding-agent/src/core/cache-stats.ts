@@ -11,8 +11,12 @@ export const CACHE_TTL_MS = 5 * 60 * 1000;
 /** Per-turn misses at or below this are cache breakpoint granularity noise. */
 const NOISE_FLOOR_TOKENS = 1024;
 
-/** A counted cache miss on a single assistant message. */
-export type CacheMissReason = "compaction" | "model_switch" | "idle" | "unexplained";
+/**
+ * A counted cache miss on a single assistant message. `warming` records only
+ * the observable case where the previous request was this model key's first
+ * session request and reported no cache activity; its cause is unproven.
+ */
+export type CacheMissReason = "compaction" | "model_switch" | "warming" | "idle" | "unexplained";
 
 export interface CacheMiss {
 	/** Prompt tokens that were in the previous turn's prompt but not read from cache. */
@@ -44,6 +48,8 @@ export function getCacheMissLabel(miss: CacheMiss): string {
 			return "Cache miss after compaction";
 		case "model_switch":
 			return "Cache miss after model switch";
+		case "warming":
+			return "Cache miss on first cached request after a cold start (no cache reported by provider yet)";
 		case "idle":
 			return `Cache miss after ${Math.round(miss.idleMs / 60_000)}m idle`;
 		case "unexplained":
@@ -181,6 +187,10 @@ interface PreviousRequest {
 	 * writes unreported) from a provider that never reports caching at all.
 	 */
 	reportedCache: boolean;
+	/** Whether this request itself reported cache reads or writes. */
+	cacheActivity: boolean;
+	/** Whether this was the first request for this provider/model key in-session. */
+	firstOnModelKey: boolean;
 }
 
 /**
@@ -195,6 +205,7 @@ function detectMiss(
 	models: ModelPriceSource,
 	compactionBoundary?: { entryId: string; tokensBefore: number },
 	modelChangeEntryId?: string,
+	prevWasFirstOnModelKey = false,
 	attribution: CacheMissAttribution = { kind: "unknown" },
 ): CacheMiss | undefined {
 	const usage = message.usage;
@@ -222,13 +233,18 @@ function detectMiss(
 
 	const idleMs = Math.max(0, message.timestamp - prev.timestamp);
 	const modelChanged = `${message.provider}/${message.model}` !== prev.modelKey;
+	// `warming` records observable state only: the previous request was this
+	// model key's first in-session request and reported no cache activity. The
+	// cause is unproven; the TTL condition keeps idle attribution separate.
 	const reason = compactionBoundary
 		? "compaction"
 		: modelChanged
 			? "model_switch"
-			: idleMs >= CACHE_TTL_MS
-				? "idle"
-				: "unexplained";
+			: prevWasFirstOnModelKey && !prev.cacheActivity && idleMs < CACHE_TTL_MS
+				? "warming"
+				: idleMs >= CACHE_TTL_MS
+					? "idle"
+					: "unexplained";
 	return {
 		missedTokens,
 		missedCost: missedTokens * Math.max(0, paidPerToken - readPerToken),
@@ -243,7 +259,11 @@ function detectMiss(
 	};
 }
 
-function asPreviousRequest(message: AssistantMessage, reportedCache: boolean): PreviousRequest | undefined {
+function asPreviousRequest(
+	message: AssistantMessage,
+	reportedCache: boolean,
+	firstOnModelKey: boolean,
+): PreviousRequest | undefined {
 	const usage = message.usage;
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
 	if (promptTokens <= 0) return undefined;
@@ -252,6 +272,8 @@ function asPreviousRequest(message: AssistantMessage, reportedCache: boolean): P
 		modelKey: `${message.provider}/${message.model}`,
 		timestamp: message.timestamp,
 		reportedCache: reportedCache || usage.cacheRead + usage.cacheWrite > 0,
+		cacheActivity: usage.cacheRead + usage.cacheWrite > 0,
+		firstOnModelKey,
 	};
 }
 
@@ -270,6 +292,7 @@ function scan(
 	const misses = new Map<AssistantMessage, CacheMiss>();
 	let compactionBoundary: { entryId: string; tokensBefore: number } | undefined;
 	let modelChangeEntryId: string | undefined;
+	const seenModelKeys = new Set<string>();
 
 	for (const entry of entries) {
 		if (entry.type === "compaction") {
@@ -287,20 +310,27 @@ function scan(
 			modelChangeEntryId = undefined;
 			continue;
 		}
-		if (
-			entry.type === "message" &&
-			entry.message.role === "assistant" &&
-			entry.message.stopReason !== "error" &&
-			entry.message.stopReason !== "aborted"
-		) {
-			const miss = detectMiss(prev, entry.message, models, compactionBoundary, modelChangeEntryId);
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			const modelKey = `${entry.message.provider}/${entry.message.model}`;
+			const firstOnModelKey = !seenModelKeys.has(modelKey);
+			seenModelKeys.add(modelKey);
+			if (entry.message.stopReason === "error" || entry.message.stopReason === "aborted") continue;
+
+			const miss = detectMiss(
+				prev,
+				entry.message,
+				models,
+				compactionBoundary,
+				modelChangeEntryId,
+				prev?.firstOnModelKey ?? false,
+			);
 			if (miss) {
 				totals.missedTokens += miss.missedTokens;
 				totals.missedCost += miss.missedCost;
 				totals.missCount += 1;
 				misses.set(entry.message, miss);
 			}
-			prev = asPreviousRequest(entry.message, prev?.reportedCache ?? false) ?? prev;
+			prev = asPreviousRequest(entry.message, prev?.reportedCache ?? false, firstOnModelKey) ?? prev;
 			compactionBoundary = undefined;
 			modelChangeEntryId = undefined;
 		}
@@ -347,6 +377,7 @@ export function detectCacheMiss(
 		models,
 		previous.compactionBoundary,
 		previous.modelChangeEntryId,
+		previous.prev?.firstOnModelKey ?? false,
 		attribution,
 	);
 }

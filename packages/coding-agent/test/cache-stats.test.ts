@@ -221,6 +221,35 @@ describe("detectCacheMiss", () => {
 		expect(detectCacheMiss([entry(turn1), entry(turn2)], healthy, models)).toBeUndefined();
 	});
 
+	it("classifies the first cached request after a cold turn as provider warming", () => {
+		const coldTurn = assistant({ input: 30_770, timestamp: 0 });
+		const warmingTurn = assistant({ input: 32_450, cacheRead: 64, timestamp: 11_000 });
+		const miss = detectCacheMiss([entry(coldTurn)], warmingTurn, models);
+
+		expect(miss?.reason).toBe("warming");
+		expect(miss?.missedTokens).toBe(30_706);
+		expect(getCacheMissLabel(miss!)).toBe(
+			"Cache miss on first cached request after a cold start (no cache reported by provider yet)",
+		);
+	});
+
+	it("does not label cache loss/regain as warming after prior same-model cache activity", () => {
+		const firstWarmRequest = assistant({ input: 30_770, cacheRead: 30_000, timestamp: 0 });
+		const laterColdRequest = assistant({ input: 32_450, timestamp: 1_000 });
+		const current = assistant({ input: 35_000, cacheRead: 64, timestamp: 11_000 });
+		const miss = detectCacheMiss([entry(firstWarmRequest), entry(laterColdRequest)], current, models);
+
+		expect(miss?.reason).toBe("unexplained");
+	});
+
+	it("classifies a cold previous request after the TTL as idle, not warming", () => {
+		const coldTurn = assistant({ input: 30_770, timestamp: 0 });
+		const current = assistant({ input: 32_450, cacheRead: 64, timestamp: CACHE_TTL_MS });
+		const miss = detectCacheMiss([entry(coldTurn)], current, models);
+
+		expect(miss?.reason).toBe("idle");
+	});
+
 	it("does not report a miss without a prior request", () => {
 		expect(detectCacheMiss([], turn1, models)).toBeUndefined();
 	});

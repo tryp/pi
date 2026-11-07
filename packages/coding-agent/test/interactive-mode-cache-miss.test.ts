@@ -108,6 +108,25 @@ describe("InteractiveMode cache-miss notices", () => {
 		expect(rendered).toContain("Context after compaction: 148k -> 51k tokens");
 	});
 
+	test("renders the first cached request after a cold start separately from unexplained misses", () => {
+		const chatContainer = new Container();
+		const miss: CacheMiss = {
+			missedTokens: 30_706,
+			missedCost: 0.004,
+			idleMs: 11_000,
+			modelChanged: false,
+			reason: "warming",
+			anchorEntryId: undefined,
+		};
+
+		initTheme("dark");
+		addCacheMissNotice.call({ chatContainer, renderedEntryComponents: new Map() }, miss);
+
+		expect(stripAnsi(chatContainer.render(120).join("\n"))).toContain(
+			"Cache miss on first cached request after a cold start (no cache reported by provider yet): 31k tokens re-billed",
+		);
+	});
+
 	test("falls back to the tail when the anchor is absent", () => {
 		const chatContainer = new Container();
 		const existing = new Text("Existing transcript", 1, 0);
