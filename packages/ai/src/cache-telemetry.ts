@@ -295,6 +295,22 @@ const modelAllowlist = new Set([
 	"claude-sonnet-4-5-20250929",
 ]);
 
+/** Allowlisted raw provider labels emitted by this telemetry producer. */
+export const CACHE_TELEMETRY_PROVIDER_LABELS: readonly string[] = Object.freeze([...providerAllowlist]);
+
+const HASHED_PROVIDER_LABEL = /^provider-sha256:[a-f0-9]{64}$/;
+const HASHED_MODEL_LABEL = /^model-sha256:[a-f0-9]{64}$/;
+
+/** Whether a provider label is one this producer can persist without changing it. */
+export function isCacheTelemetryProviderLabel(value: unknown): value is string {
+	return typeof value === "string" && (value === "custom" || providerAllowlist.has(value) || HASHED_PROVIDER_LABEL.test(value));
+}
+
+/** Whether a model label is one this producer can persist without changing it. */
+export function isCacheTelemetryModelLabel(value: unknown): value is string {
+	return typeof value === "string" && (value === "unknown" || modelAllowlist.has(value) || HASHED_MODEL_LABEL.test(value));
+}
+
 function opaqueId(): string {
 	const bytes = new Uint8Array(16);
 	if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(bytes);
