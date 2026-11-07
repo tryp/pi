@@ -11,11 +11,20 @@ export type CacheMissAttribution =
 	| { kind: "messages_rewritten"; reasons: readonly string[] }
 	| { kind: "prefix_identical_provider_side" }
 	| { kind: "comparison_truncated" }
+	| {
+			kind: "telemetry_unavailable";
+			fallbackReason: "no_request_record" | "no_operation_records" | "operation_comparison_incomplete";
+			provider?: string;
+			model?: string;
+			requestCount: number;
+	  }
 	| { kind: "unknown" };
 
 interface CacheMissComparison {
 	request?: CacheTelemetryRequestRecord;
 	operations: CacheOperationObservation[];
+	provider?: string;
+	model?: string;
 }
 
 type CacheTelemetryOutcomeRecord = Extract<CacheTelemetryRecord, { kind: "cache_request_outcome" }> & {
@@ -50,7 +59,9 @@ const MAX_ATTRIBUTION_AGE_MS = 10_000;
  */
 export class CacheMissAttributionTracker {
 	private readonly comparisons = new Map<string, CacheMissComparison>();
+	private readonly completedWithoutRequest = new Set<string>();
 	private latest: { requestId: string; completedAt: number } | undefined;
+	private requestsWithoutWireTelemetry = 0;
 
 	private ensure(requestId: string): CacheMissComparison {
 		let comparison = this.comparisons.get(requestId);
@@ -74,8 +85,17 @@ export class CacheMissAttributionTracker {
 		this.ensure(record.requestId).request = record;
 	}
 
-	recordOperations(requestId: string, observations: readonly CacheOperationObservation[]): void {
-		this.ensure(requestId).operations.push(...observations);
+	recordOperations(
+		requestId: string,
+		observations: readonly CacheOperationObservation[],
+		model?: { provider: string; model: string },
+	): void {
+		const comparison = this.ensure(requestId);
+		comparison.operations.push(...observations);
+		if (model) {
+			comparison.provider = model.provider.slice(0, 100);
+			comparison.model = model.model.slice(0, 100);
+		}
 	}
 
 	complete(requestId: string, now: number = Date.now()): void {
@@ -86,18 +106,112 @@ export class CacheMissAttributionTracker {
 		const latest = this.latest;
 		if (!latest || now - latest.completedAt > MAX_ATTRIBUTION_AGE_MS) return { kind: "unknown" };
 		const comparison = this.comparisons.get(latest.requestId);
-		return comparison?.request
-			? classifyCacheMissComparison(comparison.request, comparison.operations)
-			: { kind: "unknown" };
+		if (comparison?.request) return classifyCacheMissComparison(comparison.request, comparison.operations);
+		if (!comparison) return { kind: "unknown" };
+		if (!this.completedWithoutRequest.has(latest.requestId)) {
+			this.completedWithoutRequest.add(latest.requestId);
+			this.requestsWithoutWireTelemetry = Math.min(1_000_000_000, this.requestsWithoutWireTelemetry + 1);
+			while (this.completedWithoutRequest.size > MAX_TRACKED_MISS_COMPARISONS) {
+				const oldest = this.completedWithoutRequest.values().next().value;
+				if (oldest === undefined) break;
+				this.completedWithoutRequest.delete(oldest);
+			}
+		}
+		const operationAttribution = classifyOperationOnlyComparison(comparison.operations);
+		if (operationAttribution) return operationAttribution;
+		return {
+			kind: "telemetry_unavailable",
+			fallbackReason:
+				comparison.operations.length === 0 ? "no_operation_records" : "operation_comparison_incomplete",
+			...(comparison.provider ? { provider: comparison.provider } : {}),
+			...(comparison.model ? { model: comparison.model } : {}),
+			requestCount: this.requestsWithoutWireTelemetry,
+		};
 	}
+
+	getHealth(): Readonly<{
+		requestsWithoutWireTelemetry: number;
+		fallbackReason: string;
+		provider?: string;
+		model?: string;
+	}> {
+		const latest = this.latest && this.comparisons.get(this.latest.requestId);
+		const operationFallback =
+			latest && !latest.request ? classifyOperationOnlyComparison(latest.operations) : undefined;
+		return {
+			requestsWithoutWireTelemetry: this.requestsWithoutWireTelemetry,
+			fallbackReason: latest?.request
+				? "none"
+				: operationFallback
+					? "wire_request_missing_operation_fallback"
+					: latest
+						? "no_request_record"
+						: "no_completed_request",
+			...(latest?.provider ? { provider: latest.provider } : {}),
+			...(latest?.model ? { model: latest.model } : {}),
+		};
+	}
+}
+
+function classifyOperationOnlyComparison(
+	operations: readonly CacheOperationObservation[],
+): CacheMissAttribution | undefined {
+	const finalAcrossRequest = operations.filter(
+		(operation) => operation.operation === "final_context" && operation.comparisonScope === "across_requests",
+	);
+	if (finalAcrossRequest.length === 0) return undefined;
+
+	const forSurface = (surface: "messages" | "system_prompt" | "tools") =>
+		finalAcrossRequest.filter((operation) => operation.surface === surface);
+	const messages = forSurface("messages");
+	const systemPrompt = forSurface("system_prompt");
+	const tools = forSurface("tools");
+
+	// Preserve concrete rewrite evidence even when another required surface is unavailable.
+	if (systemPrompt.some((operation) => operation.reason === "history_rewrite"))
+		return { kind: "system_prompt_changed" };
+	if (tools.some((operation) => operation.reason === "history_rewrite")) {
+		const changedTools = Math.max(
+			1,
+			...tools
+				.filter((operation) => operation.reason === "history_rewrite")
+				.map((operation) => Math.abs((operation.afterCount ?? 0) - (operation.beforeCount ?? 0))),
+		);
+		return { kind: "tools_changed", changedTools };
+	}
+	const rewriteReasons = [
+		...new Set(
+			messages
+				.filter((operation) => operation.reason === "history_rewrite")
+				.map((operation) => operation.annotation?.reason)
+				.filter((reason) => reason !== undefined && reason !== "unavailable"),
+		),
+	];
+	if (messages.some((operation) => operation.reason === "history_rewrite" || operation.reason === "shrink"))
+		return { kind: "messages_rewritten", reasons: rewriteReasons };
+
+	const comparable = (observations: readonly CacheOperationObservation[]) =>
+		observations.length > 0 &&
+		observations.every(
+			(operation) => operation.comparisonBasis === "prior_available" && operation.reason !== "unavailable",
+		);
+	if (
+		!comparable(messages) ||
+		!comparable(systemPrompt) ||
+		!comparable(tools) ||
+		!messages.every((operation) => operation.reason === "append" || operation.reason === "unchanged") ||
+		!systemPrompt.every((operation) => operation.reason === "unchanged") ||
+		!tools.every((operation) => operation.reason === "unchanged")
+	)
+		return undefined;
+	return { kind: "prefix_identical_provider_side" };
 }
 
 export function classifyCacheMissComparison(
 	request: CacheTelemetryRequestRecord,
 	operations: readonly CacheOperationObservation[] = [],
 ): CacheMissAttribution {
-	if (request.previousWirePayloadSha256Match === true)
-		return { kind: "prefix_identical_provider_side" };
+	if (request.previousWirePayloadSha256Match === true) return { kind: "prefix_identical_provider_side" };
 	if (
 		!request.prefixComparable ||
 		request.fingerprintStatus === "unavailable" ||
@@ -113,8 +227,7 @@ export function classifyCacheMissComparison(
 	const headLimit = Math.min(headKeptCurrent, headKeptPrevious);
 	const headChanged = common < headLimit;
 	const changedSegment = headChanged ? segments[common] : undefined;
-	if (headChanged && common === 0 && changedSegment?.name === "system")
-		return { kind: "system_prompt_changed" };
+	if (headChanged && common === 0 && changedSegment?.name === "system") return { kind: "system_prompt_changed" };
 	const operationChanges = request.operationChanges;
 	const changedTools = segments.filter((segment, index) => segment.name === "tools" && index >= common).length;
 	if (
@@ -148,11 +261,7 @@ export function classifyCacheMissComparison(
 		return { kind: "prefix_identical_provider_side" };
 	}
 	if (request.previousTailMatch === "aligned_rewrite") {
-		const tailIndex =
-			(request.keptHead ?? 0) +
-			(request.keptTail ?? 0) -
-			1 -
-			(request.tailChangedFromEnd ?? 0);
+		const tailIndex = (request.keptHead ?? 0) + (request.keptTail ?? 0) - 1 - (request.tailChangedFromEnd ?? 0);
 		const tailChange = segments[tailIndex];
 		if (tailChange?.name === "tools")
 			return {
@@ -340,11 +449,7 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 	const requestId = data(source, "requestId");
 	const attemptId = data(source, "attemptId");
 	const sessionId = data(source, "sessionId");
-	if (
-		!exactId(requestId) ||
-		!exactId(attemptId) ||
-		(sessionId !== undefined && !validSessionId(sessionId))
-	)
+	if (!exactId(requestId) || !exactId(attemptId) || (sessionId !== undefined && !validSessionId(sessionId)))
 		return undefined;
 
 	if (kind === "cache_request") {
@@ -505,7 +610,13 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 			if (typeof comparisonBasis !== "string" || !COMPARISON_BASES.has(comparisonBasis)) return undefined;
 			output.comparisonBasis = comparisonBasis;
 		}
-		for (const field of ["previousSegmentCount", "postHookInputCount", "segmentCount", "middleSegmentCount", "headDroppedForBudget"] as const) {
+		for (const field of [
+			"previousSegmentCount",
+			"postHookInputCount",
+			"segmentCount",
+			"middleSegmentCount",
+			"headDroppedForBudget",
+		] as const) {
 			const value = data(source, field);
 			if (value === undefined) continue;
 			if (!boundedCount(value, 1_000_000)) return undefined;
@@ -690,11 +801,17 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 			const headSizeBytes = prior && data(prior, "headSizeBytes");
 			const surfacesInput = prior && plain(data(prior, "surfaces"));
 			if (
-				!prior || typeof priorRequestId !== "string" || priorRequestId.length > 128 ||
-				typeof provider !== "string" || provider.length > 128 ||
-				typeof model !== "string" || model.length > 256 ||
-				(headSizeBytes !== null && !boundedCount(headSizeBytes, 10_000_000)) || !surfacesInput
-			) return undefined;
+				!prior ||
+				typeof priorRequestId !== "string" ||
+				priorRequestId.length > 128 ||
+				typeof provider !== "string" ||
+				provider.length > 128 ||
+				typeof model !== "string" ||
+				model.length > 256 ||
+				(headSizeBytes !== null && !boundedCount(headSizeBytes, 10_000_000)) ||
+				!surfacesInput
+			)
+				return undefined;
 			const surfaces: Record<string, unknown> = {};
 			for (const name of ["messages", "system_prompt", "tools"] as const) {
 				const surface = plain(data(surfacesInput, name));
@@ -706,7 +823,8 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 					(id !== null && (typeof id !== "string" || id.length > 64)) ||
 					(sizeBytes !== null && !boundedCount(sizeBytes, 10_000_000)) ||
 					(count !== null && !boundedCount(count, 1_000_000))
-				) return undefined;
+				)
+					return undefined;
 				surfaces[name] = { id, sizeBytes, count };
 			}
 			output.priorSuccessfulRequest = {
@@ -942,7 +1060,10 @@ export async function createLocalCacheTelemetryWriter(
 				if (!safeRecord) throw new Error("invalid telemetry record");
 				const requestId = safeRecord.requestId;
 				const recordKind = (safeRecord as { kind: string }).kind;
-				if (recordKind === "cache_request" && (safeRecord as CacheTelemetryRequestRecord).phase === "canonical_body") {
+				if (
+					recordKind === "cache_request" &&
+					(safeRecord as CacheTelemetryRequestRecord).phase === "canonical_body"
+				) {
 					const previous = nextMissComparisons.get(requestId);
 					if (previous) overwrittenRequests++;
 					nextMissComparisons.set(requestId, {
@@ -964,9 +1085,16 @@ export async function createLocalCacheTelemetryWriter(
 					if (!comparison?.request) {
 						skippedVerdicts++;
 					} else if (
-						isProviderCacheMiss(comparison.request, comparison.operations, safeRecord as CacheTelemetryOutcomeRecord)
+						isProviderCacheMiss(
+							comparison.request,
+							comparison.operations,
+							safeRecord as CacheTelemetryOutcomeRecord,
+						)
 					) {
-						safeRecord = { ...(safeRecord as CacheTelemetryOutcomeRecord), cacheMissVerdict: "provider_cache" } as CacheTelemetryOutcomeRecord;
+						safeRecord = {
+							...(safeRecord as CacheTelemetryOutcomeRecord),
+							cacheMissVerdict: "provider_cache",
+						} as CacheTelemetryOutcomeRecord;
 					}
 					nextMissComparisons.delete(requestId);
 				}

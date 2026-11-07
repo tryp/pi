@@ -60,6 +60,8 @@ export function getCacheMissLabel(miss: CacheMiss): string {
 					return "Cache miss (prefix identical: provider eviction or routing)";
 				case "comparison_truncated":
 					return "Cache miss (prefix identical in the compared window; remainder truncated)";
+				case "telemetry_unavailable":
+					return "Cache miss (no request telemetry recorded for this provider)";
 				default:
 					return "Cache miss (cause not identified from comparison telemetry)";
 			}
@@ -68,6 +70,62 @@ export function getCacheMissLabel(miss: CacheMiss): string {
 
 export interface CacheMissDiagnosticSink {
 	appendCustomEntry(customType: string, data?: unknown): unknown;
+}
+
+export interface CacheTelemetryHealthStats {
+	queueDrops: number;
+	serializationErrors: number;
+	missVerdictsSkipped: number;
+	missComparisonOperationDrops: number;
+	writeErrors: number;
+	pruneFailures: number;
+}
+
+export interface CacheTelemetryFallbackSummary {
+	fallbackReason: string;
+	requestsWithoutWireTelemetry: number;
+	provider?: string;
+	model?: string;
+}
+
+export function createCacheTelemetryHealthRecorder(sink: CacheMissDiagnosticSink) {
+	let recorded = false;
+	return (stats: CacheTelemetryHealthStats, fallback: CacheTelemetryFallbackSummary): boolean => {
+		if (recorded) return false;
+		recorded = true;
+		recordCacheTelemetryHealthDiagnostic(sink, stats, fallback);
+		return true;
+	};
+}
+
+/** Persist bounded accounting for the local cache-telemetry writer at session shutdown. */
+export function recordCacheTelemetryHealthDiagnostic(
+	sink: CacheMissDiagnosticSink,
+	stats: CacheTelemetryHealthStats,
+	fallback: CacheTelemetryFallbackSummary,
+): void {
+	const boundedCounter = (value: number) =>
+		Math.min(1_000_000_000, Math.max(0, Number.isFinite(value) ? Math.floor(value) : 0));
+	const boundedLabel = (value: string | undefined) => (value ? value.slice(0, 100) : undefined);
+	sink.appendCustomEntry("pi.session_diagnostic", {
+		timestamp: Date.now(),
+		schemaVersion: 1,
+		kind: "cache_telemetry_health",
+		writer: {
+			queueDrops: boundedCounter(stats.queueDrops),
+			serializationErrors: boundedCounter(stats.serializationErrors),
+			missVerdictsSkipped: boundedCounter(stats.missVerdictsSkipped),
+			missComparisonOperationDrops: boundedCounter(stats.missComparisonOperationDrops),
+			writeErrors: boundedCounter(stats.writeErrors),
+			pruneFailures: boundedCounter(stats.pruneFailures),
+		},
+		attributionFallback: {
+			fallbackReason: fallback.fallbackReason.slice(0, 100),
+			requestsWithoutWireTelemetry: boundedCounter(fallback.requestsWithoutWireTelemetry),
+			...(boundedLabel(fallback.provider) ? { provider: boundedLabel(fallback.provider) } : {}),
+			...(boundedLabel(fallback.model) ? { model: boundedLabel(fallback.model) } : {}),
+		},
+	});
 }
 
 /** Persist bounded, content-free details for an emitted cache-miss notice. */
