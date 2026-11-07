@@ -425,6 +425,7 @@ export class AgentSession {
 	private _lastPreSendCompactionLength = -1;
 	private _reportedDefaultCompactionWindows = new Set<string>();
 	private _reportedReserveDominatedCompactionTriggers = new Set<string>();
+	private _reportedReserveClampedCompactionTriggers = new Set<string>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1400,14 +1401,25 @@ export class AgentSession {
 				});
 			}
 		}
-		if (resolution.zeroTriggerCause) {
-			this._appendDiagnostic({
-				kind: "compaction_trigger_clamped_to_zero",
-				triggerBasis: resolution.triggerBasis,
-				cause: resolution.zeroTriggerCause,
-				budget: resolution.budget,
-				reserveTokens: resolution.reserveTokens,
-			});
+		if (resolution.reserveClampApplied) {
+			const key = JSON.stringify([
+				model?.provider ?? "unknown",
+				model?.id ?? "unknown",
+				resolution.budget,
+			]);
+			if (!this._reportedReserveClampedCompactionTriggers.has(key)) {
+				this._reportedReserveClampedCompactionTriggers.add(key);
+				this._appendDiagnostic({
+					kind: "compaction_trigger_reserve_clamped",
+					cause: resolution.zeroTriggerCause,
+					provider: model?.provider,
+					model: model?.id,
+					budget: resolution.budget,
+					reserveTokens: resolution.reserveTokens,
+					effectiveReserveTokens: resolution.effectiveReserveTokens,
+					triggerTokens: resolution.trigger,
+				});
+			}
 		}
 		// Record only structurally reserve-dominated budgets: once output reserve exceeds half
 		// the context budget, it has grown too large for the fractional trigger to be meaningful.
@@ -1487,6 +1499,8 @@ export class AgentSession {
 			triggerBasis: resolution.triggerBasis,
 			triggerFraction: resolution.triggerFraction,
 			reserveTokens: resolution.reserveTokens,
+			effectiveReserveTokens: resolution.effectiveReserveTokens,
+			reserveClampApplied: resolution.reserveClampApplied,
 			capApplied: resolution.capApplied,
 			capValue: resolution.capValue,
 			capSource: resolution.capSource,

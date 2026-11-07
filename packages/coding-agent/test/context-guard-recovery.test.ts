@@ -460,6 +460,12 @@ describe("pre-send gate end to end", () => {
 		const { session, modelRegistry, model } = await createRecoverySession({ maxContextTokens: null });
 		model.cost = { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 };
 		const settings = session.settingsManager.getCompactionSettings();
+		const reserveClampDiagnostics = () =>
+			session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic")
+				.map((entry) => (entry as { data: Record<string, unknown> }).data)
+				.filter((data) => data.kind === "compaction_trigger_reserve_clamped");
 		const reserveDiagnostics = () =>
 			session.sessionManager
 				.getEntries()
@@ -500,6 +506,21 @@ describe("pre-send gate end to end", () => {
 			expect(halfBudget.triggerBasis).toBe("reserve");
 			expect(halfBudget.trigger).toBe(16_384);
 			expect(reserveDiagnostics()).toHaveLength(2);
+
+			const exhaustedBudget = resolve(16_384);
+			expect(exhaustedBudget.trigger).toBe(14_417);
+			expect(exhaustedBudget.reserveClampApplied).toBe(true);
+			expect(reserveClampDiagnostics()).toHaveLength(1);
+			expect(reserveClampDiagnostics()[0]).toMatchObject({
+				kind: "compaction_trigger_reserve_clamped",
+				cause: "window_below_reserve",
+				budget: 16_384,
+				reserveTokens: 16_384,
+				effectiveReserveTokens: 1_967,
+				triggerTokens: 14_417,
+			});
+			resolve(16_384);
+			expect(reserveClampDiagnostics()).toHaveLength(1);
 		} finally {
 			session.dispose();
 			modelRegistry.unregisterProvider(model.provider);

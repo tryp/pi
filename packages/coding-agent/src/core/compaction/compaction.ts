@@ -174,6 +174,8 @@ export interface CompactionTriggerResolution {
 	triggerFraction: number;
 	borderlineFraction: number;
 	reserveTokens: number;
+	effectiveReserveTokens: number;
+	reserveClampApplied: boolean;
 	capApplied: boolean;
 	capValue: number | null;
 	capSource: "absolute" | "fraction" | "none";
@@ -241,16 +243,21 @@ export function resolveCompactionTrigger(
 			: DEFAULT_COMPACTION_SETTINGS.reserveTokens!;
 	const fractionCandidate = Math.floor(budget * fraction);
 	const reserveCandidate = budget - reserveTokens;
-	const triggerBeforeClamp = Math.min(fractionCandidate, reserveCandidate);
+	const reserveClampApplied = reserveCandidate <= 0;
+	const zeroTriggerCause = reserveClampApplied
+		? firstCostTierBoundary !== null && firstCostTierBoundary <= effectiveWindow
+			? "tier_boundary_below_reserve"
+			: "window_below_reserve"
+		: null;
+	// If the configured output reserve consumes the entire budget, honor the fractional
+	// trigger instead and retain the remaining ~12% as a viable (reduced) output reserve.
+	// This avoids a zero threshold, which would request compaction after every turn.
+	const fallbackTrigger = Math.max(1, fractionCandidate);
+	const effectiveReserveTokens = reserveClampApplied ? Math.max(0, budget - fallbackTrigger) : reserveTokens;
+	const triggerBeforeClamp = reserveClampApplied ? fallbackTrigger : Math.min(fractionCandidate, reserveCandidate);
 	// On an exact tie the fraction wins; reserve is reported only when it is strictly smaller.
 	let triggerBasis: CompactionTriggerResolution["triggerBasis"] =
-		reserveCandidate < fractionCandidate ? "reserve" : "fraction";
-	const zeroTriggerCause =
-		triggerBeforeClamp <= 0
-			? firstCostTierBoundary !== null && firstCostTierBoundary <= effectiveWindow
-				? "tier_boundary_below_reserve"
-				: "window_below_reserve"
-			: null;
+		!reserveClampApplied && reserveCandidate < fractionCandidate ? "reserve" : "fraction";
 	const uncappedTrigger = Math.max(0, triggerBeforeClamp);
 	const absoluteCap =
 		typeof settings.maxContextTokens === "number" &&
@@ -275,7 +282,7 @@ export function resolveCompactionTrigger(
 	const configuredAbsoluteCapIsFallback = usedDefaultWindow && absoluteCap !== undefined;
 	const hardLimit = configuredAbsoluteCapIsFallback
 		? absoluteCap
-		: Math.max(0, Math.min(budget - reserveTokens, capValue ?? Number.POSITIVE_INFINITY));
+		: Math.max(0, Math.min(budget - effectiveReserveTokens, capValue ?? Number.POSITIVE_INFINITY));
 	const trigger = configuredAbsoluteCapIsFallback
 		? absoluteCap
 		: Math.max(0, Math.min(uncappedTrigger, capValue ?? Number.POSITIVE_INFINITY));
@@ -294,6 +301,8 @@ export function resolveCompactionTrigger(
 		triggerFraction: fraction,
 		borderlineFraction,
 		reserveTokens,
+		effectiveReserveTokens,
+		reserveClampApplied,
 		capApplied,
 		capValue: capValue ?? null,
 		capSource,

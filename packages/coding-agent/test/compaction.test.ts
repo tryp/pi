@@ -552,13 +552,28 @@ describe("resolveCompactionTrigger", () => {
 		expect(result.triggerBasis).toBe("fraction");
 	});
 
-	it("clamps to non-negative thresholds and identifies a reserve-driven zero", () => {
+	it("clamps an exhausted reserve to the fractional trigger instead of resolving to zero", () => {
 		const windowNearReserve = resolveCompactionTrigger({ ...model, contextWindow: 32_000 }, 0, {
 			...DEFAULT_COMPACTION_SETTINGS,
 			reserveTokens: 16_384,
 		});
 		expect(windowNearReserve.trigger).toBe(15_616);
 		expect(windowNearReserve.zeroTriggerCause).toBeNull();
+
+		const atReserve = resolveCompactionTrigger({ ...model, contextWindow: 16_384 }, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(atReserve.budget).toBe(16_384);
+		expect(atReserve.trigger).toBe(14_417);
+		expect(atReserve.reserveClampApplied).toBe(true);
+		expect(atReserve.effectiveReserveTokens).toBe(1_967);
+		expect(atReserve.zeroTriggerCause).toBe("window_below_reserve");
+		expect(shouldCompact(1, 16_384, DEFAULT_COMPACTION_SETTINGS, { ...model, contextWindow: 16_384 })).toBe(false);
+		expect(shouldCompact(14_418, 16_384, DEFAULT_COMPACTION_SETTINGS, { ...model, contextWindow: 16_384 })).toBe(true);
+
+		const aboveReserve = resolveCompactionTrigger({ ...model, contextWindow: 16_385 }, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(aboveReserve.budget).toBe(16_385);
+		expect(aboveReserve.trigger).toBe(1);
+		expect(aboveReserve.reserveClampApplied).toBe(false);
+		expect(aboveReserve.zeroTriggerCause).toBeNull();
 
 		const belowReserveTier = {
 			...model,
@@ -570,19 +585,15 @@ describe("resolveCompactionTrigger", () => {
 				tiers: [{ inputTokensAbove: 12_000, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }],
 			},
 		};
-		const tierResolution = resolveCompactionTrigger(belowReserveTier, 0, {
-			...DEFAULT_COMPACTION_SETTINGS,
-			reserveTokens: 16_384,
-		});
+		const tierResolution = resolveCompactionTrigger(belowReserveTier, 0, DEFAULT_COMPACTION_SETTINGS);
 		expect(tierResolution.budget).toBe(12_000);
-		expect(tierResolution.trigger).toBe(0);
+		expect(tierResolution.trigger).toBe(10_560);
+		expect(tierResolution.reserveClampApplied).toBe(true);
 		expect(tierResolution.zeroTriggerCause).toBe("tier_boundary_below_reserve");
 
-		const smallWindow = resolveCompactionTrigger({ ...model, contextWindow: 12_000 }, 0, {
-			...DEFAULT_COMPACTION_SETTINGS,
-			reserveTokens: 16_384,
-		});
-		expect(smallWindow.trigger).toBe(0);
+		const smallWindow = resolveCompactionTrigger({ ...model, contextWindow: 12_000 }, 0, DEFAULT_COMPACTION_SETTINGS);
+		expect(smallWindow.trigger).toBe(10_560);
+		expect(smallWindow.reserveClampApplied).toBe(true);
 		expect(smallWindow.zeroTriggerCause).toBe("window_below_reserve");
 	});
 

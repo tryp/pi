@@ -613,6 +613,8 @@ export interface SessionBeforeCompactEvent {
 	triggerBasis?: "fraction" | "reserve" | "absolute_cap" | "fraction_cap";
 	triggerFraction?: number;
 	reserveTokens?: number;
+	effectiveReserveTokens?: number;
+	reserveClampApplied?: boolean;
 	capApplied?: boolean;
 	capValue?: number | null;
 	capSource?: "absolute" | "fraction" | "none";
@@ -637,6 +639,8 @@ export interface SessionCompactEvent {
 	triggerBasis?: "fraction" | "reserve" | "absolute_cap" | "fraction_cap";
 	triggerFraction?: number;
 	reserveTokens?: number;
+	effectiveReserveTokens?: number;
+	reserveClampApplied?: boolean;
 	capApplied?: boolean;
 	capValue?: number | null;
 	capSource?: "absolute" | "fraction" | "none";
