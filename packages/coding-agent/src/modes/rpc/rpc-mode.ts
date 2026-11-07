@@ -29,6 +29,7 @@ import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
+import { shutdownWithPendingCompaction } from "./rpc-shutdown.ts";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -735,7 +736,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
-		await runtimeHost.dispose();
+		// An extension may have requested a compaction from a turn-scoped hook; the
+		// request can be waiting for idle or mid-write when shutdown arrives, and
+		// disposing aborts it. Let an idle session finish it first.
+		await shutdownWithPendingCompaction(session, () => runtimeHost.dispose());
 		detachInput();
 		process.stdin.pause();
 		if (signal !== "SIGTERM") {
