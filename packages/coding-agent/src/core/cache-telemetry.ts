@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import type { CacheTelemetryRecord, CacheTelemetryRequestRecord } from "@earendil-works/pi-ai";
+import {
+	isCacheTelemetryModelLabel,
+	isCacheTelemetryProviderLabel,
+	type CacheTelemetryRecord,
+	type CacheTelemetryRequestRecord,
+} from "@earendil-works/pi-ai";
 import type { CacheOperationObservation, CacheOperationRecord } from "./cache-operations.ts";
 
 export type CacheMissAttribution =
@@ -254,52 +259,8 @@ const OPERATION_UNAVAILABLE_CAUSES = new Set([
 ]);
 const OPERATION_COMPARISON_BASES = new Set(["first_request", "prior_available", "prior_unavailable"]);
 const OUTCOMES = new Set(["success", "failed", "aborted"]);
-const PROVIDERS = new Set([
-	"anthropic",
-	"openai",
-	"openai-codex",
-	"gemini",
-	"opencode",
-	"opencode-go",
-	"zai",
-	"custom",
-]);
-const MODELS = new Set([
-	"deepseek-v4-flash",
-	"deepseek-v4.1-flash",
-	"glm-5.3-flash",
-	"gpt-4.1",
-	"gpt-4.1-mini",
-	"gpt-5.4",
-	"gpt-5.6-sol",
-	"gpt-5.6-terra",
-	"gpt-6-luna",
-	"gpt-6-astra",
-	"gpt-6.1-sol",
-	"gpt-5.1-codex",
-	"claude-sonnet-4-5",
-	"claude-sonnet-4-20250514",
-	"claude-sonnet-4-5-20250929",
-	"unknown",
-]);
 const HEX_32 = /^[a-f0-9]{32}$/;
 const HEX_64 = /^[a-f0-9]{64}$/;
-// The producer labels a provider or model it does not recognize with a domain-separated
-// digest rather than its literal name (`stableLabelHash` in packages/ai). Those labels are
-// legitimate records, not malformed ones. Rejecting them was worse than a missing row: one
-// invalid record discards its whole batch, and the batch is the request plus its outcome,
-// so an unrecognized provider produced NO request and NO outcome telemetry at all. Measured
-// on the offline gate: every batch was `[cache_request(final_wire_body), cache_request_outcome]`
-// and every one was rejected on `provider-sha256:...`.
-const HASHED_LABEL = /^(?:provider|model)-sha256:[0-9a-f]{64}$/;
-
-function isProviderLabel(value: unknown): value is string {
-	return typeof value === "string" && (PROVIDERS.has(value) || HASHED_LABEL.test(value));
-}
-
-function isModelLabel(value: unknown): value is string {
-	return typeof value === "string" && (MODELS.has(value) || HASHED_LABEL.test(value));
-}
 
 function data(object: object, key: string): unknown {
 	const descriptor = Object.getOwnPropertyDescriptor(object, key);
@@ -353,8 +314,8 @@ function sanitizeRecord(record: CacheTelemetryRecord): CacheTelemetryRecord | un
 		const keyEpoch = data(source, "keyEpoch");
 		const segmentsInput = data(source, "segments");
 		if (
-			!isProviderLabel(provider) ||
-			!isModelLabel(model) ||
+			!isCacheTelemetryProviderLabel(provider) ||
+			!isCacheTelemetryModelLabel(model) ||
 			typeof keyEpoch !== "string" ||
 			!HEX_32.test(keyEpoch) ||
 			!Array.isArray(segmentsInput) ||
@@ -930,12 +891,17 @@ export async function createLocalCacheTelemetryWriter(
 			return false;
 		}
 		const lines: string[] = [];
-		const nextMissComparisons = new Map(missComparisons);
+		let nextMissComparisons = new Map(missComparisons);
 		let skippedVerdicts = 0;
 		let droppedOperations = 0;
 		let overwrittenRequests = 0;
-		try {
-			for (const record of records) {
+		let allRecordsAccepted = true;
+		for (const record of records) {
+			const recordComparisons = new Map(nextMissComparisons);
+			let recordSkippedVerdicts = 0;
+			let recordDroppedOperations = 0;
+			let recordOverwrittenRequests = 0;
+			try {
 				const sessionId = getSessionId?.();
 				const recordWithSessionId = getSessionId ? { ...record, sessionId } : record;
 				let safeRecord = sanitizeRecord(recordWithSessionId);
@@ -943,32 +909,32 @@ export async function createLocalCacheTelemetryWriter(
 				const requestId = safeRecord.requestId;
 				const recordKind = (safeRecord as { kind: string }).kind;
 				if (recordKind === "cache_request" && (safeRecord as CacheTelemetryRequestRecord).phase === "canonical_body") {
-					const previous = nextMissComparisons.get(requestId);
-					if (previous) overwrittenRequests++;
-					nextMissComparisons.set(requestId, {
+					const previous = recordComparisons.get(requestId);
+					if (previous) recordOverwrittenRequests++;
+					recordComparisons.set(requestId, {
 						request: safeRecord as CacheTelemetryRequestRecord,
 						operations: previous?.operations ?? [],
 					});
 				} else if (recordKind === "cache_context_operation") {
-					const previous = nextMissComparisons.get(requestId);
+					const previous = recordComparisons.get(requestId);
 					if (previous && previous.operations.length < MAX_WRITER_MISS_OPERATIONS) {
-						nextMissComparisons.set(requestId, {
+						recordComparisons.set(requestId, {
 							...previous,
 							operations: [...previous.operations, safeRecord as unknown as CacheOperationObservation],
 						});
 					} else if (previous) {
-						droppedOperations++;
+						recordDroppedOperations++;
 					}
 				} else if (recordKind === "cache_request_outcome") {
-					const comparison = nextMissComparisons.get(requestId);
+					const comparison = recordComparisons.get(requestId);
 					if (!comparison?.request) {
-						skippedVerdicts++;
+						recordSkippedVerdicts++;
 					} else if (
 						isProviderCacheMiss(comparison.request, comparison.operations, safeRecord as CacheTelemetryOutcomeRecord)
 					) {
 						safeRecord = { ...(safeRecord as CacheTelemetryOutcomeRecord), cacheMissVerdict: "provider_cache" } as CacheTelemetryOutcomeRecord;
 					}
-					nextMissComparisons.delete(requestId);
+					recordComparisons.delete(requestId);
 				}
 				const line = JSON.stringify({
 					type: "custom",
@@ -978,14 +944,19 @@ export async function createLocalCacheTelemetryWriter(
 				});
 				if (Buffer.byteLength(line, "utf8") > MAX_RECORD_BYTES) throw new Error("telemetry record exceeds limit");
 				lines.push(line);
+				nextMissComparisons = recordComparisons;
+				skippedVerdicts += recordSkippedVerdicts;
+				droppedOperations += recordDroppedOperations;
+				overwrittenRequests += recordOverwrittenRequests;
+			} catch {
+				allRecordsAccepted = false;
+				serializationErrors = Math.min(1_000_000_000, serializationErrors + 1);
 			}
-		} catch {
-			serializationErrors = Math.min(1_000_000_000, serializationErrors + 1);
-			return false;
 		}
 		missVerdictsSkipped = Math.min(1_000_000_000, missVerdictsSkipped + skippedVerdicts);
 		missComparisonOperationDrops = Math.min(1_000_000_000, missComparisonOperationDrops + droppedOperations);
 		missComparisonRequestOverwrites = Math.min(1_000_000_000, missComparisonRequestOverwrites + overwrittenRequests);
+		if (lines.length === 0) return false;
 		missComparisons = nextMissComparisons;
 		while (missComparisons.size > MAX_WRITER_MISS_COMPARISONS) {
 			const oldest = missComparisons.keys().next().value;
@@ -1004,7 +975,7 @@ export async function createLocalCacheTelemetryWriter(
 				}
 			}
 		});
-		return true;
+		return allRecordsAccepted;
 	};
 	const append = (record: CacheTelemetryRecord): void => {
 		appendBatch([record]);

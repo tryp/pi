@@ -15,7 +15,12 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CacheTelemetryRecord, CacheTelemetryRequestRecord } from "../../ai/src/cache-telemetry.ts";
+import {
+	CACHE_TELEMETRY_PROVIDER_LABELS,
+	createCacheTelemetrySession,
+	type CacheTelemetryRecord,
+	type CacheTelemetryRequestRecord,
+} from "../../ai/src/cache-telemetry.ts";
 import type { CacheOperationObservation, CacheOperationRecord } from "../src/core/cache-operations.ts";
 import {
 	CacheMissAttributionTracker,
@@ -59,6 +64,16 @@ function requestRecord(): CacheTelemetryRequestRecord {
 		prefixComparable: false,
 		previousCommonPrefixSegments: 0,
 		truncatedSegmentCount: 0,
+	};
+}
+
+function successfulOutcome(request: CacheTelemetryRequestRecord): CacheTelemetryRecord {
+	return {
+		schemaVersion: 2,
+		kind: "cache_request_outcome",
+		requestId: request.requestId,
+		attemptId: request.attemptId,
+		outcome: "success",
 	};
 }
 
@@ -418,6 +433,122 @@ describe("local cache telemetry writer", () => {
 		expect(JSON.parse(saved).data.requestId).toBe(requestRecord().requestId);
 		expect((await stat(directory)).mode & 0o777).toBe(0o700);
 		expect(writer.getStats().serializationErrors).toBe(3);
+	});
+
+	it("persists ollama-cloud attempts with colon-tagged model ids", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-ollama-cloud-"));
+		tempDirs.push(root);
+		const writer = await createLocalCacheTelemetryWriter(root);
+		const acceptedBatches: boolean[] = [];
+		const observer = createCacheTelemetrySession(
+			() => {},
+			(records) => {
+				const accepted = writer.appendBatch(records);
+				acceptedBatches.push(accepted);
+				return accepted;
+			},
+		);
+		const ids = observer.observeRequest({
+			provider: "ollama-cloud",
+			model: "deepseek-v4.1-flash:1017",
+			phase: "final_wire_body",
+			transport: "sse",
+			payload: { messages: [{ role: "user", content: "hello" }] },
+			wirePayload: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+		});
+		observer.observeOutcome({ ...ids, outcome: "success" });
+		await observer.flush();
+		await writer.flush();
+
+		expect(acceptedBatches).toEqual([true]);
+		const directory = join(root, "cache-telemetry");
+		const entries = await readdir(directory);
+		const saved = (await readFile(join(directory, entries[0]!), "utf8"))
+			.trim()
+			.split("\n")
+			.map(
+				(line: string) =>
+					JSON.parse(line) as { data: { kind: string; provider?: string; model?: string } },
+			);
+		expect(saved.map((record) => record.data.kind)).toEqual(["cache_request", "cache_request_outcome"]);
+		expect(saved[0].data.provider).toBe("ollama-cloud");
+		expect(saved[0].data.model).toMatch(/^model-sha256:[a-f0-9]{64}$/);
+		expect(writer.getStats().serializationErrors).toBe(0);
+	});
+
+	it("accepts producer-allowlisted provider labels and hashes a test-only dynamic provider", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-provider-labels-"));
+		tempDirs.push(root);
+		const writer = await createLocalCacheTelemetryWriter(root);
+		for (const [index, provider] of CACHE_TELEMETRY_PROVIDER_LABELS.entries()) {
+			const request = {
+				...requestRecord(),
+				requestId: String(index + 1).padStart(32, "0"),
+				attemptId: (index + 1).toString(16).padStart(32, "0"),
+				provider,
+			};
+			expect(writer.appendBatch([request, successfulOutcome(request)])).toBe(true);
+		}
+
+		const observer = createCacheTelemetrySession(
+			() => {},
+			(records) => writer.appendBatch(records),
+		);
+		const syntheticIds = observer.observeRequest({
+			provider: "test-only-dynamic-provider",
+			model: "test-model:17",
+			phase: "final_wire_body",
+			transport: "sse",
+			payload: { messages: [{ role: "user", content: "hello" }] },
+			wirePayload: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+		});
+		observer.observeOutcome({ ...syntheticIds, outcome: "success" });
+		await observer.flush();
+		await writer.flush();
+
+		const directory = join(root, "cache-telemetry");
+		const entries = await readdir(directory);
+		const saved = (await readFile(join(directory, entries[0]!), "utf8"))
+			.trim()
+			.split("\\n")
+			.map((line: string) => JSON.parse(line) as { data: { kind: string; provider?: string; model?: string } });
+		const requestRecords = saved.filter((record) => record.data.kind === "cache_request");
+		expect(requestRecords.slice(0, CACHE_TELEMETRY_PROVIDER_LABELS.length).map((record) => record.data.provider)).toEqual(
+			CACHE_TELEMETRY_PROVIDER_LABELS,
+		);
+		expect(requestRecords.at(-1)?.data.provider).toMatch(/^provider-sha256:[a-f0-9]{64}$/);
+		expect(requestRecords.at(-1)?.data.model).toMatch(/^model-sha256:[a-f0-9]{64}$/);
+		expect(writer.getStats().serializationErrors).toBe(0);
+	});
+
+	it("keeps valid batch records when a peer record is unusable", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-partial-batch-"));
+		tempDirs.push(root);
+		const writer = await createLocalCacheTelemetryWriter(root);
+		const firstRequest = { ...requestRecord(), provider: "unrecognized-provider-literal" } as CacheTelemetryRequestRecord;
+		const secondRequest = {
+			...requestRecord(),
+			requestId: "11111111111111111111111111111111",
+			attemptId: "22222222222222222222222222222222",
+		};
+
+		expect(writer.appendBatch([firstRequest, successfulOutcome(firstRequest)])).toBe(false);
+		expect(
+			writer.appendBatch([
+				secondRequest,
+				{ ...successfulOutcome(secondRequest), outcome: "invalid" } as unknown as CacheTelemetryRecord,
+			]),
+		).toBe(false);
+		await writer.flush();
+
+		const directory = join(root, "cache-telemetry");
+		const entries = await readdir(directory);
+		const saved = (await readFile(join(directory, entries[0]!), "utf8"))
+			.trim()
+			.split("\\n")
+			.map((line: string) => JSON.parse(line) as { data: { kind: string } });
+		expect(saved.map((record) => record.data.kind)).toEqual(["cache_request_outcome", "cache_request"]);
+		expect(writer.getStats().serializationErrors).toBe(2);
 	});
 
 	it("accepts the producer's hashed provider and model labels", async () => {
