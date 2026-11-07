@@ -36,6 +36,10 @@ By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settin
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
 
+An extension can request a compaction with `ctx.compact()`. That request is queued rather than
+applied in place: it runs once the current run has settled and reports `reason: "extension"`, so
+it does not abort the turn that asked for it. Unlike `/compact`, it does not interrupt a live run.
+
 ### How It Works
 
 1. **Find cut point**: Walk backwards from newest message, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached
@@ -289,7 +293,7 @@ pi.on("session_before_compact", async (event, ctx) => {
   // preparation.settings - compaction settings
 
   // branchEntries - all entries on current branch (for custom state)
-  // reason - "manual" (/compact), "threshold", or "overflow"
+  // reason - "manual" (/compact or the RPC compact command), "extension" (ctx.compact()), "threshold", or "overflow"
   // willRetry - whether the aborted turn is retried after compaction (overflow recovery)
   // signal - AbortSignal (pass to LLM calls)
 
@@ -353,7 +357,7 @@ Fired when manual or automatic compaction fails or is aborted. This is useful fo
 ```typescript
 pi.on("session_compact_failed", async (event, ctx) => {
   const { reason, errorMessage, aborted, willRetry, fromExtension } = event;
-  // reason - "manual" (/compact), "threshold", or "overflow"
+  // reason - "manual" (/compact or the RPC compact command), "extension" (ctx.compact()), "threshold", or "overflow"
   // errorMessage - present for non-abort failures
   // aborted - true for cancelled/aborted compactions
   // willRetry - whether the aborted turn would have retried after compaction

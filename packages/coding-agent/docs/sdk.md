@@ -102,6 +102,9 @@ interface AgentSession {
   // Compaction
   compact(customInstructions?: string): Promise<CompactionResult>;
   abortCompaction(): void;
+  // Resolves once no extension-requested compaction is pending. Headless modes
+  // await it before exiting so a summary the run asked for is not cut off.
+  waitForPendingCompaction(): Promise<void>;
 
   // Abort current operation
   abort(): Promise<void>;

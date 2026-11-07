@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added the `extension` compaction reason and `AgentSession.waitForPendingCompaction()`. An extension compaction requested with `ctx.compact()` is now queued until the current run settles and reported with `reason: "extension"` instead of `"manual"`, so telemetry can tell background maintenance from a user action.
 - Added the `stream_inactivity` agent event and configurable stream inactivity diagnostics. This additive event-union change may require updates to exhaustive switches in external agent consumers.
 - Added `ui_prompt_start` and `ui_prompt_end` extension events so host integrations can distinguish active agent work from waiting on user-facing `ctx.ui` prompts ([#5329](https://github.com/earendil-works/pi/issues/5329)).
 - Added transcript usage notices for compaction and branch summaries when cache miss notices are enabled.
@@ -14,6 +15,8 @@
 
 ### Fixed
 
+- Fixed an extension calling `ctx.compact()` from a turn-scoped hook (`turn_end`, `tool_result`, `agent_end`) aborting the run that asked for it. In a headless run (`pi --mode json -p`, an RPC child) that abort rejected the in-flight `prompt()`, so the process exited 1 with `This operation was aborted` and the caller reported a failed step although every turn completed and the summary was written.
+- Fixed a compaction requested from a turn-scoped hook being cut off when the process exited: print mode and RPC shutdown now wait for a pending extension compaction before disposing, and a prompt submitted while one is queued waits for it instead of racing the abort it starts with.
 - Fixed toggling thinking visibility clearing partial output from running Bash tools ([#8611](https://github.com/earendil-works/pi/issues/8611)).
 - Fixed Windows shell aborts crashing Pi when `taskkill.exe` is unavailable on `PATH` ([#6596](https://github.com/earendil-works/pi/issues/6596)).
 - Fixed resumed sessions corrupting the next appended entry when their JSONL file lacks a trailing newline ([#8345](https://github.com/earendil-works/pi/issues/8345)).

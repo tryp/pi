@@ -1074,7 +1074,7 @@ Emitted when compaction runs, whether manual or automatic.
 {"type": "compaction_start", "reason": "threshold"}
 ```
 
-The `reason` field is `"manual"`, `"threshold"`, or `"overflow"`.
+The `reason` field is `"manual"` (the user ran `/compact` or sent the RPC `compact` command), `"extension"` (an extension called `ctx.compact()`), `"threshold"`, or `"overflow"`.
 
 ```json
 {
