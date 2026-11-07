@@ -136,6 +136,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			await session.prompt(message);
 		}
 
+		// An extension may request a compaction from a turn-scoped hook, so the
+		// request can still be running (or waiting for idle) after the last
+		// `prompt()` returns. Exiting now would drop the summary and leave the
+		// transcript uncompacted.
+		await session.waitForPendingCompaction();
+
 		if (mode === "text") {
 			const state = session.state;
 			const lastMessage = state.messages[state.messages.length - 1];

@@ -19,6 +19,7 @@ type FakeSession = {
 	subscribe: ReturnType<typeof vi.fn>;
 	prompt: ReturnType<typeof vi.fn>;
 	reload: ReturnType<typeof vi.fn>;
+	waitForPendingCompaction: ReturnType<typeof vi.fn>;
 };
 
 type FakeRuntimeHost = {
@@ -72,6 +73,7 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 		subscribe: vi.fn(() => () => {}),
 		prompt: vi.fn(async () => {}),
 		reload: vi.fn(async () => {}),
+		waitForPendingCompaction: vi.fn(async () => {}),
 	};
 
 	return {
@@ -121,6 +123,27 @@ describe("runPrintMode", () => {
 		expect(session.prompt).toHaveBeenCalledWith("hello");
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("waits for a pending extension compaction before returning", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const { session } = runtimeHost;
+		let compactionSettled = false;
+		// A turn-scoped extension hook can request a compaction after the last
+		// prompt resolves; the process must not exit with that summary half written.
+		session.waitForPendingCompaction = vi.fn(async () => {
+			await Promise.resolve();
+			compactionSettled = true;
+		});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+			messages: ["hello"],
+		});
+
+		expect(exitCode).toBe(0);
+		expect(session.waitForPendingCompaction).toHaveBeenCalledTimes(1);
+		expect(compactionSettled).toBe(true);
 	});
 
 	it("emits session_shutdown and returns non-zero on assistant error", async () => {

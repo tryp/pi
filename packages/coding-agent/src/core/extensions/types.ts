@@ -593,14 +593,28 @@ export interface SessionBeforeForkEvent {
 	position: "before" | "at";
 }
 
+/**
+ * Why a compaction ran.
+ *
+ * `manual` is a compaction the user asked for (`/compact`, the RPC `compact`
+ * command). `extension` is a compaction an extension asked for through
+ * `ctx.compact()`; it is kept distinct so telemetry can tell a user action from
+ * background maintenance.
+ */
+export type CompactionEventReason = "manual" | "extension" | "threshold" | "overflow";
+
 /** Fired before context compaction (can be cancelled or customized) */
 export interface SessionBeforeCompactEvent {
 	type: "session_before_compact";
 	preparation: CompactionPreparation;
 	branchEntries: SessionEntry[];
 	customInstructions?: string;
-	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
-	reason: "manual" | "threshold" | "overflow";
+	/**
+	 * What triggered the compaction: a user `/compact` (`manual`), an extension
+	 * calling `ctx.compact()` (`extension`), the context threshold, or context
+	 * overflow recovery.
+	 */
+	reason: CompactionEventReason;
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
 	signal: AbortSignal;
@@ -631,8 +645,12 @@ export interface SessionCompactEvent {
 	type: "session_compact";
 	compactionEntry: CompactionEntry;
 	fromExtension: boolean;
-	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
-	reason: "manual" | "threshold" | "overflow";
+	/**
+	 * What triggered the compaction: a user `/compact` (`manual`), an extension
+	 * calling `ctx.compact()` (`extension`), the context threshold, or context
+	 * overflow recovery.
+	 */
+	reason: CompactionEventReason;
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
 	/** Model identity and resolved context window used by the host for compaction. */
@@ -660,8 +678,12 @@ export interface SessionCompactEvent {
 /** Fired after context compaction fails or is aborted */
 export interface SessionCompactFailedEvent {
 	type: "session_compact_failed";
-	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
-	reason: "manual" | "threshold" | "overflow";
+	/**
+	 * What triggered the compaction: a user `/compact` (`manual`), an extension
+	 * calling `ctx.compact()` (`extension`), the context threshold, or context
+	 * overflow recovery.
+	 */
+	reason: CompactionEventReason;
 	/** Error text when compaction failed for a non-abort reason. */
 	errorMessage?: string;
 	/** True when compaction was cancelled or aborted. */

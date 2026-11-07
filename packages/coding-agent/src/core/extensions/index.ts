@@ -40,6 +40,7 @@ export type {
 	BeforeProviderRequestEvent,
 	BeforeProviderRequestEventResult,
 	BuildSystemPromptOptions,
+	CompactionEventReason,
 	// Context
 	CompactOptions,
 	// Events - Agent

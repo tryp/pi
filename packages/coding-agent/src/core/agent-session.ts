@@ -72,6 +72,7 @@ import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
+	type CompactionEventReason,
 	type ContextUsage,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
@@ -163,13 +164,13 @@ export type AgentSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "compaction_start"; reason: CompactionEventReason }
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
 			type: "compaction_end";
-			reason: "manual" | "threshold" | "overflow";
+			reason: CompactionEventReason;
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -188,7 +189,7 @@ export type AgentSessionEvent =
 	| {
 			type: "summarization_retry_attempt_start";
 			source: "compaction";
-			reason: "manual" | "threshold" | "overflow";
+			reason: CompactionEventReason;
 	  }
 	| { type: "summarization_retry_finished" }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
@@ -415,6 +416,12 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _manualCompactionPending = false;
+	/**
+	 * An extension-requested compaction that has been scheduled but may not have
+	 * started yet. Headless modes await it before exiting so a summary the run
+	 * asked for is never cut off mid-write.
+	 */
+	private _extensionCompaction: Promise<CompactionResult> | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	private _overflowRecoveryOutcome: "none" | "attempting" | "compacted" | "no-op" | "cancelled" | "failed" = "none";
@@ -2655,7 +2662,7 @@ export class AgentSession {
 		customInstructions: string | undefined,
 		signal: AbortSignal,
 		env: Record<string, string> | undefined,
-		reason: "manual" | "threshold" | "overflow",
+		reason: CompactionEventReason,
 	): Promise<CompactionResult> {
 		return compact(
 			preparation,
@@ -2684,11 +2691,19 @@ export class AgentSession {
 	 * supplies a custom result.
 	 *
 	 * Aborts the current agent operation first. Manual compaction never retries or
-	 * continues the interrupted agent turn.
+	 * continues the interrupted agent turn. Callers that must not abort a live run
+	 * (an extension requesting a compaction from a turn-scoped hook) should wait for
+	 * idle first; the extension API does that in `ctx.compact()`.
 	 *
 	 * @param customInstructions Optional instructions for the compaction summary
+	 * @param options `reason` records who asked: a user (`manual`, the default) or an
+	 * extension (`extension`). It is reported on every event this compaction emits.
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(
+		customInstructions?: string,
+		options?: { reason?: Extract<CompactionEventReason, "manual" | "extension"> },
+	): Promise<CompactionResult> {
+		const reason = options?.reason ?? "manual";
 		if (this._manualCompactionPending || this.isCompacting) throw new Error("Compaction already in progress");
 		// Reserve before abort's first await without marking the session busy:
 		// abort waits for idle, so reserving the controller here would deadlock.
@@ -2699,7 +2714,7 @@ export class AgentSession {
 			this._manualCompactionPending = false;
 		}
 		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
+		this._emit({ type: "compaction_start", reason });
 		let fromExtension = false;
 
 		try {
@@ -2737,7 +2752,7 @@ export class AgentSession {
 					preparation,
 					branchEntries: pathEntries,
 					customInstructions,
-					reason: "manual",
+					reason,
 					willRetry: false,
 					signal: this._compactionAbortController.signal,
 					...compactionLimits,
@@ -2776,7 +2791,7 @@ export class AgentSession {
 					customInstructions,
 					this._compactionAbortController.signal,
 					env,
-					"manual",
+					reason,
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -2809,7 +2824,7 @@ export class AgentSession {
 					type: "session_compact",
 					compactionEntry: savedCompactionEntry,
 					fromExtension,
-					reason: "manual",
+					reason,
 					willRetry: false,
 					...compactionLimits,
 				});
@@ -2827,7 +2842,7 @@ export class AgentSession {
 			this._compactionAbortController = undefined;
 			this._emit({
 				type: "compaction_end",
-				reason: "manual",
+				reason,
 				result: compactionResult,
 				aborted: false,
 				willRetry: false,
@@ -2840,14 +2855,14 @@ export class AgentSession {
 			this._compactionAbortController = undefined;
 			this._emit({
 				type: "compaction_end",
-				reason: "manual",
+				reason,
 				result: undefined,
 				aborted,
 				willRetry: false,
 				errorMessage,
 			});
 			await this._emitSessionCompactFailed({
-				reason: "manual",
+				reason,
 				errorMessage,
 				aborted,
 				willRetry: false,
@@ -2856,6 +2871,25 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
+		}
+	}
+
+	/**
+	 * Resolve once no extension-requested compaction is pending.
+	 *
+	 * An extension may request a compaction from a turn-scoped hook, so the
+	 * request can outlive the `prompt()` call that triggered it. Headless modes
+	 * await this before disposing: exiting mid-compaction drops the summary the
+	 * run asked for and leaves the transcript uncompacted.
+	 */
+	async waitForPendingCompaction(): Promise<void> {
+		while (true) {
+			const pending = this._extensionCompaction;
+			if (!pending) return;
+			await pending.catch(() => undefined);
+			if (this._extensionCompaction === pending) {
+				this._extensionCompaction = undefined;
+			}
 		}
 	}
 
@@ -3542,15 +3576,29 @@ export class AgentSession {
 				},
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
-					void (async () => {
-						try {
-							const result = await this.compact(options?.customInstructions);
-							options?.onComplete?.(result);
-						} catch (error) {
-							const err = error instanceof Error ? error : new Error(String(error));
-							options?.onError?.(err);
-						}
+					// An extension may ask for a compaction from a turn-scoped hook
+					// (`turn_end`, `agent_end`) while the run that hook belongs to is
+					// still in flight. `compact()` starts by aborting the current
+					// operation, and in a headless run that abort rejects the very
+					// `prompt()` the hook was called from: print mode then exits 1
+					// with "This operation was aborted" and the caller reports a
+					// failed step although every turn completed. Let the run settle
+					// and compact against a quiet session instead.
+					const pending = (async () => {
+						await this.waitForIdle();
+						return this.compact(options?.customInstructions, { reason: "extension" });
 					})();
+					this._extensionCompaction = pending;
+					void pending
+						.then(
+							(result) => options?.onComplete?.(result),
+							(error: unknown) => options?.onError?.(error instanceof Error ? error : new Error(String(error))),
+						)
+						.finally(() => {
+							if (this._extensionCompaction === pending) {
+								this._extensionCompaction = undefined;
+							}
+						});
 				},
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
@@ -3793,7 +3841,7 @@ export class AgentSession {
 	 * the TUI needs to render the retry and recreate the underlying indicator.
 	 */
 	private _summarizationRetryCallbacks(
-		source: { source: "branchSummary" } | { source: "compaction"; reason: "manual" | "threshold" | "overflow" },
+		source: { source: "branchSummary" } | { source: "compaction"; reason: CompactionEventReason },
 	): RetryCallbacks {
 		return {
 			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {
