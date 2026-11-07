@@ -583,10 +583,25 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			// Built once, outside the retry loop: telemetry must describe the bytes actually sent
 			// (`stream: true` included), and every retry resends the same request.
 			const wireBody = { ...params, stream: true };
+			telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+				provider: model.provider,
+				model: model.id,
+				phase: "canonical_body",
+				transport: "sse",
+				payloadMode: "full",
+				cacheRetention: resolveCacheRetention(options?.cacheRetention, options?.env),
+				cacheKeyPresent: false,
+				sessionHeaderPresent: Boolean(options?.sessionId),
+				payload: params,
+				wirePayload: serializeWirePayload(params),
+			});
+			const canonicalAttemptId = telemetryIds?.attemptId;
+			let firstAttempt = true;
 			const response = await retryProviderRequest(
 				async () => {
 					telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
 						requestId: telemetryIds?.requestId,
+						attemptId: firstAttempt ? canonicalAttemptId : undefined,
 						provider: model.provider,
 						model: model.id,
 						phase: "final_wire_body",
@@ -598,6 +613,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						payload: wireBody,
 						wirePayload: serializeWirePayload(wireBody),
 					});
+					firstAttempt = false;
 					try {
 						return await client.messages.create(wireBody, requestOptions).asResponse();
 					} catch (error) {

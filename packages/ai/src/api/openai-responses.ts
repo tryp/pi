@@ -157,10 +157,29 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
+			telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+				provider: model.provider,
+				model: model.id,
+				phase: "canonical_body",
+				transport: options?.transport === "websocket" ? "websocket" : "sse",
+				payloadMode: "full",
+				cacheRetention,
+				cacheKeyPresent: getCacheTelemetryDataProperty(params, "prompt_cache_key") !== undefined,
+				sessionHeaderPresent: Boolean(cacheSessionId),
+				cacheIdentityMatch:
+					getCacheTelemetryDataProperty(params, "prompt_cache_key") === undefined || !cacheSessionId
+						? null
+						: getCacheTelemetryDataProperty(params, "prompt_cache_key") === cacheSessionId,
+				payload: params,
+				wirePayload: serializeWirePayload(params),
+			});
+			const canonicalAttemptId = telemetryIds?.attemptId;
+			let firstAttempt = true;
 			const { data: openaiStream, response } = await retryProviderRequest(
 				async () => {
 					telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
 						requestId: telemetryIds?.requestId,
+						attemptId: firstAttempt ? canonicalAttemptId : undefined,
 						provider: model.provider,
 						model: model.id,
 						phase: "final_wire_body",
@@ -176,6 +195,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 						payload: params,
 						wirePayload: serializeWirePayload(params),
 					});
+					firstAttempt = false;
 					try {
 						return await client.responses.create(params, requestOptions).withResponse();
 					} catch (error) {
