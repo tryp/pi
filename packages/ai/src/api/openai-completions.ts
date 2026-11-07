@@ -387,10 +387,13 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				payload: params,
 				wirePayload: serializeWirePayload(params),
 			});
+			const canonicalAttemptId = telemetryIds?.attemptId;
+			let firstAttempt = true;
 			const { data: openaiStream, response } = await retryProviderRequest(
 				() => {
 					telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
 						requestId: telemetryIds?.requestId,
+						attemptId: firstAttempt ? canonicalAttemptId : undefined,
 						provider: model.provider,
 						model: model.id,
 						phase: "final_wire_body",
@@ -403,6 +406,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						payload: params!,
 						wirePayload: serializeWirePayload(params),
 					});
+					firstAttempt = false;
 					const ids = telemetryIds;
 					return client.chat.completions
 						.create(params!, requestOptions)

@@ -88,7 +88,7 @@ describe("openai-completions provider retries", () => {
 		vi.useRealTimers();
 	});
 
-	it("records one post-hook canonical body and reuses its request ID for wire retries", async () => {
+	it("pairs the canonical body with the first wire attempt and keeps retry attempts distinct", async () => {
 		vi.useFakeTimers();
 		mockState.requestErrors = [
 			Object.assign(new Error("rate limited"), {
@@ -142,6 +142,8 @@ describe("openai-completions provider retries", () => {
 			"logical-request-id",
 			"logical-request-id",
 		]);
+		expect(wire[0]?.attemptId).toBe(canonical[0]?.attemptId);
+		expect(wire[1]?.attemptId).not.toBe(canonical[0]?.attemptId);
 	});
 
 	it("disables SDK retries by default", async () => {

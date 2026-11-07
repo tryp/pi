@@ -2025,8 +2025,8 @@ describe("cache telemetry wire payload fidelity", () => {
 		return { off, on, records: telemetry.records };
 	}
 
-	it("openai-completions records the params object the SDK serializes", async () => {
-		await withAndWithout(async (observer) => {
+	it("openai-completions records the params object the SDK serializes and persists both phases together", async () => {
+		const { records } = await withAndWithout(async (observer) => {
 			captured.completionParams.length = 0;
 			await consume(
 				streamCompletions(completionsModel, context, {
@@ -2036,6 +2036,19 @@ describe("cache telemetry wire payload fidelity", () => {
 			);
 			return JSON.stringify(captured.completionParams.at(-1));
 		});
+		const canonical = requestRecords(records).find((record) => record.phase === "canonical_body");
+		const wire = requestRecords(records).find((record) => record.phase === "final_wire_body");
+		expect(canonical).toBeDefined();
+		expect(wire).toBeDefined();
+		expect(wire?.requestId).toBe(canonical?.requestId);
+		expect(wire?.attemptId).toBe(canonical?.attemptId);
+		expect(outcomeRecords(records)).toContainEqual(
+			expect.objectContaining({
+				requestId: canonical?.requestId,
+				attemptId: canonical?.attemptId,
+				outcome: "success",
+			}),
+		);
 	});
 
 	it("anthropic-messages records the body handed to the client, stream flag included", async () => {
