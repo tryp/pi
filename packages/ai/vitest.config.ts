@@ -1,10 +1,12 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
+import { checkModelData } from "./scripts/model-data-bootstrap.ts";
 
 const telemetrySrcIndex = fileURLToPath(new URL("../telemetry/src/index.ts", import.meta.url));
 
 export default defineConfig({
 	test: {
+		globalSetup: [() => checkModelData()],
 		globals: true,
 		environment: "node",
 		testTimeout: 30000, // 30 seconds for API calls

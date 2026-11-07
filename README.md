@@ -60,6 +60,10 @@ npm run check         # Lint, format, and type check
 ./pi-test.sh         # Run pi from sources (can be run from any directory)
 ```
 
+### Fresh worktrees and model data
+
+The model-data directory is gitignored, so every fresh worktree starts without it. Tests validate the data before running; hydrate it with `npm run hydrate:model-data` from the repository root, or from `packages/ai` run `npm run bootstrap:model-data` to copy and validate the data and manifest from the primary checkout when offline. `packages/ai/bunfig.toml` guards `bun test` run from that package; `bun test packages/ai/test/...` run from the repository root is not covered.
+
 ## Building standalone binaries from release source
 
 GitHub releases include a versioned source archive covered by the release's `SHA256SUMS` file. Extract it and run the same build script used for the official standalone binaries:

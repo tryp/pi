@@ -1,0 +1,3 @@
+# Testing
+
+The model-data directory is gitignored, so every fresh worktree starts without it. The Vitest global setup validates this data before any test file runs; it covers `npm test`, direct Vitest invocations, and Bun test commands that use this Vitest config, and Bun test when run from `packages/ai`; `bun test packages/ai/test/...` from the repository root is not covered because Bun loads config from the current directory. The guard says to run `npm run hydrate:model-data` at the repository root. If network hydration is unavailable, run `npm run bootstrap:model-data` from `packages/ai`; it copies the data and manifest from the primary checkout inferred from Git's common directory, then validates the copy and reports its generation time and age.
