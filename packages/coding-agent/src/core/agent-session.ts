@@ -1414,6 +1414,8 @@ export class AgentSession {
 					cause: resolution.zeroTriggerCause,
 					provider: model?.provider,
 					model: model?.id,
+					contextWindow: resolution.contextWindow,
+					contextWindowSource: resolution.usedDefaultWindow ? "default" : (model as (Model<any> & { contextWindowSource?: "backend" | "stored" | "static" | "default" }) | undefined)?.contextWindowSource ?? "static",
 					budget: resolution.budget,
 					reserveTokens: resolution.reserveTokens,
 					effectiveReserveTokens: resolution.effectiveReserveTokens,
@@ -1468,6 +1470,10 @@ export class AgentSession {
 			// analysis can query it instead of leaving the unclamped trigger to look like a flat price.
 			this._appendDiagnostic({
 				kind: "compaction_trigger_pricing_unknown",
+				provider: this.model?.provider,
+				model: this.model?.id,
+				contextWindow: resolution.contextWindow,
+				contextWindowSource: windowSource,
 				message: `No published pricing for ${this.model ? `${this.model.provider}/${this.model.id}` : "this model"}; the cost-tier clamp cannot apply, so the trigger is window-derived (${resolution.trigger} of ${resolution.contextWindow}).`,
 				effectiveContextWindow: resolution.contextWindow,
 				effectiveBudget: resolution.budget,
@@ -1482,6 +1488,10 @@ export class AgentSession {
 			const capName = absolute ? "maxContextTokens" : "maxContextFraction";
 			this._appendDiagnostic({
 				kind: absolute ? "compaction_trigger_capped_by_absolute" : "compaction_trigger_capped_by_fraction",
+				provider: this.model?.provider,
+				model: this.model?.id,
+				contextWindow: resolution.contextWindow,
+				contextWindowSource: windowSource,
 				triggerBasis: resolution.triggerBasis,
 				message: `Compaction trigger capped by ${capName}=${resolution.capValue}; derived trigger=${resolution.uncappedTrigger}, effective trigger=${resolution.trigger}.`,
 				capValue: resolution.capValue,
@@ -1491,6 +1501,10 @@ export class AgentSession {
 			});
 		}
 		return {
+			provider: this.model?.provider,
+			model: this.model?.id,
+			contextWindow: resolution.contextWindow,
+			contextWindowSource: windowSource,
 			effectiveContextWindow: resolution.contextWindow,
 			effectiveBudget: resolution.budget,
 			firstCostTierBoundary: resolution.firstCostTierBoundary,

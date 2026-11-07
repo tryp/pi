@@ -68,6 +68,7 @@ type SessionInternals = {
 	_transportAbortRetryAllowed(): boolean;
 	compactBeforeSubmit(): Promise<AgentMessage[] | undefined>;
 	_resolveCompactionTrigger(settings: ReturnType<SettingsManager["getCompactionSettings"]>): ReturnType<typeof resolveCompactionTrigger>;
+	_compactionEventLimits(settings: ReturnType<SettingsManager["getCompactionSettings"]>, resolution: ReturnType<typeof resolveCompactionTrigger>): Record<string, unknown>;
 };
 
 const internals = AgentSession.prototype as unknown as SessionInternals;
@@ -455,6 +456,25 @@ describe("pre-send gate end to end", () => {
 		} as Message);
 		return firstMessageId;
 	}
+
+	it("emits stable model identity and window fields for a discovered model", async () => {
+		const { session, modelRegistry, model } = await createRecoverySession();
+		try {
+			model.contextWindowSource = "backend";
+			const settings = session.settingsManager.getCompactionSettings();
+			const resolution = internals._resolveCompactionTrigger.call(session as unknown as SessionInternals, settings);
+			const payload = internals._compactionEventLimits.call(session as unknown as SessionInternals, settings, resolution);
+			expect(Object.keys(payload)).toEqual([
+				"provider", "model", "contextWindow", "contextWindowSource", "effectiveContextWindow", "effectiveBudget",
+				"firstCostTierBoundary", "costTierBoundarySource", "triggerTokens", "triggerBasis", "triggerFraction",
+				"reserveTokens", "effectiveReserveTokens", "reserveClampApplied", "capApplied", "capValue", "capSource", "windowSource",
+			]);
+			expect(payload).toMatchObject({ provider: "capture-provider", model: "capture-model", contextWindow: 128_000, contextWindowSource: "backend" });
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider(model.provider);
+		}
+	});
 
 	it("records only structurally reserve-dominated triggers and deduplicates each budget", async () => {
 		const { session, modelRegistry, model } = await createRecoverySession({ maxContextTokens: null });

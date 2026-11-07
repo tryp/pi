@@ -604,6 +604,11 @@ export interface SessionBeforeCompactEvent {
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
 	signal: AbortSignal;
+	/** Model identity and resolved context window used by the host for compaction. */
+	provider?: string;
+	model?: string;
+	contextWindow?: number;
+	contextWindowSource?: "backend" | "static" | "stored" | "default";
 	/** Resolved context limits used by the host for this model. */
 	effectiveContextWindow?: number;
 	effectiveBudget?: number;
@@ -630,6 +635,11 @@ export interface SessionCompactEvent {
 	reason: "manual" | "threshold" | "overflow";
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
+	/** Model identity and resolved context window used by the host for compaction. */
+	provider?: string;
+	model?: string;
+	contextWindow?: number;
+	contextWindowSource?: "backend" | "static" | "stored" | "default";
 	/** Resolved context limits used by the host for this model. */
 	effectiveContextWindow?: number;
 	effectiveBudget?: number;
