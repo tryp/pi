@@ -2791,6 +2791,8 @@ export class AgentSession {
 		}
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason });
+		// This records whether session_before_compact supplied the summary payload; it persists as `fromHook`.
+		// Distinct from `reason: "extension"`, which records who requested compaction.
 		let fromExtension = false;
 
 		try {
