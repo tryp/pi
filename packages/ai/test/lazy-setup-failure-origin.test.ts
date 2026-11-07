@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { lazyStream } from "../src/api/lazy.ts";
-import type { Api, AssistantMessage, Model } from "../src/types.ts";
+import type { Api, AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
 import { REQUEST_FAILURE_DIAGNOSTIC_TYPE, readRequestFailureOrigin } from "../src/utils/abort-origin.ts";
 import { isRetryableAssistantError, isUnrecordedAbortFailure } from "../src/utils/retry.ts";
 
@@ -93,6 +93,25 @@ describe("lazy setup-failure origin", () => {
 				retryVerdict: "retry",
 			}),
 		);
+	});
+
+	it("records a result rejection after stream events as a streaming-phase failure", async () => {
+		const source: AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> } = {
+			async *[Symbol.asyncIterator]() {
+				yield { type: "text_start", contentIndex: 0, partial: {} as AssistantMessage };
+			},
+			async result() {
+				throw new Error("stream result failed");
+			},
+		};
+		const stream = lazyStream(model, async () => source);
+		const message = await stream.result();
+
+		expect(message.errorMessage).toBe("stream result failed");
+		expect(readRequestFailureOrigin(message)).toEqual(
+			expect.objectContaining({ phase: "streaming", transport: "unknown" }),
+		);
+		expect(readRequestFailureOrigin(message)?.phase).not.toBe("setup");
 	});
 
 	it("records a non-abort setup failure as indeterminate so wording still decides", async () => {

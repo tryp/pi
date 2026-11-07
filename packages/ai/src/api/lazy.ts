@@ -16,16 +16,22 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
  * The display string is left byte-identical to the pre-existing behaviour; only
  * the structured diagnostic is new.
  */
-function createSetupErrorMessage(model: Model<Api>, error: unknown, signal: AbortSignal | undefined): AssistantMessage {
+function createLazyErrorMessage(
+	model: Model<Api>,
+	error: unknown,
+	signal: AbortSignal | undefined,
+	phase: "setup" | "streaming",
+	eventsEmitted: boolean,
+): AssistantMessage {
 	const normalized = normalizeProviderError(error);
 	const origin = classifyRequestFailure({
 		error,
 		normalized,
 		signal,
-		phase: "setup",
-		transport: "none",
+		phase,
+		transport: phase === "setup" ? "none" : "unknown",
 		usageTokens: 0,
-		eventsEmitted: false,
+		eventsEmitted,
 	});
 	const message: AssistantMessage = {
 		role: "assistant",
@@ -49,10 +55,10 @@ function createSetupErrorMessage(model: Model<Api>, error: unknown, signal: Abor
 		error,
 		normalized,
 		signal,
-		phase: "setup",
-		transport: "none",
+		phase,
+		transport: phase === "setup" ? "none" : "unknown",
 		usageTokens: 0,
-		eventsEmitted: false,
+		eventsEmitted,
 		formattedError: normalized.message,
 	});
 	return message;
@@ -67,11 +73,18 @@ function hasResult(
 async function forwardStream(
 	target: AssistantMessageEventStream,
 	source: AsyncIterable<AssistantMessageEvent>,
+	onError: (error: unknown, eventsEmitted: boolean) => void,
 ): Promise<void> {
-	for await (const event of source) {
-		target.push(event);
+	let eventsEmitted = false;
+	try {
+		for await (const event of source) {
+			target.push(event);
+			eventsEmitted = true;
+		}
+		target.end(hasResult(source) ? await source.result() : undefined);
+	} catch (error) {
+		onError(error, eventsEmitted);
 	}
-	target.end(hasResult(source) ? await source.result() : undefined);
 }
 
 /**
@@ -87,9 +100,15 @@ export function lazyStream(
 	const outer = new AssistantMessageEventStream();
 
 	setup()
-		.then((inner) => forwardStream(outer, inner))
+		.then((inner) => {
+			void forwardStream(outer, inner, (error, eventsEmitted) => {
+				const message = createLazyErrorMessage(model, error, signal, "streaming", eventsEmitted);
+				outer.push({ type: "error", reason: "error", error: message });
+				outer.end(message);
+			});
+		})
 		.catch((error) => {
-			const message = createSetupErrorMessage(model, error, signal);
+			const message = createLazyErrorMessage(model, error, signal, "setup", false);
 			outer.push({ type: "error", reason: "error", error: message });
 			outer.end(message);
 		});
