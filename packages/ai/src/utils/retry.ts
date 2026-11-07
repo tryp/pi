@@ -273,7 +273,9 @@ export interface RetryClassificationOptions {
  * Retry stays off for this class: the wording says an abort happened, not who
  * aborted it, and re-sending into a deliberate cancellation reproduces it.
  */
-export function isUnrecordedAbortFailure(message: AssistantMessage): boolean {
+export function isUnrecordedAbortFailure(
+	message: AssistantMessage,
+): message is AssistantMessage & { errorMessage: string } {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
 	if (readRequestFailureOrigin(message) !== undefined) return false;
 	return isAbortWording(message.errorMessage);
