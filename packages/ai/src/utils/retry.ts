@@ -1,5 +1,5 @@
 import type { AssistantMessage } from "../types.ts";
-import { readRequestFailureBaseMessage, readRequestFailureOrigin } from "./abort-origin.ts";
+import { isAbortWording, readRequestFailureBaseMessage, readRequestFailureOrigin } from "./abort-origin.ts";
 
 // Only veto a structured transport-abort retry when the provider-formatted
 // message explicitly identifies a request-size/context limit. There is no
@@ -261,6 +261,25 @@ export interface RetryClassificationOptions {
 }
 
 /**
+ * True when a failed assistant message is abort-shaped by wording alone and
+ * carries no recorded origin.
+ *
+ * This is the class every pre-origin session writes: `stopReason: "error"`,
+ * zero usage, `errorMessage: "This operation was aborted"`, no diagnostic. It
+ * is an abort we cannot attribute, not a generic unretryable error, so the
+ * classifier must name it rather than let it fall through to the provider
+ * wording patterns (which is how it used to disappear into `unknown`).
+ *
+ * Retry stays off for this class: the wording says an abort happened, not who
+ * aborted it, and re-sending into a deliberate cancellation reproduces it.
+ */
+export function isUnrecordedAbortFailure(message: AssistantMessage): boolean {
+	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	if (readRequestFailureOrigin(message) !== undefined) return false;
+	return isAbortWording(message.errorMessage);
+}
+
+/**
  * Classifies whether a failed assistant message should be retried.
  *
  * Prefers the structured request-failure origin that the provider catch blocks
@@ -288,5 +307,10 @@ export function isRetryableAssistantError(message: AssistantMessage, options?: R
 		// verdict has to come from the provider's own wording.
 		return RETRYABLE_PROVIDER_ERROR_PATTERN.test(providerMessage);
 	}
+	// No origin: an abort-looking wording is an unattributable abort, not a
+	// transient provider error. Decide it explicitly so it is never "fixed" by
+	// adding abort wording to the retryable pattern list, which would retry
+	// deliberate cancellations.
+	if (isAbortWording(errorMessage)) return false;
 	return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
 }

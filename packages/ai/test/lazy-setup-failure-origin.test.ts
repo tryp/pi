@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { lazyStream } from "../src/api/lazy.ts";
 import type { Api, AssistantMessage, Model } from "../src/types.ts";
 import { readRequestFailureOrigin, REQUEST_FAILURE_DIAGNOSTIC_TYPE } from "../src/utils/abort-origin.ts";
-import { isRetryableAssistantError } from "../src/utils/retry.ts";
+import { isRetryableAssistantError, isUnrecordedAbortFailure } from "../src/utils/retry.ts";
 
 const model: Model<Api> = {
 	id: "gpt-6-luna",
@@ -132,6 +132,7 @@ describe("lazy setup-failure origin", () => {
 			timestamp: Date.now(),
 		};
 		expect(readRequestFailureOrigin(legacy)).toBeUndefined();
+		expect(isUnrecordedAbortFailure(legacy)).toBe(true);
 		expect(isRetryableAssistantError(legacy, { retryTransportAborts: true })).toBe(false);
 	});
 });

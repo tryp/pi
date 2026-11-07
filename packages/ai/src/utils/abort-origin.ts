@@ -279,6 +279,15 @@ export function classifyRequestFailure(input: RequestFailureInput): RequestFailu
 const ABORT_WORDING_PATTERN = /\babort/i;
 
 /**
+ * True when the provider's own text describes an abort. Exposed so the retry
+ * classifier can decide an unrecorded abort explicitly instead of letting the
+ * wording fall through the transient-error patterns.
+ */
+export function isAbortWording(text: string): boolean {
+	return ABORT_WORDING_PATTERN.test(text);
+}
+
+/**
  * True when the failure looks like a provider request that produced no output
  * at all: no HTTP status, no usage, no local abort. This is the shape the
  * "aborted request before any output" envelope describes, and the shape that
