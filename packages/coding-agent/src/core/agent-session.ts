@@ -125,6 +125,8 @@ import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
 
+const DEFAULT_COMPACTION_EXIT_WAIT_MS = 120_000;
+
 // ============================================================================
 // Skill Block Parsing
 // ============================================================================
@@ -2967,17 +2969,62 @@ export class AgentSession {
 	}
 
 	/**
-	 * Resolve once no extension-requested compaction is pending, unless a run is
-	 * still in flight.
+	 * Wait for extension-requested compactions before headless disposal, unless a
+	 * run is still in flight. A timed-out wait aborts the active compaction and
+	 * returns its duration and remaining pending count for the caller to report.
+	 * `PI_COMPACTION_EXIT_WAIT_MS=0` disables the deadline.
 	 *
-	 * Headless modes call this before disposing. A live run is cancelled by
-	 * disposal anyway, and waiting for it to become idle first would block shutdown
-	 * on the run; a compaction requested by the turn that just ended is the case
-	 * this exists for.
+	 * A live run is cancelled by disposal anyway, and waiting for it to become idle
+	 * first would block shutdown on the run; a compaction requested by the turn
+	 * that just ended is the case this exists for.
 	 */
-	async waitForPendingCompactionBeforeExit(): Promise<void> {
-		if (!this.isIdle) return;
-		await this.waitForPendingCompaction();
+	async waitForPendingCompactionBeforeExit(): Promise<
+		{ timedOut: false } | { timedOut: true; waitedMs: number; pending: number } | undefined
+	> {
+		if (!this.isIdle) return undefined;
+		if (this._extensionCompactions.size === 0) return { timedOut: false };
+
+		const configuredWait = process.env.PI_COMPACTION_EXIT_WAIT_MS;
+		const configuredWaitMs = configuredWait?.trim() ? Number(configuredWait) : Number.NaN;
+		const waitMs =
+			Number.isFinite(configuredWaitMs) && configuredWaitMs >= 0
+				? configuredWaitMs
+				: DEFAULT_COMPACTION_EXIT_WAIT_MS;
+		if (waitMs === 0) {
+			await this.waitForPendingCompaction();
+			return { timedOut: false };
+		}
+
+		// This is an escape hatch for a stuck extension hook, not a compaction
+		// latency bound. The 1,463 observed compaction entries do not provide a
+		// clean duration: time from the prior message to the entry is dominated by
+		// idle gaps (p50 0s, p99 3,288s), so 120s is deliberately not presented as
+		// a measured percentile. The provider request has its own retry budget.
+		while (this._extensionCompactions.size > 0) {
+			const pendingCompaction = this._extensionCompactions.values().next().value;
+			if (!pendingCompaction) break;
+			const startedAt = Date.now();
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				const timedOut = await Promise.race([
+					pendingCompaction.catch(() => undefined).then(() => false),
+					new Promise<boolean>((resolve) => {
+						timer = setTimeout(() => resolve(true), waitMs);
+					}),
+				]);
+				if (timedOut) {
+					const waitedMs = Date.now() - startedAt;
+					const pending = this._extensionCompactions.size;
+					this.abortCompaction();
+					this._appendDiagnostic({ kind: "exit_compaction_wait_timeout", waitedMs, pending });
+					return { timedOut: true, waitedMs, pending };
+				}
+				this._extensionCompactions.delete(pendingCompaction);
+			} finally {
+				if (timer !== undefined) clearTimeout(timer);
+			}
+		}
+		return { timedOut: false };
 	}
 
 	/**

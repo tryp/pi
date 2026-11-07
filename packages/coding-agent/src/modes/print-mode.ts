@@ -140,7 +140,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		// request can still be running (or waiting for idle) after the last
 		// `prompt()` returns. Exiting now would drop the summary and leave the
 		// transcript uncompacted.
-		await session.waitForPendingCompactionBeforeExit();
+		const compactionWait = await session.waitForPendingCompactionBeforeExit();
+		if (compactionWait?.timedOut) {
+			console.error(
+				`Warning: pending compaction did not finish before exit (${compactionWait.pending} pending after ${compactionWait.waitedMs}ms)`,
+			);
+		}
 
 		if (mode === "text") {
 			const state = session.state;

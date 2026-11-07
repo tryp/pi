@@ -154,6 +154,51 @@ describe("runPrintMode", () => {
 		expect(order).toEqual(["wait", "dispose"]);
 	});
 
+	it("warns when pending compaction exceeds its exit wait without changing the turn exit code", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const { session } = runtimeHost;
+		session.waitForPendingCompactionBeforeExit = vi.fn(async () => ({
+			timedOut: true,
+			waitedMs: 120_000,
+			pending: 1,
+		}));
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+			messages: ["hello"],
+		});
+
+		expect(exitCode).toBe(0);
+		expect(log).toHaveBeenCalledTimes(1);
+		expect(log).toHaveBeenCalledWith(
+			"Warning: pending compaction did not finish before exit (1 pending after 120000ms)",
+		);
+	});
+
+	it("preserves a failed turn exit code when the compaction wait times out", async () => {
+		const runtimeHost = createRuntimeHost(
+			createAssistantMessage({ stopReason: "error", errorMessage: "request failed" }),
+		);
+		const { session } = runtimeHost;
+		session.waitForPendingCompactionBeforeExit = vi.fn(async () => ({
+			timedOut: true,
+			waitedMs: 120_000,
+			pending: 1,
+		}));
+		const log = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			messages: ["hello"],
+		});
+
+		expect(exitCode).toBe(1);
+		expect(log).toHaveBeenCalledWith(
+			"Warning: pending compaction did not finish before exit (1 pending after 120000ms)",
+		);
+	});
+
 	it("compacts at turn_end without truncating the next message", async () => {
 		// Real session, real print mode: a turn-scoped hook compacts after the first
 		// message, and the second message must still run to completion instead of
