@@ -341,6 +341,10 @@ describe("detectCacheMiss", () => {
 				"Cache miss (prefix identical in the compared window; remainder truncated)",
 			],
 			[
+				{ kind: "wire_only_uncomparable" as const, provider: "zai", model: "glm-5.3-flash" },
+				"Cache miss (no canonical request body recorded for this provider; wire body only)",
+			],
+			[
 				{
 					kind: "telemetry_unavailable" as const,
 					fallbackReason: "no_operation_records" as const,

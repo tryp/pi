@@ -1,18 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
+import type { CacheTelemetryRequestInput } from "../src/cache-telemetry.ts";
 import type { Context, Model } from "../src/types.ts";
 
 const mockState = vi.hoisted(() => ({
 	requestOptions: [] as unknown[],
 	requestErrors: [] as Error[],
+	requestParams: [] as unknown[],
 }));
 
 vi.mock("openai", () => {
 	class FakeOpenAI {
 		chat = {
 			completions: {
-				create: (_params: unknown, options: unknown) => {
+				create: (params: unknown, options: unknown) => {
 					mockState.requestOptions.push(options);
+					mockState.requestParams.push(params);
 					const stream = {
 						async *[Symbol.asyncIterator]() {
 							yield {
@@ -78,10 +81,67 @@ describe("openai-completions provider retries", () => {
 	beforeEach(() => {
 		mockState.requestOptions = [];
 		mockState.requestErrors = [];
+		mockState.requestParams = [];
 	});
 
 	afterEach(() => {
 		vi.useRealTimers();
+	});
+
+	it("records one post-hook canonical body and reuses its request ID for wire retries", async () => {
+		vi.useFakeTimers();
+		mockState.requestErrors = [
+			Object.assign(new Error("rate limited"), {
+				status: 429,
+				headers: new Headers({ "retry-after-ms": "1" }),
+			}),
+		];
+		const observed: Array<{
+			input: CacheTelemetryRequestInput;
+			requestId: string;
+			attemptId: string;
+		}> = [];
+		const cacheTelemetry = {
+			observeRequest(input: CacheTelemetryRequestInput) {
+				const ids = {
+					requestId: (input.requestId as string | undefined) ?? "logical-request-id",
+					attemptId: (input.attemptId as string | undefined) ?? `attempt-${observed.length + 1}`,
+				};
+				observed.push({ input, ...ids });
+				return ids;
+			},
+			observeOutcome() {},
+			async flush() {},
+			getStats() {
+				return { queueDrops: 0, persistenceErrors: 0 };
+			},
+		};
+		const stream = streamOpenAICompletions(model, context, {
+			apiKey: "test",
+			maxRetries: 1,
+			maxRetryDelayMs: 10,
+			cacheTelemetry,
+			onPayload: (body) => ({ ...(body as Record<string, unknown>), model: "post-hook-model" }),
+		});
+		const result = (async () => {
+			for await (const _event of stream) void _event;
+			return stream.result();
+		})();
+		await vi.advanceTimersByTimeAsync(0);
+		await vi.advanceTimersByTimeAsync(1);
+		await result;
+
+		const canonical = observed.filter((record) => record.input.phase === "canonical_body");
+		const wire = observed.filter((record) => record.input.phase === "final_wire_body");
+		expect(canonical).toHaveLength(1);
+		expect(wire).toHaveLength(2);
+		expect(canonical[0]?.input.payload).toMatchObject({ model: "post-hook-model" });
+		expect(mockState.requestParams[0]).toMatchObject({ model: "post-hook-model" });
+		expect([...canonical, ...wire].map((record) => record.requestId)).toEqual([
+			"logical-request-id",
+			"logical-request-id",
+			"logical-request-id",
+		]);
 	});
 
 	it("disables SDK retries by default", async () => {

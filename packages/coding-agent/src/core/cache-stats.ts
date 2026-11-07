@@ -62,6 +62,8 @@ export function getCacheMissLabel(miss: CacheMiss): string {
 					return "Cache miss (system prompt/tools unchanged; messages appended; wire comparison unavailable)";
 				case "comparison_truncated":
 					return "Cache miss (prefix identical in the compared window; remainder truncated)";
+				case "wire_only_uncomparable":
+					return "Cache miss (no canonical request body recorded for this provider; wire body only)";
 				case "telemetry_unavailable":
 					return "Cache miss (no request telemetry recorded for this provider)";
 				default:

@@ -17,9 +17,9 @@ import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	CACHE_TELEMETRY_PROVIDER_LABELS,
-	createCacheTelemetrySession,
 	type CacheTelemetryRecord,
 	type CacheTelemetryRequestRecord,
+	createCacheTelemetrySession,
 } from "../../ai/src/cache-telemetry.ts";
 import type { CacheOperationObservation, CacheOperationRecord } from "../src/core/cache-operations.ts";
 import {
@@ -466,10 +466,7 @@ describe("local cache telemetry writer", () => {
 		const saved = (await readFile(join(directory, entries[0]!), "utf8"))
 			.trim()
 			.split("\n")
-			.map(
-				(line: string) =>
-					JSON.parse(line) as { data: { kind: string; provider?: string; model?: string } },
-			);
+			.map((line: string) => JSON.parse(line) as { data: { kind: string; provider?: string; model?: string } });
 		expect(saved.map((record) => record.data.kind)).toEqual(["cache_request", "cache_request_outcome"]);
 		expect(saved[0].data.provider).toBe("ollama-cloud");
 		expect(saved[0].data.model).toMatch(/^model-sha256:[a-f0-9]{64}$/);
@@ -513,9 +510,9 @@ describe("local cache telemetry writer", () => {
 			.split("\n")
 			.map((line: string) => JSON.parse(line) as { data: { kind: string; provider?: string; model?: string } });
 		const requestRecords = saved.filter((record) => record.data.kind === "cache_request");
-		expect(requestRecords.slice(0, CACHE_TELEMETRY_PROVIDER_LABELS.length).map((record) => record.data.provider)).toEqual(
-			CACHE_TELEMETRY_PROVIDER_LABELS,
-		);
+		expect(
+			requestRecords.slice(0, CACHE_TELEMETRY_PROVIDER_LABELS.length).map((record) => record.data.provider),
+		).toEqual(CACHE_TELEMETRY_PROVIDER_LABELS);
 		expect(requestRecords.at(-1)?.data.provider).toMatch(/^provider-sha256:[a-f0-9]{64}$/);
 		expect(requestRecords.at(-1)?.data.model).toMatch(/^model-sha256:[a-f0-9]{64}$/);
 		expect(writer.getStats().serializationErrors).toBe(0);
@@ -525,7 +522,10 @@ describe("local cache telemetry writer", () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-cache-writer-partial-batch-"));
 		tempDirs.push(root);
 		const writer = await createLocalCacheTelemetryWriter(root);
-		const firstRequest = { ...requestRecord(), provider: "unrecognized-provider-literal" } as CacheTelemetryRequestRecord;
+		const firstRequest = {
+			...requestRecord(),
+			provider: "unrecognized-provider-literal",
+		} as CacheTelemetryRequestRecord;
 		const secondRequest = {
 			...requestRecord(),
 			requestId: "11111111111111111111111111111111",
@@ -1007,7 +1007,11 @@ describe("cache miss attribution", () => {
 		shrunk.previousCommonPrefixSegments = 2;
 		shrunk.previousSegmentCount = 3;
 		expect(classifyCacheMissComparison(shrunk)).toEqual({ kind: "messages_rewritten", reasons: [] });
-		expect(classifyCacheMissComparison(requestRecord())).toEqual({ kind: "unknown" });
+		expect(classifyCacheMissComparison(requestRecord())).toEqual({
+			kind: "wire_only_uncomparable",
+			provider: "openai",
+			model: "gpt-5.4",
+		});
 		const noPredecessor = mutableRequestRecord();
 		noPredecessor.prefixComparable = true;
 		noPredecessor.comparisonUnavailableCause = "no_predecessor";
@@ -1074,6 +1078,32 @@ describe("cache miss attribution", () => {
 		small.previousCommonPrefixSegments = 0;
 		small.previousSegmentCount = 1;
 		expect(classifyCacheMissComparison(small)).toEqual({ kind: "system_prompt_changed" });
+	});
+
+	it("distinguishes wire-only request evidence from absent comparisons", () => {
+		const wire = requestRecord();
+		const tracker = new CacheMissAttributionTracker();
+		tracker.recordRequest(wire);
+		tracker.complete(wire.requestId, 1_000);
+		expect(tracker.getLatest(1_000)).toEqual({
+			kind: "wire_only_uncomparable",
+			provider: "openai",
+			model: "gpt-5.4",
+		});
+		expect(tracker.getHealth().requestsWithoutWireTelemetry).toBe(0);
+
+		const canonical = mutableRequestRecord();
+		canonical.segments = [{ name: "system", byteLength: 10, hmacSha256: "a".repeat(64) }];
+		canonical.prefixComparable = true;
+		canonical.previousCommonPrefixSegments = 0;
+		const withCanonical = new CacheMissAttributionTracker();
+		withCanonical.recordRequest(canonical);
+		withCanonical.complete(canonical.requestId, 1_000);
+		expect(withCanonical.getLatest(1_000)).toEqual({ kind: "system_prompt_changed" });
+
+		const noEvidence = new CacheMissAttributionTracker();
+		noEvidence.complete("f".repeat(32), 1_000);
+		expect(noEvidence.getLatest(1_000)).toEqual({ kind: "unknown" });
 	});
 
 	it("joins the newest completed request's comparison to the notice, and expires it", () => {

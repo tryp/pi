@@ -3,10 +3,10 @@ import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
-	isCacheTelemetryModelLabel,
-	isCacheTelemetryProviderLabel,
 	type CacheTelemetryRecord,
 	type CacheTelemetryRequestRecord,
+	isCacheTelemetryModelLabel,
+	isCacheTelemetryProviderLabel,
 } from "@earendil-works/pi-ai";
 import type { CacheOperationObservation, CacheOperationRecord } from "./cache-operations.ts";
 
@@ -17,6 +17,7 @@ export type CacheMissAttribution =
 	| { kind: "prefix_identical_provider_side" }
 	| { kind: "prefix_unchanged_client_side"; evidence: "operations" }
 	| { kind: "comparison_truncated" }
+	| { kind: "wire_only_uncomparable"; provider?: string; model?: string }
 	| {
 			kind: "telemetry_unavailable";
 			fallbackReason: "no_request_record" | "no_operation_records" | "operation_comparison_incomplete";
@@ -28,6 +29,7 @@ export type CacheMissAttribution =
 
 interface CacheMissComparison {
 	request?: CacheTelemetryRequestRecord;
+	wireRequest?: CacheTelemetryRequestRecord;
 	operations: CacheOperationObservation[];
 	provider?: string;
 	model?: string;
@@ -85,10 +87,12 @@ export class CacheMissAttributionTracker {
 	}
 
 	recordRequest(record: CacheTelemetryRecord): void {
-		// Prefix comparisons are computed for canonical_body records; final wire records
-		// do not compare request history and cannot explain a miss.
-		if (record.kind !== "cache_request" || record.phase !== "canonical_body") return;
-		this.ensure(record.requestId).request = record;
+		if (record.kind !== "cache_request") return;
+		const comparison = this.ensure(record.requestId);
+		comparison.provider = record.provider;
+		comparison.model = record.model;
+		if (record.phase === "canonical_body") comparison.request = record;
+		else comparison.wireRequest = record;
 	}
 
 	recordOperations(
@@ -114,7 +118,7 @@ export class CacheMissAttributionTracker {
 		const comparison = this.comparisons.get(latest.requestId);
 		if (comparison?.request) return classifyCacheMissComparison(comparison.request, comparison.operations);
 		if (!comparison) return { kind: "unknown" };
-		if (!this.completedWithoutRequest.has(latest.requestId)) {
+		if (!comparison.wireRequest && !this.completedWithoutRequest.has(latest.requestId)) {
 			this.completedWithoutRequest.add(latest.requestId);
 			this.requestsWithoutWireTelemetry = Math.min(1_000_000_000, this.requestsWithoutWireTelemetry + 1);
 			while (this.completedWithoutRequest.size > MAX_TRACKED_MISS_COMPARISONS) {
@@ -125,6 +129,16 @@ export class CacheMissAttributionTracker {
 		}
 		const operationAttribution = classifyOperationOnlyComparison(comparison.operations);
 		if (operationAttribution) return operationAttribution;
+		// A wire record proves request telemetry exists, but cannot support the
+		// cross-request comparison used for prefix attribution. Keep this distinct
+		// from absent telemetry and from a request with no comparison evidence.
+		if (comparison.wireRequest) {
+			return {
+				kind: "wire_only_uncomparable",
+				...(comparison.provider ? { provider: comparison.provider } : {}),
+				...(comparison.model ? { model: comparison.model } : {}),
+			};
+		}
 		return {
 			kind: "telemetry_unavailable",
 			fallbackReason:
@@ -223,8 +237,15 @@ export function classifyCacheMissComparison(
 		request.fingerprintStatus === "unavailable" ||
 		request.comparisonUnavailableCause !== undefined ||
 		request.comparisonBasis === undefined
-	)
+	) {
+		// A final-wire-only record is evidence of a request, but lacks the
+		// canonical body required for this comparison. Canonical records that are
+		// otherwise incomplete remain unknown rather than being mislabeled wire-only.
+		if (request.phase === "final_wire_body") {
+			return { kind: "wire_only_uncomparable", provider: request.provider, model: request.model };
+		}
 		return { kind: "unknown" };
+	}
 	const segments = request.segments;
 	const common = request.previousCommonPrefixSegments;
 	const previousSegmentCount = request.previousSegmentCount;

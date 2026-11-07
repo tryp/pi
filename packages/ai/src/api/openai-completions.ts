@@ -374,6 +374,19 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
+			telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
+				provider: model.provider,
+				model: model.id,
+				phase: "canonical_body",
+				transport: "sse",
+				payloadMode: "full",
+				cacheRetention,
+				cacheKeyPresent: getCacheTelemetryDataProperty(params, "prompt_cache_key") !== undefined,
+				sessionHeaderPresent: Boolean(cacheSessionId),
+				cacheIdentityMatch: null,
+				payload: params,
+				wirePayload: serializeWirePayload(params),
+			});
 			const { data: openaiStream, response } = await retryProviderRequest(
 				() => {
 					telemetryIds = observeCacheRequestSafely(options?.cacheTelemetry, {
