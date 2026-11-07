@@ -299,6 +299,54 @@ describe("ModelRuntime auth options", () => {
 		expect(refreshSignal?.reason).toBe(reason);
 	});
 
+	it("records a setup-phase abort raised while resolving auth", async () => {
+		const controller = new AbortController();
+		const credentials = AuthStorage.inMemory({
+			"abort-oauth": { type: "oauth", access: "expired", refresh: "refresh", expires: 0 },
+		});
+		const runtime = await ModelRuntime.create({ credentials, modelsPath: null });
+		runtime.registerProvider("abort-oauth", {
+			name: "Abort OAuth",
+			baseUrl: "https://example.test/v1",
+			api: "openai-completions",
+			oauth: {
+				name: "Abort subscription",
+				login: async () => ({ access: "access", refresh: "refresh", expires: Date.now() + 60_000 }),
+				refreshToken: async () => {
+					// A local cancellation (for example a compaction aborting the run) lands
+					// mid-refresh, which is where auth resolution observes it.
+					controller.abort();
+					throw new DOMException("This operation was aborted", "AbortError");
+				},
+				getApiKey: (credential) => credential.access,
+			},
+			streamSimple: () => {
+				throw new Error("provider must not be reached");
+			},
+			models: [testModel("abort-model")],
+		});
+		const model = runtime.getModel("abort-oauth", "abort-model");
+		expect(model).toBeDefined();
+
+		const message = await runtime
+			.streamSimple(model!, { messages: [] }, { signal: controller.signal })
+			.result();
+
+		// Same shape the run ended with in the field: no content, zero usage, the raw
+		// transport wording. The point of the change is the diagnostic beside it.
+		expect(message.stopReason).toBe("error");
+		expect(message.content).toEqual([]);
+		expect(message.errorMessage).toBe("This operation was aborted");
+		const diagnostic = (message.diagnostics ?? []).find((entry) => entry.type === "provider_request_failure");
+		expect(diagnostic?.details).toMatchObject({
+			failureCode: "abort_signal",
+			phase: "setup",
+			transport: "none",
+			signalAborted: true,
+			retryVerdict: "do_not_retry",
+		});
+	});
+
 	it("does not fabricate an API key method for an extension OAuth-only provider", async () => {
 		const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null });
 		runtime.registerProvider("extension-oauth", {
