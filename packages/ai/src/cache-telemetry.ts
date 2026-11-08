@@ -619,6 +619,8 @@ export function createCacheTelemetrySession(
 	onAttemptBatch?: (
 		records: readonly CacheTelemetryRecord[],
 	) => void | boolean | Promise<void> | Promise<boolean | undefined>,
+	/** Called as each request record is built, before the response; the outcome batch is too late for attribution. */
+	onRequestRecord?: (record: CacheTelemetryRequestRecord) => void,
 ): CacheTelemetryObserver {
 	const keyEpoch = opaqueId();
 	let keyPromise: ReturnType<typeof globalThis.crypto.subtle.importKey> | undefined;
@@ -1073,6 +1075,11 @@ export function createCacheTelemetrySession(
 					const pending = pendingRequestRecords.get(attemptId) ?? [];
 					if (pending.length < 2) pending.push(record);
 					pendingRequestRecords.set(attemptId, pending);
+					try {
+						onRequestRecord?.(record);
+					} catch {
+						/* Attribution is diagnostic only and must not affect a provider request. */
+					}
 				}, true);
 				if (accepted)
 					acceptedAttempts.set(attemptId, {

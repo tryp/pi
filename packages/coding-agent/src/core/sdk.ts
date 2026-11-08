@@ -287,11 +287,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const writer = await createLocalCacheTelemetryWriter(agentDir, getCacheTelemetrySessionId);
 			cacheMissAttributionTracker = new CacheMissAttributionTracker();
 			const observer = createCacheTelemetrySession(
-				(record: CacheTelemetryRecord) => {
-					cacheMissAttributionTracker?.recordRequest(record);
-					writer.append(record);
-				},
+				(record: CacheTelemetryRecord) => writer.append(record),
 				(records: Parameters<typeof writer.appendBatch>[0]) => writer.appendBatch(records),
+				(record) => {
+					try {
+						cacheMissAttributionTracker?.recordRequest(record);
+					} catch {
+						/* Cache miss attribution is diagnostic only and must not affect a session. */
+					}
+				},
 			);
 			const recordCacheTelemetryHealth = createCacheTelemetryHealthRecorder(sessionManager);
 			disposeCacheTelemetry = async () => {
