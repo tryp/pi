@@ -1,6 +1,7 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentSession } from "../../../core/agent-session.ts";
+import { CACHE_TTL_MS } from "../../../core/cache-stats.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
 import { addUsageToTotals, createUsageTotals } from "../../../core/usage-totals.ts";
@@ -29,6 +30,21 @@ export function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
+export function formatIdleDuration(ms: number): string {
+	const totalMinutes = Math.floor(ms / 60_000);
+	if (totalMinutes < 60) return `${totalMinutes}m`;
+
+	const totalHours = Math.floor(totalMinutes / 60);
+	if (totalHours < 24) {
+		const minutes = totalMinutes % 60;
+		return minutes === 0 ? `${totalHours}h` : `${totalHours}h${String(minutes).padStart(2, "0")}m`;
+	}
+
+	const days = Math.floor(totalHours / 24);
+	const hours = totalHours % 24;
+	return hours === 0 ? `${days}d` : `${days}d${String(hours).padStart(2, "0")}h`;
+}
+
 export function formatCwdForFooter(cwd: string, home: string | undefined): string {
 	if (!home) return cwd;
 
@@ -51,10 +67,13 @@ export class FooterComponent implements Component {
 	private autoCompactEnabled = true;
 	private session: AgentSession;
 	private footerData: ReadonlyFooterDataProvider;
+	private requestRender: (() => void) | undefined;
+	private idleRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 
-	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
+	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider, requestRender?: () => void) {
 		this.session = session;
 		this.footerData = footerData;
+		this.requestRender = requestRender;
 	}
 
 	setSession(session: AgentSession): void {
@@ -78,7 +97,11 @@ export class FooterComponent implements Component {
 	 * Git watcher cleanup now handled by provider.
 	 */
 	dispose(): void {
-		// Git watcher cleanup handled by provider
+		// Git watcher cleanup handled by provider.
+		if (this.idleRefreshTimer) {
+			clearTimeout(this.idleRefreshTimer);
+			this.idleRefreshTimer = undefined;
+		}
 	}
 
 	render(width: number): string[] {
@@ -88,7 +111,18 @@ export class FooterComponent implements Component {
 		const usageTotals = createUsageTotals();
 		let latestCacheHitRate: number | undefined;
 
+		let lastActivityAt: number | undefined;
 		for (const entry of this.session.sessionManager.getEntries()) {
+			if (entry.type === "message") {
+				const messageTimestamp = entry.message.timestamp;
+				const timestamp =
+					typeof messageTimestamp === "number" && Number.isFinite(messageTimestamp)
+						? messageTimestamp
+						: Date.parse(entry.timestamp);
+				if (Number.isFinite(timestamp) && (lastActivityAt === undefined || timestamp > lastActivityAt)) {
+					lastActivityAt = timestamp;
+				}
+			}
 			if (entry.type === "message" && entry.message.role === "assistant") {
 				addUsageToTotals(usageTotals, entry.message.usage);
 
@@ -166,9 +200,29 @@ export class FooterComponent implements Component {
 			contextPercentStr = contextPercentDisplay;
 		}
 		statsParts.push(contextPercentStr);
+
+		// Time since the session was last active. The anchor is the newest message
+		// timestamp, which is the submission time for a user turn and the request
+		// start for an assistant turn, so it also approximates prompt-cache age.
+		// Hidden while a run is active (the number would claim idleness that does
+		// not exist) and below one minute (no noise right after submitting).
+		const idleMs = lastActivityAt === undefined ? undefined : Math.max(0, Date.now() - lastActivityAt);
+		let idlePart: string | undefined;
+		if (!this.session.isIdle || idleMs === undefined) {
+			this.clearIdleRefreshTimer();
+		} else {
+			this.scheduleIdleRefresh(idleMs);
+			if (idleMs >= 60_000) {
+				const idleText = `idle ${formatIdleDuration(idleMs)}`;
+				idlePart =
+					idleMs >= CACHE_TTL_MS ? theme.fg("warning", `${idleText} · cache expired`) : theme.fg("dim", idleText);
+			}
+		}
+
 		if (areExperimentalFeaturesEnabled()) {
 			statsParts.push(`${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`);
 		}
+		if (idlePart) statsParts.push(idlePart);
 
 		let statsLeft = statsParts.join(" ");
 
@@ -248,5 +302,34 @@ export class FooterComponent implements Component {
 		}
 
 		return lines;
+	}
+
+	private clearIdleRefreshTimer(): void {
+		if (this.idleRefreshTimer) {
+			clearTimeout(this.idleRefreshTimer);
+			this.idleRefreshTimer = undefined;
+		}
+	}
+
+	/**
+	 * Re-arm the idle refresh. The TUI renders only when something asks it to, so
+	 * an untouched terminal would keep showing a stale duration. One one-shot
+	 * timer aligned to the next displayed change (a minute boundary) is enough:
+	 * the render it requests re-arms the next one, and an idle pi wakes once a
+	 * minute instead of polling.
+	 */
+	private scheduleIdleRefresh(idleMs: number): void {
+		this.clearIdleRefreshTimer();
+		if (!this.requestRender) return;
+
+		const delay = idleMs < 60_000 ? 60_000 - idleMs : 60_000 - (idleMs % 60_000);
+		this.idleRefreshTimer = setTimeout(
+			() => {
+				this.idleRefreshTimer = undefined;
+				this.requestRender?.();
+			},
+			Math.max(1000, delay),
+		);
+		this.idleRefreshTimer.unref?.();
 	}
 }
