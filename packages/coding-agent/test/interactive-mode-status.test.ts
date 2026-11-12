@@ -1290,7 +1290,7 @@ describe("InteractiveMode model selection persistence", () => {
 
 		await (InteractiveMode as any).prototype.handleModelCommand.call(fakeThis, "deepseek-v4-flash");
 
-		expect(setModel).toHaveBeenCalledWith(model, { persist: true });
+		expect(setModel).toHaveBeenCalledWith(model, { persist: true, reason: "manual" });
 		expect(fakeThis.showStatus).toHaveBeenCalledWith("Default model: opencode-go/deepseek-v4-flash");
 	});
 

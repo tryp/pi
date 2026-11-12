@@ -164,7 +164,7 @@ describe("boot model refresh", () => {
 	});
 
 	it("skips and counts a refresh when the runtime is offline", async () => {
-		// No allowNetwork(): the suite runs with PI_OFFLINE=1, so the runtime cannot fetch.
+		vi.stubEnv("PI_OFFLINE", "1");
 		const fixture = await createBootFixture();
 		const sessionManager = SessionManager.inMemory();
 

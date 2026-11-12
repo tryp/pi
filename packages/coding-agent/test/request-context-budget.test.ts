@@ -86,8 +86,9 @@ describe("enforceRequestContextBudget", () => {
 	});
 
 	test("uses maxContextTokens as an absolute budget", () => {
-		const big = "y".repeat(200_000);
-		const messages = [user("prefix"), user(big)];
+		// Each message fits the explicit budget, but together they exceed it.
+		const big = "y".repeat(60_000);
+		const messages = [user("x".repeat(60_000)), user(big)];
 		const result = enforceRequestContextBudget(messages, "system", { contextWindow: 1_000_000 }, 20_000, 16_384);
 		expect(result[result.length - 1]).toBe(messages[1]);
 		expect(result.length).toBe(1);
