@@ -157,6 +157,9 @@ describe("fetchWithRetry", () => {
 	});
 
 	it("bounds sleep by the remaining timeout budget", async () => {
+		// Freeze wall-clock time: this test checks the budget calculation, not
+		// incidental milliseconds spent setting up its mocked response.
+		vi.spyOn(Date, "now").mockReturnValue(0);
 		const sleep = vi.fn(async () => {});
 		const fetchMock = vi
 			.spyOn(globalThis, "fetch")
