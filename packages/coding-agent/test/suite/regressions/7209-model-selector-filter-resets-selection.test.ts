@@ -19,6 +19,16 @@ function selectedModelId(rendered: string): string | undefined {
 	return id?.trim() || undefined;
 }
 
+/** Keep this selector test independent of models added to the runtime catalog. */
+function useFixtureModelsOnly(harness: Harness) {
+	const runtime = harness.session.modelRuntime;
+	const fixtureModels = new Set(harness.models.map(({ provider, id }) => `${provider}\0${id}`));
+	vi.spyOn(runtime, "getAvailableSnapshot").mockImplementation(() =>
+		runtime.getModels().filter(({ provider, id }) => fixtureModels.has(`${provider}\0${id}`)),
+	);
+	return runtime;
+}
+
 describe("model selector filter resets selection to top", () => {
 	const harnesses: Harness[] = [];
 
@@ -48,10 +58,11 @@ describe("model selector filter resets selection to top", () => {
 		harnesses.push(harness);
 
 		const current = harness.getModel("alpha-1")!;
+		const modelRuntime = useFixtureModelsOnly(harness);
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
 			current,
-			harness.session.modelRuntime,
+			modelRuntime,
 			[],
 			() => {},
 			() => {},
