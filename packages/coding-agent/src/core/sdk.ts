@@ -26,6 +26,7 @@ import { estimateProviderContextTokens, resolveCompactionTrigger } from "./compa
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { convertToLlm, hasProviderInputContent, isProviderUserInputMessage } from "./messages.ts";
+import { getModelChangeContextMetadata } from "./model-change-metadata.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
@@ -694,7 +695,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	} else {
 		// Save initial model and thinking level for new sessions so they can be restored on resume
 		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
+			sessionManager.appendModelChange(
+				model.provider,
+				model.id,
+				getModelChangeContextMetadata(model, settingsManager.getCompactionSettings()),
+			);
 		}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}

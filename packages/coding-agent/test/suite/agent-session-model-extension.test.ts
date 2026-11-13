@@ -89,6 +89,149 @@ describe("AgentSession model and extension characterization", () => {
 		expect(unknownChanges).toHaveLength(1);
 	});
 
+	it.each([
+		{
+			name: "openai-codex/gpt-6-luna with tier at context limit",
+			model: {
+				contextWindow: 272_000,
+				contextWindowSource: "static" as const,
+				costSource: "known" as const,
+				cost: {
+					input: 1,
+					output: 1,
+					cacheRead: 1,
+					cacheWrite: 1,
+					tiers: [{ inputTokensAbove: 272_000, input: 2, output: 2, cacheRead: 2, cacheWrite: 2 }],
+				},
+			},
+			expected: {
+				effectiveContextLimit: 272_000,
+				compactionTriggerThreshold: 239_360,
+				effectiveContextLimitSource: "cost_tier_boundary_catalog",
+				costTierClampApplied: false,
+				costTierClampFrom: null,
+				costTierClampTo: null,
+				pricingAvailability: "tiers_present",
+			},
+		},
+		{
+			name: "openai/gpt-6-luna window-only",
+			model: {
+				contextWindow: 1_050_000,
+				contextWindowSource: "backend" as const,
+				costSource: "known" as const,
+				cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+			},
+			expected: {
+				effectiveContextLimit: 1_050_000,
+				compactionTriggerThreshold: 924_000,
+				effectiveContextLimitSource: "backend_context_window",
+				costTierClampApplied: false,
+				costTierClampFrom: null,
+				costTierClampTo: null,
+				pricingAvailability: "none",
+			},
+		},
+		{
+			name: "openai-codex/gpt-6.1-terra zero-cost placeholder",
+			model: {
+				contextWindow: 500_000,
+				contextWindowSource: "backend" as const,
+				costSource: "unknown" as const,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			},
+			expected: {
+				effectiveContextLimit: 500_000,
+				compactionTriggerThreshold: 440_000,
+				effectiveContextLimitSource: "backend_context_window",
+				costTierClampApplied: false,
+				costTierClampFrom: null,
+				costTierClampTo: null,
+				pricingAvailability: "zero_cost_placeholder",
+			},
+		},
+		{
+			name: "sol-codex with tier-clamped context",
+			model: {
+				contextWindow: 500_000,
+				contextWindowSource: "static" as const,
+				costSource: "known" as const,
+				cost: {
+					input: 1,
+					output: 1,
+					cacheRead: 1,
+					cacheWrite: 1,
+					tiers: [{ inputTokensAbove: 272_000, input: 2, output: 2, cacheRead: 2, cacheWrite: 2 }],
+				},
+			},
+			expected: {
+				effectiveContextLimit: 272_000,
+				compactionTriggerThreshold: 239_360,
+				effectiveContextLimitSource: "cost_tier_boundary_catalog",
+				costTierClampApplied: true,
+				costTierClampFrom: 500_000,
+				costTierClampTo: 272_000,
+				pricingAvailability: "tiers_present",
+			},
+		},
+	])("records compaction basis fields for $name model changes", async ({ model, expected }) => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One", reasoning: true },
+				{ id: "faux-2", name: "Two", reasoning: true },
+			],
+		});
+		harnesses.push(harness);
+		const targetModel = Object.assign(harness.getModel("faux-2")!, model);
+
+		await harness.session.setModel(targetModel);
+
+		const entry = harness.sessionManager.getEntries().find((candidate) => candidate.type === "model_change");
+		expect(entry).toMatchObject(expected);
+	});
+
+	it("records a classifiable model_switch diagnostic when effective context decreases", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-1", name: "One", reasoning: true },
+				{ id: "faux-2", name: "Two", reasoning: true },
+			],
+		});
+		harnesses.push(harness);
+		Object.assign(harness.session.model!, {
+			contextWindow: 1_050_000,
+			contextWindowSource: "backend",
+			costSource: "known",
+			cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+		});
+		const smallerModel = Object.assign(harness.getModel("faux-2")!, {
+			contextWindow: 500_000,
+			contextWindowSource: "backend",
+			costSource: "known",
+			cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+		});
+
+		await harness.session.setModel(smallerModel);
+
+		const switchDiagnostic = harness.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic");
+		expect(switchDiagnostic).toMatchObject({
+			customType: "pi.session_diagnostic",
+			data: expect.objectContaining({
+				kind: "model_switch",
+				fromEffectiveContextLimit: 1_050_000,
+				toEffectiveContextLimit: 500_000,
+				fromCompactionTriggerThreshold: 924_000,
+				toCompactionTriggerThreshold: 440_000,
+				fromEffectiveContextLimitSource: "backend_context_window",
+				toEffectiveContextLimitSource: "backend_context_window",
+				fromPricingAvailability: "none",
+				toPricingAvailability: "none",
+			}),
+		});
+	});
+
 	it("does not append a model change when the effective model is unchanged", async () => {
 		const harness = await createHarness({ models: [{ id: "faux-1", name: "One", reasoning: true }] });
 		harnesses.push(harness);

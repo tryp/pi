@@ -101,6 +101,13 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	fromProvider?: string;
 	fromModelId?: string;
 	reason?: ModelChangeReason;
+	effectiveContextLimit?: number;
+	compactionTriggerThreshold?: number;
+	effectiveContextLimitSource?: "cost_tier_boundary_catalog" | "backend_context_window" | "models_dev_row" | "unknown";
+	costTierClampApplied?: boolean;
+	costTierClampFrom?: number | null;
+	costTierClampTo?: number | null;
+	pricingAvailability?: "tiers_present" | "zero_cost_placeholder" | "none";
 }
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
@@ -1573,7 +1580,17 @@ export class SessionManager {
 	appendModelChange(
 		provider: string,
 		modelId: string,
-		change?: { fromProvider: string; fromModelId: string; reason: ModelChangeReason },
+		change?: {
+			fromProvider?: string;
+			fromModelId?: string;
+			reason?: ModelChangeReason;
+			effectiveContextLimit?: number;
+			effectiveContextLimitSource?: ModelChangeEntry["effectiveContextLimitSource"];
+			costTierClampApplied?: boolean;
+			costTierClampFrom?: number | null;
+			costTierClampTo?: number | null;
+			pricingAvailability?: ModelChangeEntry["pricingAvailability"];
+		},
 	): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",

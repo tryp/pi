@@ -103,6 +103,7 @@ import {
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
+import { getModelChangeContextMetadata } from "./model-change-metadata.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
@@ -1411,6 +1412,43 @@ export class AgentSession {
 		});
 	}
 
+	private _modelChangeContextMetadata(model: Model<any>) {
+		return getModelChangeContextMetadata(model, this.settingsManager.getCompactionSettings());
+	}
+
+	private _appendModelChange(model: Model<any>, previousModel?: Model<any>, reason?: ModelChangeReason): void {
+		const nextMetadata = this._modelChangeContextMetadata(model);
+		const change = previousModel
+			? {
+					fromProvider: previousModel.provider,
+					fromModelId: previousModel.id,
+					reason: reason ?? "unknown",
+					...nextMetadata,
+				}
+			: nextMetadata;
+		this.sessionManager.appendModelChange(model.provider, model.id, change);
+		if (!previousModel) return;
+
+		const previousMetadata = this._modelChangeContextMetadata(previousModel);
+		if (previousMetadata.effectiveContextLimit > nextMetadata.effectiveContextLimit) {
+			this._appendDiagnostic({
+				kind: "model_switch",
+				fromProvider: previousModel.provider,
+				fromModel: previousModel.id,
+				toProvider: model.provider,
+				toModel: model.id,
+				fromEffectiveContextLimit: previousMetadata.effectiveContextLimit,
+				toEffectiveContextLimit: nextMetadata.effectiveContextLimit,
+				fromCompactionTriggerThreshold: previousMetadata.compactionTriggerThreshold,
+				toCompactionTriggerThreshold: nextMetadata.compactionTriggerThreshold,
+				fromEffectiveContextLimitSource: previousMetadata.effectiveContextLimitSource,
+				toEffectiveContextLimitSource: nextMetadata.effectiveContextLimitSource,
+				fromPricingAvailability: previousMetadata.pricingAvailability,
+				toPricingAvailability: nextMetadata.pricingAvailability,
+			});
+		}
+	}
+
 	private _resolveCompactionTrigger(settings: ReturnType<SettingsManager["getCompactionSettings"]>) {
 		const model = this.model;
 		const resolution = resolveCompactionTrigger(model, model?.contextWindow ?? 0, settings);
@@ -1427,11 +1465,7 @@ export class AgentSession {
 			}
 		}
 		if (resolution.reserveClampApplied) {
-			const key = JSON.stringify([
-				model?.provider ?? "unknown",
-				model?.id ?? "unknown",
-				resolution.budget,
-			]);
+			const key = JSON.stringify([model?.provider ?? "unknown", model?.id ?? "unknown", resolution.budget]);
 			if (!this._reportedReserveClampedCompactionTriggers.has(key)) {
 				this._reportedReserveClampedCompactionTriggers.add(key);
 				this._appendDiagnostic({
@@ -1440,7 +1474,13 @@ export class AgentSession {
 					provider: model?.provider,
 					model: model?.id,
 					contextWindow: resolution.contextWindow,
-					contextWindowSource: resolution.usedDefaultWindow ? "default" : (model as (Model<any> & { contextWindowSource?: "backend" | "stored" | "static" | "default" }) | undefined)?.contextWindowSource ?? "static",
+					contextWindowSource: resolution.usedDefaultWindow
+						? "default"
+						: ((
+								model as
+									| (Model<any> & { contextWindowSource?: "backend" | "stored" | "static" | "default" })
+									| undefined
+							)?.contextWindowSource ?? "static"),
 					budget: resolution.budget,
 					reserveTokens: resolution.reserveTokens,
 					effectiveReserveTokens: resolution.effectiveReserveTokens,
@@ -2472,15 +2512,7 @@ export class AgentSession {
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
 		this.agent.state.model = model;
-		if (previousModel) {
-			this.sessionManager.appendModelChange(model.provider, model.id, {
-				fromProvider: previousModel.provider,
-				fromModelId: previousModel.id,
-				reason: options.reason ?? "unknown",
-			});
-		} else {
-			this.sessionManager.appendModelChange(model.provider, model.id);
-		}
+		this._appendModelChange(model, previousModel, options.reason ?? "unknown");
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 			this._addPersistedDefaultToNonEmptyScope(model);
@@ -2547,15 +2579,7 @@ export class AgentSession {
 
 		// Apply model
 		this.agent.state.model = next.model;
-		if (currentModel) {
-			this.sessionManager.appendModelChange(next.model.provider, next.model.id, {
-				fromProvider: currentModel.provider,
-				fromModelId: currentModel.id,
-				reason: options.reason ?? "manual",
-			});
-		} else {
-			this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-		}
+		this._appendModelChange(next.model, currentModel, options.reason ?? "manual");
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 			this._addPersistedDefaultToNonEmptyScope(next.model);
@@ -2590,15 +2614,7 @@ export class AgentSession {
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
 		this.agent.state.model = nextModel;
-		if (currentModel) {
-			this.sessionManager.appendModelChange(nextModel.provider, nextModel.id, {
-				fromProvider: currentModel.provider,
-				fromModelId: currentModel.id,
-				reason: options.reason ?? "manual",
-			});
-		} else {
-			this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
-		}
+		this._appendModelChange(nextModel, currentModel, options.reason ?? "manual");
 		if (options.persist) {
 			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 			this._addPersistedDefaultToNonEmptyScope(nextModel);
