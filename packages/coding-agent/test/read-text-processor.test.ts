@@ -3,6 +3,8 @@ import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { resolveReadTextProcessor } from "../src/core/extensions/read-text-processor.ts";
+import type { ReadTextProcessor } from "../src/core/extensions/types.ts";
 import { createReadTool, MAX_READ_PROCESSOR_INPUT_BYTES, readFileBoundedSnapshot } from "../src/core/tools/read.ts";
 
 const testDirs: string[] = [];
@@ -75,6 +77,62 @@ describe("opt-in read text processor", () => {
 		const tool = createReadTool(process.cwd());
 		const result = await tool.execute("disabled", { path });
 		expect(textOf(result)).toBe("     1\tpublic\n     2\ttext\n     3\t");
+	});
+
+	it("keeps the selected processor for an in-flight read after unregistering", async () => {
+		const secret = "synthetic-in-flight-secret";
+		const path = makeFile(secret);
+		let processorStarted!: () => void;
+		let releaseProcessor!: () => void;
+		const started = new Promise<void>((resolve) => {
+			processorStarted = resolve;
+		});
+		const hold = new Promise<void>((resolve) => {
+			releaseProcessor = resolve;
+		});
+		const processor: ReadTextProcessor = async ({ text }) => {
+			processorStarted();
+			await hold;
+			return text.replace(secret, "[REDACTED]");
+		};
+		const processors = [processor];
+		const unregister = () => {
+			const index = processors.indexOf(processor);
+			if (index >= 0) processors.splice(index, 1);
+		};
+		const tool = createReadTool(process.cwd(), { getTextProcessor: () => resolveReadTextProcessor(processors) });
+
+		const inFlight = tool.execute("in-flight", { path });
+		await started;
+		unregister();
+		releaseProcessor();
+		const result = await inFlight;
+		const output = textOf(result);
+		expect(output).toContain("[REDACTED]");
+		expect(output).not.toContain(secret);
+		expect(resolveReadTextProcessor(processors)).toBeUndefined();
+
+		const optedOut = await tool.execute("after-unregister", { path });
+		expect(textOf(optedOut)).toContain(secret);
+	});
+
+	it("rejects ambiguous processor registrations without returning source text", async () => {
+		const secret = "synthetic-ambiguous-secret";
+		const path = makeFile(secret);
+		let calls = 0;
+		const first: ReadTextProcessor = ({ text }) => {
+			calls++;
+			return text.replace(secret, "[REDACTED]");
+		};
+		const second: ReadTextProcessor = ({ text }) => {
+			calls++;
+			return text;
+		};
+		const processors = [first, second];
+		const tool = createReadTool(process.cwd(), { getTextProcessor: () => resolveReadTextProcessor(processors) });
+
+		await expect(tool.execute("ambiguous", { path })).rejects.toThrow("Ambiguous read text processor configuration");
+		expect(calls).toBe(0);
 	});
 
 	it("does not emit source if the processor fails or changes newline layout", async () => {

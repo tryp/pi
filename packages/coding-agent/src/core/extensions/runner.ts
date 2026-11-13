@@ -14,6 +14,7 @@ import type { ScopedModel } from "../model-resolver.ts";
 import type { SessionManager } from "../session-manager.ts";
 import { cloneContextMessages } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
+import { resolveReadTextProcessor } from "./read-text-processor.ts";
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -501,16 +502,13 @@ export class ExtensionRunner {
 		return this.extensions.map((e) => e.path);
 	}
 
-	/** Resolve the single registered opt-in processor for one built-in read call. */
+	/**
+	 * Select the single opt-in processor when a built-in read requests it. The returned callback captures that
+	 * selection for the in-flight read; unregistering affects later reads, not one already selected. Multiple
+	 * registrations are an error rather than a plaintext fallback.
+	 */
 	getReadTextProcessor(): ReadTextProcessor | undefined {
-		const processors = this.extensions.flatMap((extension) => extension.readTextProcessors);
-		if (processors.length > 1) throw new Error("Ambiguous read text processor configuration");
-		if (processors.length === 0) return undefined;
-		const processor = processors[0];
-		return (input) => {
-			if (input.signal?.aborted) throw new Error("Read text processing aborted");
-			return processor(input);
-		};
+		return resolveReadTextProcessor(this.extensions.flatMap((extension) => extension.readTextProcessors));
 	}
 
 	/** Get all registered tools from all extensions (first registration per name wins). */
