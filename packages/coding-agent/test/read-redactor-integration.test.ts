@@ -76,6 +76,8 @@ describe.skipIf(!redactorExtension)("actual pi-redact extension with built-in re
 
 		const bounded = await tool.execute("bounded", { path, offset: 2, limit: 6, maxBytes: 48 });
 		assertNoSecret(bounded, secrets);
+		assertNoSecret(bounded.details, secrets);
+		expect(bounded.details).toMatchObject({ truncation: { truncated: true, maxBytes: 48 } });
 		expect(JSON.stringify(bounded)).not.toContain("synthetic-inner-private-material");
 
 		const [first, second] = await Promise.all([
@@ -111,8 +113,11 @@ describe.skipIf(!redactorExtension)("actual pi-redact extension with built-in re
 			type: "text",
 			text: "[REDACTED: native read requires full-input redaction support]",
 		});
+		expect(result?.details).toEqual({ synthetic: true });
+		assertNoSecret(result?.details, [secret]);
 		assertNoSecret(result, [secret]);
 	});
+
 	it("keeps opt-in behavior and processing failures fail-closed", async () => {
 		const cwd = makeDir();
 		const dir = makeDir();
