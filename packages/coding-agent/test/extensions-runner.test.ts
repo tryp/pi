@@ -9,18 +9,26 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createCacheOperationInstrumentation } from "../src/core/cache-operations.ts";
-import { createExtensionRuntime, discoverAndLoadExtensions, loadExtensions } from "../src/core/extensions/loader.ts";
+import { createEventBus } from "../src/core/event-bus.ts";
+import {
+	createExtensionRuntime,
+	discoverAndLoadExtensions,
+	loadExtensionFromFactory,
+	loadExtensions,
+} from "../src/core/extensions/loader.ts";
 import { ExtensionRunner, emitProjectTrustEvent } from "../src/core/extensions/runner.ts";
 import type {
 	ExtensionActions,
 	ExtensionContextActions,
 	ExtensionUIContext,
 	ProviderConfig,
+	ReadTextProcessor,
 } from "../src/core/extensions/types.ts";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
 import type { ScopedModel } from "../src/core/model-resolver.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { createReadTool } from "../src/core/tools/read.ts";
 
 describe("ExtensionRunner", () => {
 	let tempDir: string;
@@ -103,6 +111,97 @@ describe("ExtensionRunner", () => {
 		getSystemPrompt: () => "",
 		getScopedModels: () => [],
 	};
+
+	describe("read text processor registrations", () => {
+		it("keeps an actual API-registered processor for an in-flight read after disposal", async () => {
+			const secret = "synthetic-api-disposal-secret";
+			const filePath = path.join(tempDir, "read-processor-input.txt");
+			fs.writeFileSync(filePath, secret);
+			let processorStarted!: () => void;
+			let releaseProcessor!: () => void;
+			const started = new Promise<void>((resolve) => {
+				processorStarted = resolve;
+			});
+			const hold = new Promise<void>((resolve) => {
+				releaseProcessor = resolve;
+			});
+			const processor: ReadTextProcessor = async ({ text }) => {
+				processorStarted();
+				await hold;
+				return text.replace(secret, "[REDACTED]");
+			};
+			let disposeRegistration: (() => void) | undefined;
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					disposeRegistration = pi.registerReadTextProcessor(processor);
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<inline:read-processor-disposal>",
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const tool = createReadTool(tempDir, { getTextProcessor: () => runner.getReadTextProcessor() });
+
+			const inFlight = tool.execute("in-flight", { path: filePath });
+			await started;
+			disposeRegistration?.();
+			releaseProcessor();
+			const inFlightResult = await inFlight;
+			const inFlightText = inFlightResult.content
+				.map((item: { type: string; text?: string }) => (item.type === "text" ? item.text : ""))
+				.join("\n");
+			expect(inFlightText).toContain("[REDACTED]");
+			expect(inFlightText).not.toContain(secret);
+
+			const laterResult = await tool.execute("after-disposal", { path: filePath });
+			const laterText = laterResult.content
+				.map((item: { type: string; text?: string }) => (item.type === "text" ? item.text : ""))
+				.join("\n");
+			expect(laterText).toContain(secret);
+		});
+
+		it("rejects two actual API registrations before either processor executes", async () => {
+			const secret = "synthetic-multiple-registration-secret";
+			const filePath = path.join(tempDir, "multiple-read-processors.txt");
+			fs.writeFileSync(filePath, secret);
+			let calls = 0;
+			const makeProcessor =
+				(): ReadTextProcessor =>
+				({ text }) => {
+					calls++;
+					return text.replace(secret, "[REDACTED]");
+				};
+			const runtime = createExtensionRuntime();
+			const eventBus = createEventBus();
+			const first = await loadExtensionFromFactory(
+				(pi) => {
+					pi.registerReadTextProcessor(makeProcessor());
+				},
+				tempDir,
+				eventBus,
+				runtime,
+				"<inline:read-processor-first>",
+			);
+			const second = await loadExtensionFromFactory(
+				(pi) => {
+					pi.registerReadTextProcessor(makeProcessor());
+				},
+				tempDir,
+				eventBus,
+				runtime,
+				"<inline:read-processor-second>",
+			);
+			const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
+			const tool = createReadTool(tempDir, { getTextProcessor: () => runner.getReadTextProcessor() });
+
+			await expect(tool.execute("ambiguous", { path: filePath })).rejects.toThrow(
+				"Ambiguous read text processor configuration",
+			);
+			expect(calls).toBe(0);
+		});
+	});
 
 	describe("scopedModels", () => {
 		it("reflects the getScopedModels context action on ctx.scopedModels", async () => {
