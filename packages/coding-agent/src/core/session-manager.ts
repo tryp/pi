@@ -1586,6 +1586,7 @@ export class SessionManager {
 			reason?: ModelChangeReason;
 			effectiveContextLimit?: number;
 			effectiveContextLimitSource?: ModelChangeEntry["effectiveContextLimitSource"];
+			compactionTriggerThreshold?: number;
 			costTierClampApplied?: boolean;
 			costTierClampFrom?: number | null;
 			costTierClampTo?: number | null;
