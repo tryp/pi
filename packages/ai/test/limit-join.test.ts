@@ -286,4 +286,31 @@ describe("openai-codex discovery uses the join", () => {
 			},
 		]);
 	});
+
+	it("keeps the unknown-cost placeholder for discovered ids absent from models.dev", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					models: [
+						{
+							slug: "codex-id-not-in-models-dev-test-sentinel",
+							display_name: "Unpriced Codex Model",
+							context_window: 128_000,
+							input_modalities: ["text"],
+						},
+					],
+				}),
+				{ status: 200 },
+			),
+		);
+
+		const models = (await fetchCodexModels(context(), [])) as Model<"openai-codex-responses">[];
+		const unpriced = models[0]!;
+
+		expect(unpriced.id).toBe("codex-id-not-in-models-dev-test-sentinel");
+		expect(unpriced.costSource).toBe("unknown");
+		expect(unpriced.cost).toEqual(UNPRICED);
+		expect(unpriced.cost.tiers).toBeUndefined();
+		expect(limitJoinStats.noMatch).toBe(1);
+	});
 });
