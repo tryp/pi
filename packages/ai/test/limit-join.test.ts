@@ -287,6 +287,18 @@ describe("openai-codex discovery uses the join", () => {
 		]);
 	});
 
+	/**
+	 * Pricing-quality spot-check, retrieved from the live models.dev catalog on 2026-11-14:
+	 * - openai/gpt-6.1-terra: input/output 1/5; context tier at 272,000 is 2/7.5.
+	 * - openai/gpt-6-luna: input/output 0.1/0.5; context tier at 272,000 is 0.2/0.75.
+	 * - openai/gpt-6.1-sol: input/output 2/10; context tier at 272,000 is 4/15.
+	 * - gpt-5.6-luna, gpt-5.6-sol, and gpt-5.5 also have context-tier entries at 272,000.
+	 *
+	 * The source is models.dev's `openai` catalog, joined for Codex through the explicit
+	 * `openai-codex -> openai` alias in `limit-join.ts`. The hydrated
+	 * `packages/ai/src/providers/data/openai.json` is gitignored/generated, so this comment is
+	 * the durable provenance record for this pricing-quality check; it is not a test fixture.
+	 */
 	it("keeps the unknown-cost placeholder for discovered ids absent from models.dev", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(
 			new Response(
