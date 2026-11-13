@@ -3,7 +3,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { constants } from "fs";
-import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
+import { access as fsAccess, open as fsOpen, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { getReadmePath } from "../../config.ts";
 import { keyHint, keyText } from "../../modes/interactive/components/keybinding-hints.ts";
@@ -12,7 +12,7 @@ import { processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import { formatPathRelativeToCwdOrAbsolute } from "../../utils/paths.ts";
 import { getExperimentalToolSampling } from "../experimental.ts";
-import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { ReadTextProcessor, ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import { resolvePerCallCwd, resolveReadPathAsync, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, renderToolPath, replaceTabs, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -63,23 +63,69 @@ const COMPACT_RESOURCE_FILE_NAMES = new Set(["AGENTS.override.md", "AGENTS.md", 
 export interface ReadOperations {
 	/** Read file contents as a Buffer */
 	readFile: (absolutePath: string) => Promise<Buffer>;
+	/** Read no more than maxBytes + 1 bytes, returning undefined when the input exceeds maxBytes. */
+	readFileBounded?: (absolutePath: string, maxBytes: number) => Promise<Buffer | undefined>;
 	/** Check if file is readable (throw if not) */
 	access: (absolutePath: string) => Promise<void>;
 	/** Detect image MIME type, return null or undefined for non-images */
 	detectImageMimeType?: (absolutePath: string) => Promise<string | null | undefined>;
 }
 
+type OpenReadFile = typeof fsOpen;
+
+/** Metadata checks detect common changes; they are not an atomic snapshot guarantee. */
+export async function readFileBoundedSnapshot(
+	path: string,
+	maxBytes: number,
+	openFile: OpenReadFile = fsOpen,
+): Promise<Buffer | undefined> {
+	const file = await openFile(path, "r");
+	try {
+		const before = await file.stat({ bigint: true });
+		const chunks: Buffer[] = [];
+		let total = 0;
+		while (total <= maxBytes) {
+			const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1 - total));
+			const { bytesRead } = await file.read(chunk, 0, chunk.length, total);
+			if (bytesRead === 0) break;
+			chunks.push(chunk.subarray(0, bytesRead));
+			total += bytesRead;
+		}
+		const after = await file.stat({ bigint: true });
+		if (
+			before.dev !== after.dev ||
+			before.ino !== after.ino ||
+			before.size !== after.size ||
+			before.mtimeNs !== after.mtimeNs ||
+			before.ctimeNs !== after.ctimeNs ||
+			BigInt(total) !== before.size
+		) {
+			throw new Error("Read text input changed while being read");
+		}
+		return total > maxBytes ? undefined : Buffer.concat(chunks, total);
+	} finally {
+		await file.close();
+	}
+}
+
+const readFileBounded = (path: string, maxBytes: number) => readFileBoundedSnapshot(path, maxBytes);
+
 const defaultReadOperations: ReadOperations = {
 	readFile: (path) => fsReadFile(path),
+	readFileBounded,
 	access: (path) => fsAccess(path, constants.R_OK),
 	detectImageMimeType: detectSupportedImageMimeTypeFromFile,
 };
+
+export const MAX_READ_PROCESSOR_INPUT_BYTES = 16 * 1024 * 1024;
 
 export interface ReadToolOptions {
 	/** Whether to auto-resize images to 2000x2000 max. Default: true */
 	autoResizeImages?: boolean;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
+	/** Resolve the optional whole-text processor at call time; undefined preserves existing reads exactly. */
+	getTextProcessor?: () => ReadTextProcessor | undefined;
 }
 
 type ReadRenderArgs = { path?: string; file_path?: string; offset?: number; limit?: number };
@@ -152,6 +198,16 @@ export function byteWindow(line: string, budget: number): string {
 		}
 	}
 	return "";
+}
+
+function hasSameLineLayout(original: string, transformed: string): boolean {
+	const originalLines = original.split("\n");
+	const transformedLines = transformed.split("\n");
+	return (
+		originalLines.length === transformedLines.length &&
+		original.endsWith("\n") === transformed.endsWith("\n") &&
+		originalLines.every((line, index) => line.endsWith("\r") === transformedLines[index].endsWith("\r"))
+	);
 }
 
 function formatReadLineRange(args: ReadRenderArgs | undefined, theme: Theme): string {
@@ -385,8 +441,53 @@ export function createReadToolDefinition(
 								}
 							} else {
 								// Read text content.
-								const buffer = await ops.readFile(absolutePath);
-								const textContent = buffer.toString("utf-8");
+								const textProcessor = options?.getTextProcessor?.();
+								let buffer: Buffer;
+								if (textProcessor) {
+									if (ops !== defaultReadOperations || !ops.readFileBounded) {
+										throw new Error("Read text processing is unavailable for custom read operations");
+									}
+									let bounded: Buffer | undefined;
+									try {
+										bounded = await ops.readFileBounded(absolutePath, MAX_READ_PROCESSOR_INPUT_BYTES);
+									} catch {
+										throw new Error("Read text input could not be verified");
+									}
+									if (!bounded || bounded.byteLength > MAX_READ_PROCESSOR_INPUT_BYTES) {
+										throw new Error("Read text processor input exceeds configured limit");
+									}
+									buffer = bounded;
+								} else {
+									buffer = await ops.readFile(absolutePath);
+								}
+								if (aborted) return;
+								let textContent: string;
+								try {
+									textContent = textProcessor
+										? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer)
+										: buffer.toString("utf-8");
+								} catch {
+									throw new Error("Read text input is not valid UTF-8");
+								}
+								if (textProcessor) {
+									try {
+										const transformed = await textProcessor({
+											path: absolutePath,
+											text: textContent,
+											signal,
+										});
+										if (
+											signal?.aborted ||
+											Buffer.byteLength(transformed, "utf-8") > MAX_READ_PROCESSOR_INPUT_BYTES ||
+											!hasSameLineLayout(textContent, transformed)
+										) {
+											throw new Error("invalid read text processor output");
+										}
+										textContent = transformed;
+									} catch {
+										throw new Error("Read text processing failed");
+									}
+								}
 								const allLines = textContent.split("\n");
 								const totalFileLines = allLines.length;
 								// Apply offset if specified. Convert from 1-indexed input to 0-indexed array access.
@@ -398,7 +499,8 @@ export function createReadToolDefinition(
 								}
 								// A caller-supplied byte budget only narrows the window: the
 								// tool's contract is bounded output, so raising it is refused
-								// rather than silently clamped into a bigger context.
+								// rather than silently clamped into a bigger context. When a processor
+								// changes line lengths, the budget applies to transformed output.
 								const requestedMaxBytes = normalizeMaxBytes(maxBytes);
 								let selectedLines: string[];
 								let userLimitedLines: number | undefined;

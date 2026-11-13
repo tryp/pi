@@ -49,6 +49,7 @@ import type {
 	ProjectTrustEvent,
 	ProjectTrustEventResult,
 	ProviderConfig,
+	ReadTextProcessor,
 	RegisteredCommand,
 	RegisteredTool,
 	ReplacedSessionContext,
@@ -498,6 +499,18 @@ export class ExtensionRunner {
 
 	getExtensionPaths(): string[] {
 		return this.extensions.map((e) => e.path);
+	}
+
+	/** Resolve the single registered opt-in processor for one built-in read call. */
+	getReadTextProcessor(): ReadTextProcessor | undefined {
+		const processors = this.extensions.flatMap((extension) => extension.readTextProcessors);
+		if (processors.length > 1) throw new Error("Ambiguous read text processor configuration");
+		if (processors.length === 0) return undefined;
+		const processor = processors[0];
+		return (input) => {
+			if (input.signal?.aborted) throw new Error("Read text processing aborted");
+			return processor(input);
+		};
 	}
 
 	/** Get all registered tools from all extensions (first registration per name wins). */

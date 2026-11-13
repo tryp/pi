@@ -287,6 +287,15 @@ function createExtensionAPI(
 			extension.handlers.set(event, list);
 		},
 
+		registerReadTextProcessor(processor): () => void {
+			assertActive();
+			extension.readTextProcessors.push(processor);
+			return () => {
+				const index = extension.readTextProcessors.indexOf(processor);
+				if (index >= 0) extension.readTextProcessors.splice(index, 1);
+			};
+		},
+
 		registerTool(tool: ToolDefinition): void {
 			assertActive();
 			extension.tools.set(tool.name, {
@@ -545,6 +554,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		resolvedPath,
 		sourceInfo: createSyntheticSourceInfo(extensionPath, { source, baseDir }),
 		handlers: new Map(),
+		readTextProcessors: [],
 		tools: new Map(),
 		messageRenderers: new Map(),
 		entryRenderers: new Map(),

@@ -116,6 +116,7 @@ export type {
 	// Provider Registration
 	ProviderConfig,
 	ProviderModelConfig,
+	ReadTextProcessor,
 	ReadToolCallEvent,
 	ReadToolResultEvent,
 	// Commands

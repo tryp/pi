@@ -1330,6 +1330,18 @@ export interface ResolvedCommand extends RegisteredCommand {
 export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContext) => Promise<R | void> | R | void;
 
 /**
+ * Opt-in processor for the bounded full-text buffer of one built-in local read, invoked before any line/byte slicing.
+ * Descriptor metadata checks can detect common concurrent mutation but do not make an atomic snapshot: a same-UID
+ * writer that changes bytes while restoring metadata can evade detection. This is not a security proof or boundary.
+ * Source/output are capped at 16 MiB; output must preserve line boundaries. Errors and invalid output fail closed.
+ */
+export type ReadTextProcessor = (input: {
+	path: string;
+	text: string;
+	signal?: AbortSignal;
+}) => string | Promise<string>;
+
+/**
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
@@ -1391,6 +1403,9 @@ export interface ExtensionAPI {
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown, TState = any>(
 		tool: ToolDefinition<TParams, TDetails, TState>,
 	): void;
+
+	/** Register one opt-in processor for the built-in read tool's full per-call text snapshot. */
+	registerReadTextProcessor(processor: ReadTextProcessor): () => void;
 
 	/**
 	 * Contribute prompt guidelines for a specific tool.
@@ -1876,6 +1891,7 @@ export interface Extension {
 	hidden?: boolean;
 	sourceInfo: SourceInfo;
 	handlers: Map<string, HandlerFn[]>;
+	readTextProcessors: ReadTextProcessor[];
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
 	markdownTransformer?: MarkdownTransformer;

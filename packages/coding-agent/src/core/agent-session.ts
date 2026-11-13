@@ -3930,7 +3930,7 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages },
+					read: { autoResizeImages, getTextProcessor: () => this._extensionRunner?.getReadTextProcessor() },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
 
