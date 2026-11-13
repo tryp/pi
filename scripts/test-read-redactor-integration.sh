@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+check_only=0
+if [[ "${1:-}" == "--check-only" && $# -eq 1 ]]; then
+	check_only=1
+elif [[ $# -ne 0 ]]; then
+	printf 'Usage: %s [--check-only]\n' "$0" >&2
+	exit 2
+fi
+
 # Reviewed integration input: @spences10/pi-redact 0.0.18,
 # source commit e2966b0e3dd6c11d885acbc3f8996667dc611dd4.
 # The runtime module closure is package.json -> dist/index.js ->
@@ -10,6 +18,8 @@ set -euo pipefail
 # package-local node_modules directory is excluded: it contains test/build deps,
 # and is not in the runtime import closure. Unrelated untracked files outside
 # scope (for example .pi-subagents/) are preserved and ignored.
+# The npm gate runs test-read-redactor-gate.test.mjs first, then this script
+# once for the actual integration. --check-only runs provenance validation only.
 # Invoke via: PI_REDACTOR_WORKTREE=/path/to/reviewed/redactor \
 #   npm run test:read-redactor-integration (from packages/coding-agent).
 readonly expected_branch="wip/redact-unbounded-safe"
@@ -21,6 +31,10 @@ readonly expected_windowed_replace_sha256="a1a8124e685207cf8134fdfc399a36e243e43
 
 if [[ -z "${PI_REDACTOR_WORKTREE:-}" ]]; then
 	printf '%s\n' "PI_REDACTOR_WORKTREE is required; set it to the reviewed redactor worktree." >&2
+	exit 2
+fi
+if [[ ! -d "$PI_REDACTOR_WORKTREE" ]]; then
+	printf 'Redactor worktree path does not exist: %s\n' "$PI_REDACTOR_WORKTREE" >&2
 	exit 2
 fi
 
@@ -74,6 +88,9 @@ fi
 
 printf 'Verified @spences10/pi-redact %s at %s (%s); package and runtime closure hashes match.\n' \
 	"$actual_version" "$actual_branch" "$actual_commit"
+if [[ "$check_only" -eq 1 ]]; then
+	exit 0
+fi
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root/packages/coding-agent"
 exec env PI_REDACTOR_EXTENSION="$redactor_extension" \
