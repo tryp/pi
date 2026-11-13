@@ -5,8 +5,13 @@ set -euo pipefail
 # source commit e2966b0e3dd6c11d885acbc3f8996667dc611dd4.
 # The runtime module closure is package.json -> dist/index.js ->
 # dist/windowed-replace.js; pinned hashes below. The package imports no external
-# runtime modules. The package source/dist tree and workspace lockfiles must be
-# clean relative to the pinned commit; unrelated untracked files are ignored.
+# runtime modules. Package source/dist and workspace manifests/lockfiles must
+# match the pinned tree. Untracked files and symlinks there are rejected. The
+# package-local node_modules directory is excluded: it contains test/build deps,
+# and is not in the runtime import closure. Unrelated untracked files outside
+# scope (for example .pi-subagents/) are preserved and ignored.
+# Invoke via: PI_REDACTOR_WORKTREE=/path/to/reviewed/redactor \
+#   npm run test:read-redactor-integration (from packages/coding-agent).
 readonly expected_branch="wip/redact-unbounded-safe"
 readonly expected_commit="e2966b0e3dd6c11d885acbc3f8996667dc611dd4"
 readonly expected_version="0.0.18"
@@ -32,9 +37,27 @@ actual_version="$(node -p "require('$redactor_worktree/packages/pi-redact/packag
 actual_package_sha256="$(sha256sum "$redactor_worktree/packages/pi-redact/package.json" | cut -d ' ' -f 1)"
 actual_index_sha256="$(sha256sum "$redactor_extension" | cut -d ' ' -f 1)"
 actual_windowed_replace_sha256="$(sha256sum "$redactor_worktree/packages/pi-redact/dist/windowed-replace.js" | cut -d ' ' -f 1)"
-tracked_changes="$(git -C "$redactor_worktree" status --porcelain --untracked-files=no -- packages/pi-redact package.json pnpm-lock.yaml pnpm-workspace.yaml)"
-if [[ -n "$tracked_changes" ]]; then
-	printf '%s\n' "Tracked redactor package or dependency-lock changes found; refusing to run:" "$tracked_changes" >&2
+package_dir="$redactor_worktree/packages/pi-redact"
+package_symlink="$(find "$package_dir" -path "$package_dir/node_modules" -prune -o -type l -print -quit)"
+if [[ -n "$package_symlink" ]]; then
+	printf 'Symlink in redactor package source/dist scope; refusing to run: %s\n' "$package_symlink" >&2
+	exit 2
+fi
+scoped_changes="$(git -C "$redactor_worktree" status --porcelain --untracked-files=all -- packages/pi-redact package.json pnpm-lock.yaml pnpm-workspace.yaml)"
+if [[ -n "$scoped_changes" ]]; then
+	printf '%s\n' "Redactor package or dependency-manifest changes found; refusing to run:" "$scoped_changes" >&2
+	exit 2
+fi
+untracked_package_file=""
+while IFS= read -r -d '' package_file; do
+	relative_file="${package_file#"$redactor_worktree"/}"
+	if ! git -C "$redactor_worktree" ls-files --error-unmatch -- "$relative_file" >/dev/null 2>&1; then
+		untracked_package_file="$package_file"
+		break
+	fi
+done < <(find "$package_dir" -mindepth 1 -path "$package_dir/node_modules" -prune -o \( -type f -o -type l \) -print0)
+if [[ -n "$untracked_package_file" ]]; then
+	printf 'Untracked file in redactor package source/dist scope; refusing to run: %s\n' "$untracked_package_file" >&2
 	exit 2
 fi
 if [[ "$actual_branch" != "$expected_branch" || "$actual_commit" != "$expected_commit" || "$actual_version" != "$expected_version" || "$actual_package_sha256" != "$expected_package_sha256" || "$actual_index_sha256" != "$expected_index_sha256" || "$actual_windowed_replace_sha256" != "$expected_windowed_replace_sha256" ]]; then
