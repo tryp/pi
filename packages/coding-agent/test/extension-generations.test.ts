@@ -2,9 +2,27 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { loadExtensions, loadExtensionsWithPreImportHookForTest } from "../src/core/extensions/loader.ts";
+import type { createJiti as createJitiFunction } from "jiti/static";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { loadExtensions } from "../src/core/extensions/loader.ts";
 import type { ExtensionCommandContext } from "../src/core/extensions/types.ts";
+
+const jitiFailureInstrumentation = vi.hoisted(() => ({
+	beforeCreateJiti: undefined as (() => void) | undefined,
+}));
+
+vi.mock("jiti/static", async (importOriginal) => {
+	const actual = (await importOriginal()) as { createJiti: typeof createJitiFunction };
+	return {
+		createJiti: (...args: Parameters<typeof actual.createJiti>) => {
+			if (process.env.PI_GENERATION_MODE === "pre-import-failure") {
+				jitiFailureInstrumentation.beforeCreateJiti?.();
+				throw new Error("injected jiti setup failure");
+			}
+			return actual.createJiti(...args);
+		},
+	};
+});
 
 const isHostChild = process.env.PI_GENERATION_HOST_CHILD === "1";
 const isLinuxX64 = process.platform === "linux" && process.arch === "x64";
@@ -144,14 +162,15 @@ describe("managed extension generation loader", () => {
 		if (!readyPath) throw new Error("missing child ready path");
 		const isPreImportFailure = process.env.PI_GENERATION_MODE === "pre-import-failure";
 		let blockedDuringHook: number | undefined;
-		const loaded = isPreImportFailure
-			? await loadExtensionsWithPreImportHookForTest(entryPaths, process.cwd(), () => {
-					const lockPath = process.env.PI_GENERATION_LOCK;
-					if (!lockPath) throw new Error("missing pre-import lock path");
-					blockedDuringHook = tryExclusiveLock(lockPath);
-					throw new Error("injected pre-import failure");
-				})
-			: await loadExtensions(entryPaths, process.cwd());
+		if (isPreImportFailure) {
+			const lockPath = process.env.PI_GENERATION_LOCK;
+			if (!lockPath) throw new Error("missing pre-import lock path");
+			jitiFailureInstrumentation.beforeCreateJiti = () => {
+				blockedDuringHook = tryExclusiveLock(lockPath);
+			};
+		}
+		const loaded = await loadExtensions(entryPaths, process.cwd());
+		jitiFailureInstrumentation.beforeCreateJiti = undefined;
 		const releasedAfterHook = isPreImportFailure ? tryExclusiveLock(process.env.PI_GENERATION_LOCK ?? "") : undefined;
 		fs.writeFileSync(
 			readyPath,
@@ -451,7 +470,7 @@ describe("managed extension generation loader", () => {
 	);
 
 	it.skipIf(isHostChild || !isLinuxX64)(
-		"releases an acquired lease when a pre-import hook fails before extension execution",
+		"releases an acquired lease when jiti setup fails before extension execution",
 		async () => {
 			const root = path.join(temporaryRoot, "pre-import-failure");
 			const generation = createGeneration(
@@ -479,7 +498,7 @@ describe("managed extension generation loader", () => {
 					blockedDuringHook: number;
 					releasedAfterHook: number;
 				};
-				expect(result.errors[0]?.error).toContain("injected pre-import failure");
+				expect(result.errors[0]?.error).toContain("injected jiti setup failure");
 				expect(result.blockedDuringHook).not.toBe(0);
 				expect(result.releasedAfterHook).toBe(0);
 				expect(fs.existsSync(executed)).toBe(false);
