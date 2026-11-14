@@ -92,7 +92,8 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
     def test_unexpected_path_outside_agent_directory_is_rejected(self):
         self.cache().write_text(self.serialized_store())
         (self.home / "outside-agent.txt").write_text("not allowed")
-        self.assert_invalid()
+        with self.assertRaisesRegex(ValidationError, "HOME differs from baseline outside models-store.json"):
+            validate(self.home, self.baseline)
 
     def test_changed_permissions_are_rejected(self):
         self.cache().write_text(self.serialized_store())
