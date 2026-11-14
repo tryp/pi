@@ -5,21 +5,66 @@ release_dir=${PI_HOST_RELEASE_DIR:-}
 [ -n "$release_dir" ] || { echo "FAIL: set PI_HOST_RELEASE_DIR to an explicit immutable release directory" >&2; exit 2; }
 [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || { echo "FAIL: invalid release directory: $release_dir" >&2; exit 1; }
 release_dir=$(CDPATH= cd -- "$release_dir" && pwd -P)
-[ -f "$release_dir/.host-release.json" ] && [ ! -L "$release_dir/.host-release.json" ] && [ -f "$release_dir/SHA256SUMS" ] && [ ! -L "$release_dir/SHA256SUMS" ] || { echo "FAIL: release provenance/checksum files missing or symlinked" >&2; exit 1; }
-command -v sha256sum >/dev/null 2>&1 || { echo "FAIL: sha256sum is required" >&2; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "FAIL: node is required" >&2; exit 1; }
 expected_manifest=${PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256:-}
 case "$expected_manifest" in
 	[0-9a-fA-F][0-9a-fA-F]*) [ "${#expected_manifest}" -eq 64 ] || { echo "FAIL: expected manifest digest must be 64 hex characters" >&2; exit 2; } ;;
 	*) echo "FAIL: set PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256 to the independently supplied manifest SHA-256" >&2; exit 2 ;;
 esac
 case "$expected_manifest" in *[!0-9a-fA-F]*) echo "FAIL: expected manifest digest is not hexadecimal" >&2; exit 2;; esac
-actual_manifest=$(sha256sum "$release_dir/.host-release.json" | awk '{print $1}')
-[ "$(printf '%s' "$actual_manifest" | tr 'A-F' 'a-f')" = "$(printf '%s' "$expected_manifest" | tr 'A-F' 'a-f')" ] || { echo "FAIL: release manifest digest mismatch" >&2; exit 1; }
-[ -z "$(find "$release_dir" -type l -print -quit)" ] || { echo "FAIL: release tree contains symlinks" >&2; exit 1; }
-manifest_checksums=$(node -e 'const m=require(process.argv[1]); process.stdout.write(m.checksumsSha256 || "")' "$release_dir/.host-release.json")
-actual_checksums=$(sha256sum "$release_dir/SHA256SUMS" | awk '{print $1}')
-[ "$manifest_checksums" = "$actual_checksums" ] || { echo "FAIL: release checksum index digest mismatch" >&2; exit 1; }
-(cd "$release_dir" && sha256sum -c SHA256SUMS >/dev/null) || { echo "FAIL: release verification failed" >&2; exit 1; }
+node - "$release_dir" "$expected_manifest" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const fail = (message) => { console.error(`FAIL: ${message}`); process.exit(1); };
+const [root, expectedDigest] = process.argv.slice(2);
+const manifestPath = path.join(root, ".host-release.json");
+const sumsPath = path.join(root, "SHA256SUMS");
+const regular = (p) => { const s = fs.lstatSync(p); return s.isFile() && !s.isSymbolicLink() && s.nlink === 1; };
+try {
+  if (!regular(manifestPath) || !regular(sumsPath)) fail("release provenance/checksum files missing, linked, or not regular files");
+  const manifestBytes = fs.readFileSync(manifestPath);
+  const actualManifest = crypto.createHash("sha256").update(manifestBytes).digest("hex");
+  if (actualManifest !== expectedDigest.toLowerCase()) fail("release manifest digest mismatch");
+  const metadata = JSON.parse(manifestBytes.toString("utf8"));
+  const sumsBytes = fs.readFileSync(sumsPath);
+  const sumsDigest = crypto.createHash("sha256").update(sumsBytes).digest("hex");
+  if (metadata.checksumsSha256 !== sumsDigest) fail("release checksum index digest mismatch");
+  const expected = new Map();
+  for (const line of sumsBytes.toString("utf8").split("\n")) {
+    if (!line) continue;
+    const match = /^([0-9a-f]{64})  (\.\/.+)$/.exec(line);
+    if (!match) fail("unsafe or malformed checksum entry");
+    const rel = match[2].slice(2);
+    if (!rel || rel.includes("\\") || rel.split("/").some((part) => !part || part === "." || part === "..") || /[\x00-\x1f\x7f]/.test(rel)) fail(`unsafe checksum path: ${rel}`);
+    if (rel === ".host-release.json" || rel === "SHA256SUMS" || expected.has(rel)) fail(`duplicate or forbidden checksum path: ${rel}`);
+    expected.set(rel, match[1]);
+  }
+  const actual = new Set();
+  const walk = (dir, prefix = "") => {
+    for (const name of fs.readdirSync(dir)) {
+      const p = path.join(dir, name);
+      const rel = prefix ? `${prefix}/${name}` : name;
+      const s = fs.lstatSync(p);
+      if (s.isSymbolicLink()) fail(`release tree contains symlink: ${rel}`);
+      if (s.isDirectory()) walk(p, rel);
+      else if (s.isFile() && s.nlink === 1) actual.add(rel);
+      else fail(`release tree contains non-regular file or hardlink: ${rel}`);
+    }
+  };
+  walk(root);
+  actual.delete(".host-release.json");
+  actual.delete("SHA256SUMS");
+  if (actual.size !== expected.size || [...actual].some((rel) => !expected.has(rel))) fail("release file inventory does not exactly match checksum manifest");
+  for (const [rel, digest] of expected) {
+    const file = path.join(root, rel);
+    if (crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex") !== digest) fail(`release checksum mismatch: ${rel}`);
+  }
+} catch (error) {
+  if (error?.message?.startsWith("FAIL:")) throw error;
+  fail(`release verification failed: ${error.message}`);
+}
+NODE
 [ -x "$release_dir/dist/cli.js" ] || { echo "FAIL: release CLI missing" >&2; exit 1; }
 export TMPDIR=${TMPDIR:-"$HOME/tmp"}
 exec node "$release_dir/dist/cli.js" "$@"

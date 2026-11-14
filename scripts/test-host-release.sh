@@ -3,7 +3,12 @@
 set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/pi-host-release-test.XXXXXX")
-trap 'chmod -R u+w "$tmp" 2>/dev/null || true; rm -rf -- "$tmp"' EXIT HUP INT TERM
+cleanup() {
+	if [ -n "${legacy_fd_pid:-}" ]; then touch "$tmp/legacy-fd-stop"; wait "$legacy_fd_pid" 2>/dev/null || true; fi
+	chmod -R u+w "$tmp" 2>/dev/null || true
+	rm -rf -- "$tmp"
+}
+trap cleanup EXIT HUP INT TERM
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # Synthetic user state must remain outside the release and byte-identical.
@@ -12,6 +17,9 @@ printf 'settings sentinel\n' > "$tmp/home/.pi/agent/settings.json"
 printf 'session sentinel\n' > "$tmp/home/.pi/agent/sessions/session.jsonl"
 cp "$tmp/home/.pi/agent/settings.json" "$tmp/settings.expected"
 cp "$tmp/home/.pi/agent/sessions/session.jsonl" "$tmp/session.expected"
+sh -c 'exec 9< "$1"; : > "$2/legacy-fd-ready"; while [ ! -e "$2/legacy-fd-stop" ]; do sleep 0.1; done; cat <&9 > "$2/legacy-fd-copy"' sh "$tmp/home/.pi/agent/settings.json" "$tmp" &
+legacy_fd_pid=$!
+while [ ! -e "$tmp/legacy-fd-ready" ]; do sleep 0.1; done
 cat > "$tmp/release/dist/cli.js" <<'NODE'
 #!/usr/bin/env node
 const fs = require("node:fs");
@@ -51,7 +59,7 @@ if RESULT_FILE="$tmp/should-not-exist" PI_HOST_RELEASE_DIR="$tmp/release" PI_HOS
 	"$repo/scripts/pi-host-release" --version >"$tmp/tamper.out" 2>&1; then
 	fail "launcher accepted a modified release"
 fi
-grep -Eq 'manifest digest mismatch|checksum index digest mismatch|release verification failed' "$tmp/tamper.out"
+grep -Eq 'manifest digest mismatch|checksum index digest mismatch|release checksum mismatch|inventory does not exactly match' "$tmp/tamper.out"
 test ! -e "$tmp/should-not-exist"
 # The independently supplied digest is mandatory; a matching checksum list alone is insufficient.
 if RESULT_FILE="$tmp/no-digest" PI_HOST_RELEASE_DIR="$tmp/release" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
@@ -59,6 +67,19 @@ if RESULT_FILE="$tmp/no-digest" PI_HOST_RELEASE_DIR="$tmp/release" HOME="$tmp/ho
 	fail "launcher accepted a release without operator-provided digest"
 fi
 grep -q 'set PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256' "$tmp/no-digest.out"
+# Unlisted injected files and an independently supplied digest mismatch are rejected.
+printf 'injected module\n' > "$tmp/release/dist/injected.js"
+if RESULT_FILE="$tmp/unlisted-result" PI_HOST_RELEASE_DIR="$tmp/release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+	"$repo/scripts/pi-host-release" --version >"$tmp/unlisted.out" 2>&1; then
+	fail "launcher accepted an unlisted injected module"
+fi
+grep -q 'inventory does not exactly match' "$tmp/unlisted.out"
+rm "$tmp/release/dist/injected.js"
+if RESULT_FILE="$tmp/digest-result" PI_HOST_RELEASE_DIR="$tmp/release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$(printf '0%.0s' $(seq 1 64))" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+	"$repo/scripts/pi-host-release" --version >"$tmp/digest.out" 2>&1; then
+	fail "launcher accepted a mismatched manifest digest"
+fi
+grep -q 'manifest digest mismatch' "$tmp/digest.out"
 # A symlink cannot redirect a release payload outside its root.
 cp "$tmp/release/dist/cli.js" "$tmp/cli.expected"
 rm "$tmp/release/dist/cli.js"
@@ -67,23 +88,89 @@ if RESULT_FILE="$tmp/symlink-result" PI_HOST_RELEASE_DIR="$tmp/release" PI_HOST_
 	"$repo/scripts/pi-host-release" --version >"$tmp/symlink.out" 2>&1; then
 	fail "launcher accepted a symlink in the release"
 fi
-grep -q 'release tree contains symlinks' "$tmp/symlink.out"
+grep -q 'release tree contains symlink' "$tmp/symlink.out"
 rm "$tmp/release/dist/cli.js"
 mv "$tmp/cli.expected" "$tmp/release/dist/cli.js"
+cp "$tmp/release/dist/cli.js" "$tmp/release/dist/hardlink"
+ln "$tmp/release/dist/cli.js" "$tmp/release/dist/hardlink2"
+if PI_HOST_RELEASE_DIR="$tmp/release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+	"$repo/scripts/pi-host-release" --version >"$tmp/hardlink.out" 2>&1; then
+	fail "launcher accepted a hardlinked release file"
+fi
+grep -q 'hardlink' "$tmp/hardlink.out"
+rm "$tmp/release/dist/hardlink" "$tmp/release/dist/hardlink2"
 
-# Publisher rejects symlinks, then durably renames an ordinary staged payload.
+# Publisher rejects symlinks and hardlinks, then durably renames a valid stage.
+prepare_stage() {
+	stage=$1
+	printf 'durable payload\n' > "$stage/payload"
+	(cd "$stage" && sha256sum ./payload > SHA256SUMS)
+	checksums_digest=$(sha256sum "$stage/SHA256SUMS" | awk '{print $1}')
+	printf '{"format":1,"checksumsSha256":"%s"}\n' "$checksums_digest" > "$stage/.host-release.json"
+}
 mkdir -p "$tmp/publish-parent/.symlink-stage"
+prepare_stage "$tmp/publish-parent/.symlink-stage"
 ln -s "$tmp/cli.expected" "$tmp/publish-parent/.symlink-stage/escape"
 if python3 "$repo/scripts/publish-host-release.py" "$tmp/publish-parent/.symlink-stage" "$tmp/publish-parent/rejected" >"$tmp/publish-symlink.out" 2>&1; then
 	fail "publisher accepted a symlinked stage"
 fi
 grep -q 'symlink in release tree' "$tmp/publish-symlink.out"
 rm -rf "$tmp/publish-parent/.symlink-stage"
+mkdir "$tmp/publish-parent/.hardlink-stage"
+prepare_stage "$tmp/publish-parent/.hardlink-stage"
+ln "$tmp/publish-parent/.hardlink-stage/payload" "$tmp/publish-parent/.hardlink-stage/alias"
+if python3 "$repo/scripts/publish-host-release.py" "$tmp/publish-parent/.hardlink-stage" "$tmp/publish-parent/rejected-hardlink" >"$tmp/publish-hardlink.out" 2>&1; then
+	fail "publisher accepted a hardlinked stage"
+fi
+grep -q 'hardlink in release tree' "$tmp/publish-hardlink.out"
+rm -rf "$tmp/publish-parent/.hardlink-stage"
+mkdir "$tmp/publish-parent/.unlisted-stage"
+prepare_stage "$tmp/publish-parent/.unlisted-stage"
+printf 'injected module\\n' > "$tmp/publish-parent/.unlisted-stage/injected.js"
+if python3 "$repo/scripts/publish-host-release.py" "$tmp/publish-parent/.unlisted-stage" "$tmp/publish-parent/rejected-unlisted" >"$tmp/publish-unlisted.out" 2>&1; then
+	fail "publisher accepted an unlisted injected module"
+fi
+grep -Eq 'unlisted file|inventory does not exactly match' "$tmp/publish-unlisted.out"
+rm -rf "$tmp/publish-parent/.unlisted-stage"
 mkdir "$tmp/publish-parent/.durable-stage"
-printf 'durable payload\n' > "$tmp/publish-parent/.durable-stage/payload"
+prepare_stage "$tmp/publish-parent/.durable-stage"
 python3 "$repo/scripts/publish-host-release.py" "$tmp/publish-parent/.durable-stage" "$tmp/publish-parent/release"
 test "$(cat "$tmp/publish-parent/release/payload")" = 'durable payload'
 test ! -e "$tmp/publish-parent/.durable-stage"
+# Inject a parent fsync failure only into this test interpreter; production has no bypass.
+python3 - "$repo/scripts/publish-host-release.py" "$tmp/publish-parent/.uncertain-stage" "$tmp/publish-parent/uncertain-release" <<'PY'
+import hashlib
+import os
+import runpy
+import sys
+
+script, stage, release = sys.argv[1:]
+os.mkdir(stage)
+with open(os.path.join(stage, "payload"), "wb") as stream:
+    stream.write(b"uncertain payload\n")
+digest = hashlib.sha256(b"uncertain payload\n").hexdigest()
+checksums = f"{digest}  ./payload\n".encode()
+with open(os.path.join(stage, "SHA256SUMS"), "wb") as stream:
+    stream.write(checksums)
+with open(os.path.join(stage, ".host-release.json"), "w", encoding="utf-8") as stream:
+    stream.write('{"checksumsSha256":"' + hashlib.sha256(checksums).hexdigest() + '"}')
+original_fsync = os.fsync
+parent = os.path.dirname(release)
+def injected_fsync(fd):
+    if os.path.realpath(f"/proc/self/fd/{fd}") == parent:
+        raise OSError(5, "injected parent fsync failure")
+    return original_fsync(fd)
+os.fsync = injected_fsync
+sys.argv = [script, stage, release]
+try:
+    runpy.run_path(script, run_name="__main__")
+except SystemExit as error:
+    assert error.code == 3, error.code
+else:
+    raise AssertionError("publisher did not report committed-but-uncertain")
+assert os.path.isfile(os.path.join(release, "payload")), "rename was rolled back"
+assert not os.path.exists(stage), "stage still exists after commit"
+PY
 
 # A path collision and a concurrent publication lock both refuse without damage.
 mkdir -p "$tmp/output/existing" "$tmp/source/packages/coding-agent/install-lock"
@@ -148,4 +235,7 @@ grep -q 'synthetic npm stage failure' "$tmp/stage-failure.out" || { cat "$tmp/st
 test ! -e "$tmp/output/$release_key"
 test "$(cat "$tmp/output/existing/sentinel")" = 'release sentinel'
 test -z "$(find "$tmp/output" -maxdepth 1 -name '.*.stage.*')"
-echo "OK: launcher checksum and independent manifest digest, argument/TMPDIR/config isolation, sentinel preservation, lock/collision guards, and failed stage cleanup"
+touch "$tmp/legacy-fd-stop"
+wait "$legacy_fd_pid"
+cmp "$tmp/legacy-fd-copy" "$tmp/settings.expected"
+echo "OK: exact release inventory, manifest digest, link rejection, uncertain commit, live sentinel fd preservation, lock/collision guards, and failed stage cleanup"
