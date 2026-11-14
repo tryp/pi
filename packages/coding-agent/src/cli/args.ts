@@ -34,6 +34,7 @@ export interface Args {
 	noTools?: boolean;
 	noBuiltinTools?: boolean;
 	extensions?: string[];
+	extensionPackageReplacement?: { source: string; replacement: string };
 	noExtensions?: boolean;
 	print?: boolean;
 	export?: string;
@@ -166,6 +167,25 @@ export function parseArgs(args: string[]): Args {
 		} else if ((arg === "--extension" || arg === "-e") && i + 1 < args.length) {
 			result.extensions = result.extensions ?? [];
 			result.extensions.push(args[++i]);
+		} else if (arg === "--replace-extension-package") {
+			const source = args[i + 1];
+			const replacement = args[i + 2];
+			if (!source || source.startsWith("-") || !replacement || replacement.startsWith("-")) {
+				result.diagnostics.push({
+					type: "error",
+					message: "--replace-extension-package requires a configured source and replacement source",
+				});
+			} else {
+				if (result.extensionPackageReplacement) {
+					result.diagnostics.push({
+						type: "error",
+						message: "--replace-extension-package may only be specified once",
+					});
+				} else {
+					result.extensionPackageReplacement = { source, replacement };
+				}
+				i += 2;
+			}
 		} else if (arg === "--no-extensions" || arg === "-ne") {
 			result.noExtensions = true;
 		} else if (arg === "--skill" && i + 1 < args.length) {
@@ -245,6 +265,13 @@ export function parseArgs(args: string[]): Args {
 		}
 	}
 
+	if (result.noExtensions && result.extensionPackageReplacement) {
+		result.diagnostics.push({
+			type: "error",
+			message: "--replace-extension-package cannot be combined with --no-extensions",
+		});
+	}
+
 	return result;
 }
 
@@ -300,6 +327,8 @@ ${chalk.bold("Options:")}
                                  Applies to built-in, extension, and custom tools
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
   --extension, -e <path>         Load an extension file (can be used multiple times)
+  --replace-extension-package <source> <replacement>
+                                 Replace exactly one configured local extension package
   --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
   --skill <path>                 Load a skill file or directory (can be used multiple times)
   --no-skills, -ns               Disable skills discovery and loading

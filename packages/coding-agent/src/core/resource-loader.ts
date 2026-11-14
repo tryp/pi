@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import chalk from "chalk";
 import { CONFIG_DIR_NAME } from "../config.ts";
@@ -167,6 +167,7 @@ export interface DefaultResourceLoaderOptions {
 	additionalThemePaths?: string[];
 	extensionFactories?: InlineExtension[];
 	noExtensions?: boolean;
+	extensionPackageReplacement?: { source: string; replacement: string };
 	noSkills?: boolean;
 	noPromptTemplates?: boolean;
 	noThemes?: boolean;
@@ -205,6 +206,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private additionalThemePaths: string[];
 	private extensionFactories: InlineExtension[];
 	private noExtensions: boolean;
+	private extensionPackageReplacement?: { source: string; replacement: string };
 	private noSkills: boolean;
 	private noPromptTemplates: boolean;
 	private noThemes: boolean;
@@ -267,6 +269,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.additionalThemePaths = options.additionalThemePaths ?? [];
 		this.extensionFactories = options.extensionFactories ?? [];
 		this.noExtensions = options.noExtensions ?? false;
+		this.extensionPackageReplacement = options.extensionPackageReplacement;
+		if (this.noExtensions && this.extensionPackageReplacement) {
+			throw new Error("extensionPackageReplacement cannot be combined with noExtensions");
+		}
 		this.noSkills = options.noSkills ?? false;
 		this.noPromptTemplates = options.noPromptTemplates ?? false;
 		this.noThemes = options.noThemes ?? false;
@@ -452,8 +458,23 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
 			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
+		const replacementPaths = await this.applyConfiguredExtensionPackageReplacement(
+			resolvedPaths.extensions,
+			extensionPaths,
+		);
+		if (this.extensionPackageReplacement) {
+			for (const path of replacementPaths) {
+				if (!metadataByPath.has(path)) {
+					metadataByPath.set(path, {
+						source: this.extensionPackageReplacement.replacement,
+						scope: "temporary",
+						origin: "top-level",
+					});
+				}
+			}
+		}
 
-		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions);
+		const extensionsResult = await this.loadFinalExtensionSet(replacementPaths, preTrustExtensions);
 		for (const p of this.additionalExtensionPaths) {
 			if (isLocalPath(p)) {
 				const resolved = this.resolveResourcePath(p);
@@ -546,6 +567,67 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.loaded = true;
 	}
 
+	private canonicalPackagePath(path: string): string {
+		const resolved = resolvePath(path);
+		try {
+			return realpathSync.native(resolved);
+		} catch {
+			return resolved;
+		}
+	}
+
+	private async applyConfiguredExtensionPackageReplacement(
+		configuredResources: ResolvedResource[],
+		extensionPaths: string[],
+	): Promise<string[]> {
+		const replacement = this.extensionPackageReplacement;
+		if (!replacement) return extensionPaths;
+
+		const targetRoots = new Set(
+			[this.agentDir, join(this.cwd, CONFIG_DIR_NAME)].map((baseDir) =>
+				this.canonicalPackagePath(resolvePath(replacement.source, baseDir)),
+			),
+		);
+		const matchingRoots = new Set<string>();
+		for (const resource of configuredResources) {
+			if (
+				resource.metadata.origin !== "package" ||
+				!resource.metadata.baseDir ||
+				!isLocalPath(resource.metadata.source)
+			) {
+				continue;
+			}
+			const root = this.canonicalPackagePath(resource.metadata.baseDir);
+			if (targetRoots.has(root)) matchingRoots.add(root);
+		}
+		if (matchingRoots.size !== 1) {
+			throw new Error(
+				`--replace-extension-package expected exactly one configured local package source matching ${replacement.source}; found ${matchingRoots.size}`,
+			);
+		}
+
+		const replacedRoot = matchingRoots.values().next().value as string;
+		const legacyPaths = new Set(
+			configuredResources
+				.filter((resource) => resource.metadata.origin === "package" && resource.metadata.baseDir)
+				.filter((resource) => this.canonicalPackagePath(resource.metadata.baseDir!) === replacedRoot)
+				.map((resource) => resource.path),
+		);
+		const replacementResources = await this.packageManager.resolveExtensionSources([replacement.replacement], {
+			temporary: true,
+		});
+		const replacementPaths = replacementResources.extensions
+			.filter((resource) => resource.enabled)
+			.map((resource) => resource.path);
+		if (replacementPaths.length === 0) {
+			throw new Error(`Replacement extension package has no enabled extensions: ${replacement.replacement}`);
+		}
+		return this.mergePaths(
+			extensionPaths.filter((path) => !legacyPaths.has(path)),
+			replacementPaths,
+		);
+	}
+
 	private async loadCurrentExtensionSet(options: { includeInlineFactories: boolean }): Promise<LoadExtensionsResult> {
 		const resolvedPaths = await this.packageManager.resolve();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
@@ -556,7 +638,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
 			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
-		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus);
+		const finalExtensionPaths = await this.applyConfiguredExtensionPackageReplacement(
+			resolvedPaths.extensions,
+			extensionPaths,
+		);
+		const extensionsResult = await loadExtensionsCached(finalExtensionPaths, this.cwd, this.eventBus);
 		if (!options.includeInlineFactories) {
 			return extensionsResult;
 		}

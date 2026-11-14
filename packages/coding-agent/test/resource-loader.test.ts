@@ -31,6 +31,95 @@ describe("DefaultResourceLoader", () => {
 	});
 
 	describe("reload", () => {
+		it("replaces only the exact configured package and preserves global, project, and CLI extensions", async () => {
+			const legacy = join(tempDir, "legacy-context");
+			const managed = join(tempDir, "managed-context");
+			const globalOther = join(tempDir, "global-other");
+			const projectOther = join(tempDir, "project-other");
+			for (const root of [legacy, managed, globalOther, projectOther]) {
+				mkdirSync(join(root, "extensions"), { recursive: true });
+				const command = root.split(/[\\/]/).pop() ?? "loaded-extension";
+				writeFileSync(
+					join(root, "extensions", "index.ts"),
+					`export default function(pi) { pi.registerCommand(${JSON.stringify(command)}, { description: "loaded", handler: async () => {} }); }`,
+				);
+				writeFileSync(join(root, "package.json"), JSON.stringify({ pi: { extensions: ["extensions/index.ts"] } }));
+			}
+			const legacyAlias = join(tempDir, "legacy-context-alias");
+			symlinkSync(legacy, legacyAlias, "dir");
+			const cliExtension = join(tempDir, "cli.ts");
+			writeFileSync(cliExtension, "export default function(pi) {}");
+			const settingsManager = SettingsManager.inMemory(
+				{ packages: [legacyAlias, globalOther] },
+				{ projectTrusted: true },
+			);
+			settingsManager.setProjectPackages([legacy, { source: projectOther, extensions: ["extensions/index.ts"] }]);
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager,
+				additionalExtensionPaths: [cliExtension],
+				extensionPackageReplacement: { source: legacy, replacement: managed },
+			});
+
+			await loader.reload();
+
+			const loadedPaths = loader.getExtensions().extensions.map((extension) => extension.path);
+			expect(loadedPaths).toContain(join(managed, "extensions", "index.ts"));
+			expect(loadedPaths.filter((path) => path === join(managed, "extensions", "index.ts"))).toHaveLength(1);
+			expect(loadedPaths).not.toContain(join(legacy, "extensions", "index.ts"));
+			for (const root of [globalOther, projectOther]) {
+				expect(loadedPaths).toContain(join(root, "extensions", "index.ts"));
+			}
+			expect(loadedPaths).toContain(cliExtension);
+			for (const root of [managed, globalOther, projectOther]) {
+				const extension = loader
+					.getExtensions()
+					.extensions.find((item) => item.path === join(root, "extensions", "index.ts"));
+				expect(extension?.commands.has(root.split(/[\\/]/).pop() ?? "")).toBe(true);
+			}
+			expect(loader.getExtensions().errors).toEqual([]);
+		});
+
+		it("fails closed when the configured replacement target is absent", async () => {
+			const managed = join(tempDir, "managed-context");
+			mkdirSync(join(managed, "extensions"), { recursive: true });
+			writeFileSync(join(managed, "extensions", "index.ts"), "export default function(pi) {}");
+			writeFileSync(join(managed, "package.json"), JSON.stringify({ pi: { extensions: ["extensions/index.ts"] } }));
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager: SettingsManager.inMemory(),
+				extensionPackageReplacement: { source: join(tempDir, "missing-context"), replacement: managed },
+			});
+
+			await expect(loader.reload()).rejects.toThrow("found 0");
+		});
+
+		it("fails closed when a relative target matches both global and project packages", async () => {
+			const globalTarget = join(agentDir, "context-package");
+			const projectTarget = join(cwd, ".pi", "context-package");
+			const managed = join(tempDir, "managed-context");
+			for (const root of [globalTarget, projectTarget, managed]) {
+				mkdirSync(join(root, "extensions"), { recursive: true });
+				writeFileSync(join(root, "extensions", "index.ts"), "export default function(pi) {}");
+				writeFileSync(join(root, "package.json"), JSON.stringify({ pi: { extensions: ["extensions/index.ts"] } }));
+			}
+			const settingsManager = SettingsManager.inMemory(
+				{ packages: ["./context-package"] },
+				{ projectTrusted: true },
+			);
+			settingsManager.setProjectPackages(["./context-package"]);
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager,
+				extensionPackageReplacement: { source: "./context-package", replacement: managed },
+			});
+
+			await expect(loader.reload()).rejects.toThrow("found 2");
+		});
+
 		it("should initialize with empty results before reload", () => {
 			const loader = new DefaultResourceLoader({ cwd, agentDir });
 

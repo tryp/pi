@@ -229,6 +229,49 @@ describe("parseArgs", () => {
 			const result = parseArgs(["--extension", "./ext1.ts", "-e", "./ext2.ts"]);
 			expect(result.extensions).toEqual(["./ext1.ts", "./ext2.ts"]);
 		});
+
+		test("parses exact package replacement independently of other extension flags", () => {
+			const result = parseArgs([
+				"--replace-extension-package",
+				"/legacy/context",
+				"/managed/context",
+				"-e",
+				"./extra.ts",
+			]);
+			expect(result.extensionPackageReplacement).toEqual({
+				source: "/legacy/context",
+				replacement: "/managed/context",
+			});
+			expect(result.extensions).toEqual(["./extra.ts"]);
+			expect(result.noExtensions).toBeUndefined();
+		});
+
+		test("rejects combining selective replacement with --no-extensions", () => {
+			expect(
+				parseArgs(["--no-extensions", "--replace-extension-package", "/legacy/context", "/managed/context"])
+					.diagnostics,
+			).toContainEqual({
+				type: "error",
+				message: "--replace-extension-package cannot be combined with --no-extensions",
+			});
+		});
+
+		test("reports missing or duplicate package replacement options", () => {
+			expect(parseArgs(["--replace-extension-package", "/legacy/context"]).diagnostics).toContainEqual({
+				type: "error",
+				message: "--replace-extension-package requires a configured source and replacement source",
+			});
+			expect(
+				parseArgs([
+					"--replace-extension-package",
+					"/legacy/a",
+					"/managed/a",
+					"--replace-extension-package",
+					"/legacy/b",
+					"/managed/b",
+				]).diagnostics,
+			).toContainEqual({ type: "error", message: "--replace-extension-package may only be specified once" });
+		});
 	});
 
 	describe("--no-extensions flag", () => {
