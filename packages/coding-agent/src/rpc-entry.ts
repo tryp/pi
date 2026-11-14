@@ -1,13 +1,12 @@
 #!/usr/bin/env node
-import { APP_NAME } from "./config.ts";
-import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
-import { main } from "./main.ts";
+import { getManagedRuntimeRoot, runManagedRuntime } from "./runtime-bootstrap.ts";
 
-process.title = `${APP_NAME}-rpc`;
-process.env.PI_CODING_AGENT = "true";
-process.env.AI_AGENT = "pi";
-process.emitWarning = (() => {}) as typeof process.emitWarning;
-
-configureHttpDispatcher();
-
-main(["--mode", "rpc", ...process.argv.slice(2)]);
+process.env.PI_RPC_MODE = "1";
+const rpcArgs = ["--mode", "rpc", ...process.argv.slice(2)];
+const generationRoot = getManagedRuntimeRoot(import.meta.url);
+if (generationRoot) {
+	process.exitCode = await runManagedRuntime(generationRoot, rpcArgs, import.meta.url);
+} else {
+	process.argv = [process.argv[0] ?? process.execPath, process.argv[1] ?? "", ...rpcArgs];
+	await import("./runtime-entry.js");
+}

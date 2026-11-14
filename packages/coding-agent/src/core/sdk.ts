@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
+import { assertManagedRuntimeLease } from "../runtime-bootstrap.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, ContextGuardError } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
@@ -258,6 +259,7 @@ export function enforceRequestContextBudget(
 }
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	assertManagedRuntimeLease();
 	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));

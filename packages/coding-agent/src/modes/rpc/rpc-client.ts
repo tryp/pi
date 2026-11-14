@@ -11,6 +11,7 @@ import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
+import { getRuntimeLeaseDescriptor } from "../../runtime-bootstrap.ts";
 import type { JsonAgentSessionEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
@@ -91,10 +92,15 @@ export class RpcClient {
 			args.push(...this.options.args);
 		}
 
+		const stdio: (number | "pipe")[] = ["pipe", "pipe", "pipe"];
+		const leaseFd = getRuntimeLeaseDescriptor();
+		if (leaseFd !== undefined) stdio.push(leaseFd);
+		const childEnv = { ...process.env, ...this.options.env };
+		if (leaseFd !== undefined) childEnv.PI_RUNTIME_LEASE_FD = "3";
 		const childProcess = spawn("node", [cliPath, ...args], {
 			cwd: this.options.cwd,
-			env: { ...process.env, ...this.options.env },
-			stdio: ["pipe", "pipe", "pipe"],
+			env: childEnv,
+			stdio,
 		});
 		this.process = childProcess;
 

@@ -1,5 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { assertManagedRuntimeLease } from "../runtime-bootstrap.ts";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
@@ -417,6 +418,7 @@ export async function createAgentSessionRuntime(
 		sessionStartEvent?: SessionStartEvent;
 	},
 ): Promise<AgentSessionRuntime> {
+	assertManagedRuntimeLease();
 	assertSessionCwdExists(options.sessionManager, options.cwd);
 	const result = await createRuntime(options);
 	return new AgentSessionRuntime(

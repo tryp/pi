@@ -7,6 +7,7 @@ import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import { truncateToVisualLines } from "../../modes/interactive/components/visual-truncate.ts";
 import { theme } from "../../modes/interactive/theme/theme.ts";
+import { getRuntimeLeaseDescriptor } from "../../runtime-bootstrap.ts";
 import { waitForChildProcess } from "../../utils/child-process.ts";
 import {
 	getShellConfig,
@@ -152,11 +153,21 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			}
 
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
+			const stdio: (number | "ignore" | "pipe")[] = [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"];
+			const leaseFd = getRuntimeLeaseDescriptor();
+			if (leaseFd !== undefined) stdio.push(leaseFd);
+			const childEnv = { ...(env ?? getShellEnv()) };
+			if (leaseFd !== undefined) {
+				childEnv.PI_RUNTIME_MANAGED = "1";
+				childEnv.PI_RUNTIME_GENERATION_ROOT = process.env.PI_RUNTIME_GENERATION_ROOT;
+				childEnv.PI_RUNTIME_GENERATION = process.env.PI_RUNTIME_GENERATION;
+				childEnv.PI_RUNTIME_LEASE_FD = "3";
+			}
 			const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
 				cwd,
 				detached: process.platform !== "win32",
-				env: env ?? getShellEnv(),
-				stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
+				env: childEnv,
+				stdio,
 				windowsHide: true,
 			});
 			if (commandFromStdin) {

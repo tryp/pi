@@ -3,6 +3,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { getRuntimeLeaseDescriptor } from "../runtime-bootstrap.ts";
 import { waitForChildProcess } from "../utils/child-process.ts";
 
 /**
@@ -38,10 +39,14 @@ export async function execCommand(
 	options?: ExecOptions,
 ): Promise<ExecResult> {
 	return new Promise((resolve) => {
+		const stdio: (number | "ignore" | "pipe")[] = ["ignore", "pipe", "pipe"];
+		const leaseFd = getRuntimeLeaseDescriptor();
+		if (leaseFd !== undefined) stdio.push(leaseFd);
 		const proc = spawn(command, args, {
 			cwd,
 			shell: false,
-			stdio: ["ignore", "pipe", "pipe"],
+			stdio,
+			env: leaseFd === undefined ? undefined : { ...process.env, PI_RUNTIME_LEASE_FD: "3" },
 		});
 
 		let stdout = "";

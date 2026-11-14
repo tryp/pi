@@ -25,6 +25,7 @@ import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.ts";
 // NOTE: This import works because loader.ts exports are NOT re-exported from index.ts,
 // avoiding a circular dependency. Extensions can import from @earendil-works/pi-coding-agent.
 import * as _bundledPiCodingAgent from "../../index.ts";
+import { assertManagedRuntimeLease } from "../../runtime-bootstrap.ts";
 import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
@@ -500,6 +501,21 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 }
 
 async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
+	assertManagedRuntimeLease();
+	const runtimeGeneration = process.env.PI_RUNTIME_GENERATION;
+	if (runtimeGeneration) {
+		const loaderPath = fs.realpathSync(fileURLToPath(import.meta.url));
+		const relativeLoaderPath = path.relative(runtimeGeneration, loaderPath);
+		if (
+			relativeLoaderPath === ".." ||
+			relativeLoaderPath.startsWith(`..${path.sep}`) ||
+			path.isAbsolute(relativeLoaderPath)
+		) {
+			throw new Error(
+				`Extension loader ${loaderPath} is outside pinned runtime generation ${runtimeGeneration}; refusing extension imports`,
+			);
+		}
+	}
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
 		if (cachedFactory) {
