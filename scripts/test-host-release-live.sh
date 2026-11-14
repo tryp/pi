@@ -145,21 +145,13 @@ addon_source_sha=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).add
 # env -i must remove any inherited provider key from invocations other than
 # model listing; the fake key is injected only into that offline invocation.
 "${clean_env[@]}" sh -c 'test -z "${ANTHROPIC_API_KEY+x}"' || fail "clean CLI environment retained ANTHROPIC_API_KEY"
-for arg in --version --help; do
-  output="$tmp/cli-${arg#--}.out"
-  "${clean_env[@]}" PI_HOST_RELEASE_DIR="$release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" \
-    "$tmp/reviewed-source/scripts/pi-host-release" "$arg" > "$output" 2>&1 || { cat "$output" >&2; fail "real assembled CLI $arg failed"; }
-done
-models_store="$tmp/home/.pi/agent/models-store.json"
-[[ ! -e "$models_store" && ! -L "$models_store" ]] || fail "models-store.json existed before offline model listing"
-"${clean_env[@]}" ANTHROPIC_API_KEY=pi-offline-test-key PI_HOST_RELEASE_DIR="$release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" \
-  "$tmp/reviewed-source/scripts/pi-host-release" --offline --list-models > "$tmp/cli-list-models.out" 2>&1 || { cat "$tmp/cli-list-models.out" >&2; fail "real assembled CLI --offline --list-models failed"; }
-grep -Fq "$version" "$tmp/cli-version.out" || fail "real CLI --version did not report assembled artifact version"
-grep -Eqi 'usage|pi' "$tmp/cli-help.out" || fail "real CLI --help output did not contain help text"
-if ! bash "$tmp/reviewed-source/scripts/check-model-table.sh" "$tmp/cli-list-models.out"; then
-  cat "$tmp/cli-list-models.out" >&2
-  fail "offline --list-models did not produce a model table"
-fi
+mkdir -p "$tmp/cli-checks"
+"${clean_env[@]}" bash "$tmp/reviewed-source/scripts/run-host-release-cli-checks.sh" \
+  "$tmp/reviewed-source/scripts/pi-host-release" "$release" "$manifest_digest" "$version" "$tmp/cli-checks" || fail "isolated real CLI startup checks failed"
+# Retain the expected output names for the tamper/integrity diagnostic below.
+cp "$tmp/cli-checks/cli-version.out" "$tmp/cli-version.out"
+cp "$tmp/cli-checks/cli-help.out" "$tmp/cli-help.out"
+cp "$tmp/cli-checks/cli-list.out" "$tmp/cli-list-models.out"
 [[ $(sha256sum "$release/dist/cli.js" | awk '{print $1}') == "$expected_cli_sha" ]] || fail "assembled CLI bytes changed during startup checks"
 [[ $(sha256sum "$release/SHA256SUMS" | awk '{print $1}') == "$expected_sums_sha" ]] || fail "assembled release checksum inventory changed during startup checks"
 
@@ -195,10 +187,8 @@ cmp "$tmp/home/.pi/agent/settings.json" "$tmp/legacy-expected/settings.json"
 cmp "$tmp/home/.pi/agent/sessions/sentinel.jsonl" "$tmp/legacy-expected/sessions/sentinel.jsonl"
 cmp "$tmp/home/.pi/agent/db/sentinel.sqlite" "$tmp/legacy-expected/db/sentinel.sqlite"
 
-# The initial snapshot must not contain the cache. Offline listing may create
-# only that exact path; the helper compares every other entry and validates its
-# catalog schema without adopting post-run state into the expected snapshot.
-python3 "$tmp/reviewed-source/scripts/validate_host_release_home.py" "$tmp/home" "$tmp/initial-home" || fail "offline model listing changed unexpected HOME state or created an invalid cache"
+# None of the CLI invocations may touch the shared legacy sentinel HOME.
+python3 "$tmp/reviewed-source/scripts/validate_host_release_home.py" --no-cache "$tmp/home" "$tmp/initial-home" || fail "CLI startup changed the shared legacy sentinel HOME"
 [[ ! -e "$release/.pi" ]] || fail "release created user state under its own tree"
 touch "$tmp/legacy-stop"
 wait "$legacy_pid"

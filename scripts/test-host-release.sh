@@ -402,3 +402,30 @@ test "$(wc -l < "$tmp/gate-git.log")" -ge 3 || fail "live gate test did not obse
 if grep -q '^unguarded$' "$tmp/gate-git.log"; then fail "live gate issued Git without GIT_NO_LAZY_FETCH=1"; fi
 test ! -e "$tmp/lazy-fetch-sentinel" || fail "live gate contacted promisor helper for missing required blob"
 echo "OK: exact release inventory, manifest digest, link rejection, uncertain commit, live sentinel fd preservation, lock/collision guards, failed stage cleanup, and guarded gate-wide promisor source materialization"
+
+# Exercise the exact version/help/list sequence through the real isolation helper.
+# Each synthetic CLI startup writes a cache, reproducing the cache-before-list
+# failure while proving each invocation starts from its own clean baseline.
+cat > "$tmp/sequence-cli" <<'EOF_SEQUENCE'
+#!/bin/sh
+set -eu
+case "$*" in
+  --version) printf 'pi 1.2.3\n' ;;
+  --help) printf 'Usage: pi\n' ;;
+  '--offline --list-models')
+    [ "${ANTHROPIC_API_KEY:-}" = pi-offline-test-key ] || exit 31
+    printf 'provider  model  context  max-out  thinking  images\nfixture  model  1K  100  no  no\n'
+    ;;
+  *) exit 32 ;;
+esac
+[ "$*" = '--offline --list-models' ] || [ -z "${ANTHROPIC_API_KEY:-}" ] || exit 33
+mkdir -p "$HOME/.pi/agent"
+printf '{"fixture-provider":{"models":[{"id":"fixture","name":"Fixture","api":"fixture-api"}]}}\n' > "$HOME/.pi/agent/models-store.json"
+EOF_SEQUENCE
+chmod +x "$tmp/sequence-cli"
+mkdir -p "$tmp/sequence-output"
+bash "$repo/scripts/run-host-release-cli-checks.sh" "$tmp/sequence-cli" "$tmp/release" "$(printf '0%.0s' $(seq 1 64))" 1.2.3 "$tmp/sequence-output" || fail "isolated real CLI invocation sequence failed"
+test "$(grep -c '^pi 1.2.3' "$tmp/sequence-output/cli-version.out")" -eq 1 || fail "version fixture was not run"
+grep -q '^Usage: pi' "$tmp/sequence-output/cli-help.out" || fail "help fixture was not run"
+grep -q '^provider  model' "$tmp/sequence-output/cli-list.out" || fail "offline listing fixture was not run"
+echo "OK: version/help/list each used a fresh baseline; synthetic startup cache was causal and the offline key was scoped to listing"
