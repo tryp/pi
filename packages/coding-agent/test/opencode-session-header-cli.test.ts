@@ -104,6 +104,7 @@ describe("OpenCode session header CLI integration", () => {
 			).toBe(0);
 			expect(requests).toHaveLength(2);
 			expect(sessionHeaderValues).toHaveLength(2);
+			expect(sessionHeaderValues.every((value) => value.length > 0)).toBe(true);
 			expect(sessionHeaderValues[0] === sessionHeaderValues[1]).toBe(true);
 			expect(requests).toEqual([
 				{ method: "POST", path: "/v1/messages", sessionHeaderPresent: true },
