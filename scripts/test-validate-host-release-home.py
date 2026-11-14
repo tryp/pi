@@ -26,6 +26,22 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
             (path / ".pi/agent/sessions/sentinel.jsonl").write_text("session\n")
             (path / ".pi/agent/db/sentinel.sqlite").write_bytes(b"db sentinel")
 
+    @staticmethod
+    def serialized_store():
+        # Match a real FileModelsStore write: provider -> ModelsStoreEntry -> Model.
+        return json.dumps({"fixture-provider": {"models": [{
+            "id": "fixture-model",
+            "name": "Fixture Model",
+            "api": "openai-completions",
+            "provider": "fixture-provider",
+            "baseUrl": "https://example.test/v1",
+            "reasoning": False,
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000,
+            "maxTokens": 100,
+        }], "checkedAt": 1}})
+
     def cache(self):
         return self.home / ".pi/agent/models-store.json"
 
@@ -34,9 +50,7 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
             validate(self.home, self.baseline)
 
     def test_full_end_of_gate_acceptance_preserves_legacy_sentinels_and_cache(self):
-        self.cache().write_text(json.dumps({"fixture-provider": {"models": [
-            {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
-        ]}}))
+        self.cache().write_text(self.serialized_store())
         validate(self.home, self.baseline)
         self.assertEqual((self.home / ".pi/agent/settings.json").read_text(), "{}\n")
         self.assertEqual((self.home / ".pi/agent/sessions/sentinel.jsonl").read_text(), "session\n")
@@ -66,30 +80,27 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
 
     def test_symlink_cache_is_rejected(self):
         target = self.home / "outside.json"
-        target.write_text(json.dumps({"fixture-provider": {"models": [
-            {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
-        ]}}))
+        target.write_text(self.serialized_store())
         self.cache().symlink_to(target)
         self.assert_invalid()
 
     def test_unexpected_other_path_is_rejected(self):
-        self.cache().write_text(json.dumps({"fixture-provider": {"models": [
-            {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
-        ]}}))
+        self.cache().write_text(self.serialized_store())
         (self.home / ".pi/agent/unexpected.txt").write_text("not allowed")
         self.assert_invalid()
 
+    def test_unexpected_path_outside_agent_directory_is_rejected(self):
+        self.cache().write_text(self.serialized_store())
+        (self.home / "outside-agent.txt").write_text("not allowed")
+        self.assert_invalid()
+
     def test_changed_permissions_are_rejected(self):
-        self.cache().write_text(json.dumps({"fixture-provider": {"models": [
-            {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
-        ]}}))
+        self.cache().write_text(self.serialized_store())
         (self.home / ".pi/agent/settings.json").chmod(0o600)
         self.assert_invalid()
 
     def test_modified_legacy_path_is_rejected(self):
-        self.cache().write_text(json.dumps({"fixture-provider": {"models": [
-            {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
-        ]}}))
+        self.cache().write_text(self.serialized_store())
         (self.home / ".pi/agent/sessions/sentinel.jsonl").write_text("modified session\\n")
         self.assert_invalid()
 
