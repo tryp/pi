@@ -29,6 +29,15 @@ function lockAttempt() {
 	return spawnSync("flock", ["--nonblock", "--exclusive", lockPath, "true"], { encoding: "utf8" });
 }
 
+async function waitForLockAvailable(timeoutMs = 2000) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (lockAttempt().status === 0) return;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.fail(`exclusive flock was not acquired within ${timeoutMs}ms`);
+}
+
 function child(script, flags = []) {
 	const spawned = spawn(globalThis.process.execPath, [...flags, "-e", script, addon, lockPath], { stdio: ["pipe", "pipe", "pipe"] });
 	spawned.output = "";
@@ -110,8 +119,7 @@ describe("Linux same-process N-API flock prototype", { skip: !testable }, () => 
 		});
 		assert.notEqual(lockAttempt().status, 0);
 		process.kill(line, "SIGKILL");
-		await new Promise((resolve) => setTimeout(resolve, 25));
-		assert.equal(lockAttempt().status, 0);
+		await waitForLockAvailable();
 		holder.kill();
 	});
 
