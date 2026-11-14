@@ -45,16 +45,10 @@ cleanup() {
   rm -rf -- "$tmp"
 }
 trap cleanup EXIT HUP INT TERM
-mkdir -p "$tmp/home/.pi/agent/sessions" "$tmp/home/.pi/agent/db" "$tmp/output" "$tmp/npm-cache" "$tmp/reviewed-source"
-# Materialize and execute the harness from the exact pinned archive. Attach the
-# original commit object metadata so the reviewed builder can verify clean HEAD
-# and independently archive that same commit for its private build stage.
-git -C "$source_dir" archive --format=tar "$commit" | tar -xf - -C "$tmp/reviewed-source"
-git -C "$tmp/reviewed-source" init -q
-git -C "$tmp/reviewed-source" fetch -q --no-tags "$source_dir" "$commit"
-git -C "$tmp/reviewed-source" update-ref refs/heads/reviewed "$commit"
-git -C "$tmp/reviewed-source" symbolic-ref HEAD refs/heads/reviewed
-git -C "$tmp/reviewed-source" read-tree "$commit"
+mkdir -p "$tmp/home/.pi/agent/sessions" "$tmp/home/.pi/agent/db" "$tmp/output" "$tmp/npm-cache"
+# Recreate only the pinned commit/tree/blobs from the local object store and
+# exact archive. Do not fetch unrelated history or allow lazy network fetches.
+"$repo/scripts/materialize-host-release-source.sh" "$source_dir" "$commit" "$tree" "$tmp/reviewed-source"
 verify_archive_blobs() {
   python3 - "$source_dir" "$tmp/reviewed-source" "$commit" <<'PY'
 import hashlib

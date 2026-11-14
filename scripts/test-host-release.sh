@@ -265,4 +265,41 @@ test -z "$(find "$tmp/output" -maxdepth 1 -name '.*.stage.*')"
 touch "$tmp/legacy-fd-stop"
 wait "$legacy_fd_pid"
 cmp "$tmp/legacy-fd-copy" "$tmp/settings.expected"
-echo "OK: exact release inventory, manifest digest, link rejection, uncertain commit, live sentinel fd preservation, lock/collision guards, and failed stage cleanup"
+
+# Regress the live-gate source materializer against a shallow-like repository:
+# its pinned commit/tree/blobs exist, but its unrelated parent object is absent.
+mkdir -p "$tmp/partial-source"
+printf 'parent source\n' > "$tmp/partial-source/source.txt"
+git -C "$tmp/partial-source" init -q
+git -C "$tmp/partial-source" -c user.name=fixture -c user.email=fixture@example.invalid add source.txt
+git -C "$tmp/partial-source" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm parent
+parent_commit=$(git -C "$tmp/partial-source" rev-parse HEAD)
+printf 'pinned source\n' > "$tmp/partial-source/source.txt"
+git -C "$tmp/partial-source" add source.txt
+git -C "$tmp/partial-source" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm pinned
+pinned_commit=$(git -C "$tmp/partial-source" rev-parse HEAD)
+pinned_tree=$(git -C "$tmp/partial-source" rev-parse HEAD^{tree})
+parent_object="$tmp/partial-source/.git/objects/$(printf '%s' "$parent_commit" | cut -c1-2)/$(printf '%s' "$parent_commit" | cut -c3-)"
+test -f "$parent_object"
+rm -f "$parent_object"
+if GIT_NO_LAZY_FETCH=1 git -C "$tmp/partial-source" cat-file -e "$parent_commit^{commit}" 2>/dev/null; then
+	fail "synthetic source still contains unrelated parent object"
+fi
+"$repo/scripts/materialize-host-release-source.sh" "$tmp/partial-source" "$pinned_commit" "$pinned_tree" "$tmp/materialized-source"
+test "$(git -C "$tmp/materialized-source" rev-parse HEAD)" = "$pinned_commit"
+test "$(git -C "$tmp/materialized-source" rev-parse HEAD^{tree})" = "$pinned_tree"
+test "$(git -C "$tmp/materialized-source" branch --show-current)" = reviewed
+test "$(cat "$tmp/materialized-source/source.txt")" = 'pinned source'
+if GIT_NO_LAZY_FETCH=1 git -C "$tmp/materialized-source" cat-file -e "$parent_commit^{commit}" 2>/dev/null; then
+	fail "materialized source copied unrelated parent history"
+fi
+[ -z "$(git -C "$tmp/materialized-source" status --porcelain=v1)" ] || fail "materialized source is dirty"
+required_blob=$(git -C "$tmp/partial-source" rev-parse "$pinned_commit:source.txt")
+required_blob_object="$tmp/partial-source/.git/objects/$(printf '%s' "$required_blob" | cut -c1-2)/$(printf '%s' "$required_blob" | cut -c3-)"
+test -f "$required_blob_object"
+rm -f "$required_blob_object"
+if "$repo/scripts/materialize-host-release-source.sh" "$tmp/partial-source" "$pinned_commit" "$pinned_tree" "$tmp/missing-blob-source" >"$tmp/missing-blob.out" 2>&1; then
+	fail "materializer accepted a missing required pinned blob"
+fi
+grep -q 'cannot archive pinned commit from locally available objects' "$tmp/missing-blob.out" || { cat "$tmp/missing-blob.out" >&2; fail "missing required blob did not fail at source archive"; }
+echo "OK: exact release inventory, manifest digest, link rejection, uncertain commit, live sentinel fd preservation, lock/collision guards, failed stage cleanup, and pinned source/history/object validation"
