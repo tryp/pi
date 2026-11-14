@@ -103,12 +103,10 @@ PY
 }
 verify_archive_blobs
 printf '{}\n' > "$tmp/home/.pi/agent/settings.json"
-# Synthetic, non-secret API key enables the built-in Anthropic catalog without
-# any provider requests; PI_OFFLINE keeps model discovery local.
-printf '{"anthropic":{"type":"api_key","key":"offline-test-key-not-real"}}\n' > "$tmp/home/.pi/agent/auth.json"
 printf 'legacy session sentinel\n' > "$tmp/home/.pi/agent/sessions/sentinel.jsonl"
 printf 'legacy database sentinel\n' > "$tmp/home/.pi/agent/db/sentinel.sqlite"
 cp -a "$tmp/home/.pi/agent" "$tmp/legacy-expected"
+[[ ! -e "$tmp/home/.pi/agent/auth.json" ]] || fail "isolated HOME unexpectedly contains auth.json"
 (
   exec 9< "$tmp/home/.pi/agent/settings.json"
   printf '%s\n' "$BASHPID" > "$tmp/legacy-pid"
@@ -141,12 +139,15 @@ addon_source_sha=$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).add
 [[ $(sha256sum "$tmp/reviewed-source/packages/coding-agent/src/native/flock-lease.cc" | awk '{print $1}') == "$addon_source_sha" ]] || fail "addon source provenance does not match pinned source archive"
 [[ $(sha256sum "$release/dist/native/linux-x64/flock_lease.node" | awk '{print $1}') == "$addon_sha" ]] || fail "assembled addon does not match pinned manifest provenance"
 
+# env -i must remove any inherited provider key from invocations other than
+# model listing; the fake key is injected only into that offline invocation.
+"${clean_env[@]}" sh -c 'test -z "${ANTHROPIC_API_KEY+x}"' || fail "clean CLI environment retained ANTHROPIC_API_KEY"
 for arg in --version --help; do
   output="$tmp/cli-${arg#--}.out"
   "${clean_env[@]}" PI_HOST_RELEASE_DIR="$release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" \
     "$tmp/reviewed-source/scripts/pi-host-release" "$arg" > "$output" 2>&1 || { cat "$output" >&2; fail "real assembled CLI $arg failed"; }
 done
-"${clean_env[@]}" PI_HOST_RELEASE_DIR="$release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" \
+"${clean_env[@]}" ANTHROPIC_API_KEY=pi-offline-test-key PI_HOST_RELEASE_DIR="$release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" \
   "$tmp/reviewed-source/scripts/pi-host-release" --offline --list-models > "$tmp/cli-list-models.out" 2>&1 || { cat "$tmp/cli-list-models.out" >&2; fail "real assembled CLI --offline --list-models failed"; }
 grep -Fq "$version" "$tmp/cli-version.out" || fail "real CLI --version did not report assembled artifact version"
 grep -Eqi 'usage|pi' "$tmp/cli-help.out" || fail "real CLI --help output did not contain help text"
