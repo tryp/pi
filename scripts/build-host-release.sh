@@ -126,8 +126,8 @@ fs.writeFileSync(path.join(stage, ".host-release.json"), JSON.stringify(metadata
 NODE
 (cd "$stage" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 # Make the completed payload read-only before its single atomic, no-clobber rename.
-find "$stage" -type f -exec chmod 0444 {} +
-find "$stage" -type d -exec chmod 0555 {} +
+find "$stage" -type f -exec chmod a-w {} +
+find "$stage" -type d -exec chmod a-w {} +
 [ ! -e "$release_dir" ] && [ ! -L "$release_dir" ] || fail "release appeared during build; refusing overwrite: $release_dir"
 python3 "$script_dir/publish-host-release.py" "$stage" "$release_dir" || fail "atomic no-clobber release publication failed"
 stage=

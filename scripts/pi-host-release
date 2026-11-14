@@ -7,7 +7,7 @@ release_dir=${PI_HOST_RELEASE_DIR:-}
 release_dir=$(CDPATH= cd -- "$release_dir" && pwd -P)
 [ -f "$release_dir/.host-release.json" ] && [ -f "$release_dir/SHA256SUMS" ] || { echo "FAIL: release provenance/checksum files missing" >&2; exit 1; }
 command -v sha256sum >/dev/null 2>&1 || { echo "FAIL: sha256sum is required" >&2; exit 1; }
-(cd "$release_dir" && sha256sum -c SHA256SUMS) || { echo "FAIL: release verification failed" >&2; exit 1; }
+(cd "$release_dir" && sha256sum -c SHA256SUMS >/dev/null) || { echo "FAIL: release verification failed" >&2; exit 1; }
 [ -x "$release_dir/dist/cli.js" ] || { echo "FAIL: release CLI missing" >&2; exit 1; }
 export TMPDIR=${TMPDIR:-"$HOME/tmp"}
 exec node "$release_dir/dist/cli.js" "$@"
