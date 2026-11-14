@@ -10,11 +10,17 @@ node --test packages/coding-agent/test/native/flock-lease.test.mjs
 
 Set `NODE_INCLUDE_DIR` if headers are not in `/usr/include/node` or `/usr/local/include/node`. The test compiles temporary `.node` addons and removes them afterward. The tests include foreign-addon external rejection, excess-argument rejection, forced GC while a handle is reachable and after it becomes unreachable, symlink/hard-link rejection, fork-only descriptor inheritance, and fork-plus-exec close-on-exec behavior.
 
-## Packaging is not enabled
+## Optional local packaging prototype
 
-Do not load this prototype from the extension loader. It is not wired into the package build, bundle, published files, or deployment artifact. Inspection of `packages/coding-agent/package.json` shows the normal build is TypeScript plus an esbuild JS bundle; `files` ships `dist`, but there is no addon build step. `scripts/deploy-runtime.sh` copies `dist` and validates JS entrypoints only. `scripts/build-binaries.sh` supports linux-x64 and linux-arm64 for Bun executables and explicitly copies existing native modules for other features, but has no Node addon build/copy step; its release workflow builds on ubuntu-latest and cross-targets Bun binaries. The npm package is platform-generic and declares `node >=22.19.0`; the N-API prototype has only been compiled and exercised on Linux x64 with local Node 26.2.0 headers, targeting Node-API 8. Node-API ABI stability does not provide OS/architecture artifacts or prove Bun compatibility.
+This artifact is not wired into the extension loader and does not make managed extension loading use leases. The normal build remains platform-independent and does not compile native code. For an explicit local Linux x64 build and stage, run `make deploy NATIVE_EXTENSION_LEASE=1`; this compiles only at build time and stages `native/linux-x64/flock_lease.node` plus a manifest. The manifest records Node-API 8, target, source SHA-256, and artifact SHA-256; staging and load verification reject missing, altered, or incompatible artifacts. The loader is not enabled, so there is no unleased fallback path to close yet.
 
-Packaging and loader integration are therefore blocked. No managed-loader failure behavior was added or claimed: only direct missing-addon `require()` failure is tested. Before loader routing, establish a Node-only target policy (at minimum decide Linux x64 and arm64 coverage), build per-architecture prebuilt `.node` artifacts on matching Linux CI runners using Node-API 8 and the oldest supported Node headers, verify the glibc baseline and Node 22/latest runtimes, include those artifacts in npm `dist` and the staged runtime, and add artifact-presence/load smoke gates. Do not compile native code in a live runtime or silently fall back to an unleased managed import. If non-Linux or Bun hosts are in scope, separately prove support or fail managed loading there. Missing/incompatible artifacts must produce an explicit fail-closed error in the eventual loader.
+The build target intentionally rejects non-Linux or non-x64 hosts. It does not claim arm64, macOS, Windows, or Bun support. Node-API 8 is compiled against local Node headers; the addon was exercised with Node 26.2.0, while the project runtime floor is Node >=22.19.0. This prototype has not established an oldest-Node test matrix or a portable glibc floor: the compiled artifact may require the glibc version of its build host or newer. Keep it local-only until matching CI builds verify supported Node versions and an explicit glibc baseline. Never compile native code at live startup or silently fall back to an unleased managed import.
+
+Packaging regression test (Linux x64 with Node headers and g++):
+
+```sh
+node --test scripts/native-extension-lease.test.mjs
+```
 
 ## Lock-path trust assumptions and limits
 

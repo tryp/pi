@@ -187,6 +187,10 @@ npm install --prefix "$stage" --no-save --ignore-scripts grok-mermaid@0.2.2
 test -f "$stage/node_modules/grok-mermaid/package.json" || fail "grok-mermaid runtime dependency missing from stage"
 
 rsync -a --delete "$source_dir/packages/coding-agent/dist/" "$stage/dist/"
+if [ "${NATIVE_EXTENSION_LEASE:-0}" = 1 ]; then
+	node "$source_dir/scripts/native-extension-lease.mjs" stage \
+		"$source_dir/packages/coding-agent/native-build/linux-x64" "$stage"
+fi
 mkdir -p "$stage/node_modules/@earendil-works/pi-telemetry"
 rsync -a --delete "$source_dir/packages/telemetry/dist/" \
 	"$stage/node_modules/@earendil-works/pi-telemetry/dist/"
