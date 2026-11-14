@@ -1,9 +1,16 @@
-import { basename, dirname, isAbsolute, relative, resolve as resolvePath, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { constants } from "fs";
-import { access as fsAccess, open as fsOpen, readFile as fsReadFile } from "fs/promises";
+import {
+	access as fsAccess,
+	copyFile as fsCopyFile,
+	mkdtemp as fsMkdtemp,
+	open as fsOpen,
+	readFile as fsReadFile,
+	rm as fsRm,
+} from "fs/promises";
 import { type Static, Type } from "typebox";
 import { getReadmePath } from "../../config.ts";
 import { keyHint, keyText } from "../../modes/interactive/components/keybinding-hints.ts";
@@ -71,40 +78,78 @@ export interface ReadOperations {
 	detectImageMimeType?: (absolutePath: string) => Promise<string | null | undefined>;
 }
 
-type OpenReadFile = typeof fsOpen;
-
-/** Metadata checks detect common changes; they are not an atomic snapshot guarantee. */
+/**
+ * Make a private CoW clone before reading opt-in processor input. This backend is deliberately
+ * pinned to the audited Linux Node/libuv implementation; it is not a public Node API guarantee.
+ */
 export async function readFileBoundedSnapshot(
 	path: string,
 	maxBytes: number,
-	openFile: OpenReadFile = fsOpen,
+	copyFile: typeof fsCopyFile = fsCopyFile,
 ): Promise<Buffer | undefined> {
-	const file = await openFile(path, "r");
+	if (process.platform !== "linux" || process.versions.node !== "26.2.0" || process.versions.uv !== "1.52.1") {
+		throw new Error("Reliable read text snapshots are unavailable on this runtime");
+	}
+	const source = await fsOpen(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	let tempDir: string | undefined;
 	try {
-		const before = await file.stat({ bigint: true });
-		const chunks: Buffer[] = [];
-		let total = 0;
-		while (total <= maxBytes) {
-			const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1 - total));
-			const { bytesRead } = await file.read(chunk, 0, chunk.length, total);
-			if (bytesRead === 0) break;
-			chunks.push(chunk.subarray(0, bytesRead));
-			total += bytesRead;
+		const sourceStat = await source.stat();
+		if (!sourceStat.isFile()) throw new Error("Read text input is not a regular file");
+		if (sourceStat.size > maxBytes) return undefined;
+
+		const parent = dirname(path);
+		const parentStat = await fsOpen(parent, constants.O_RDONLY | constants.O_DIRECTORY);
+		try {
+			const stat = await parentStat.stat();
+			if (!stat.isDirectory() || ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0)) {
+				throw new Error("Secure read snapshot temporary storage is unavailable");
+			}
+		} finally {
+			await parentStat.close();
 		}
-		const after = await file.stat({ bigint: true });
-		if (
-			before.dev !== after.dev ||
-			before.ino !== after.ino ||
-			before.size !== after.size ||
-			before.mtimeNs !== after.mtimeNs ||
-			before.ctimeNs !== after.ctimeNs ||
-			BigInt(total) !== before.size
-		) {
-			throw new Error("Read text input changed while being read");
+
+		tempDir = await fsMkdtemp(join(parent, ".pi-read-snapshot-"));
+		const tempStat = await fsOpen(tempDir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+		try {
+			const stat = await tempStat.stat();
+			if (!stat.isDirectory() || (stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()) {
+				throw new Error("Secure read snapshot temporary storage is unavailable");
+			}
+		} finally {
+			await tempStat.close();
 		}
-		return total > maxBytes ? undefined : Buffer.concat(chunks, total);
+
+		// libuv reopens this procfs descriptor path, not the user pathname, so path replacement
+		// after open cannot switch the source inode. The audited FORCE path issues Linux FICLONE.
+		const clonedPath = join(tempDir, "snapshot");
+		await copyFile(
+			`/proc/self/fd/${source.fd}`,
+			clonedPath,
+			constants.COPYFILE_FICLONE_FORCE | constants.COPYFILE_EXCL,
+		);
+
+		const clone = await fsOpen(clonedPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		try {
+			const cloneStat = await clone.stat();
+			if (!cloneStat.isFile()) throw new Error("Read text snapshot is not a regular file");
+			if (cloneStat.size > maxBytes) return undefined;
+			const chunks: Buffer[] = [];
+			let total = 0;
+			while (total <= maxBytes) {
+				const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1 - total));
+				const { bytesRead } = await clone.read(chunk, 0, chunk.length, total);
+				if (bytesRead === 0) break;
+				chunks.push(chunk.subarray(0, bytesRead));
+				total += bytesRead;
+			}
+			if (total !== cloneStat.size) throw new Error("Read text snapshot could not be verified");
+			return total > maxBytes ? undefined : Buffer.concat(chunks, total);
+		} finally {
+			await clone.close();
+		}
 	} finally {
-		await file.close();
+		await source.close();
+		if (tempDir) await fsRm(tempDir, { recursive: true, force: true });
 	}
 }
 

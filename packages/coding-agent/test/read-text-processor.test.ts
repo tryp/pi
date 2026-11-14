@@ -1,7 +1,7 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { open } from "node:fs/promises";
+import { closeSync, mkdtempSync, openSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { resolveReadTextProcessor } from "../src/core/extensions/read-text-processor.ts";
 import type { ReadTextProcessor } from "../src/core/extensions/types.ts";
@@ -103,7 +103,17 @@ describe("opt-in read text processor", () => {
 		const tool = createReadTool(process.cwd(), { getTextProcessor: () => resolveReadTextProcessor(processors) });
 
 		const inFlight = tool.execute("in-flight", { path });
-		await started;
+		const processorEntered = await Promise.race([
+			started.then(() => true),
+			inFlight.then(
+				() => false,
+				() => false,
+			),
+		]);
+		if (!processorEntered) {
+			await expect(inFlight).rejects.toThrow("Read text input could not be verified");
+			return;
+		}
 		unregister();
 		releaseProcessor();
 		const result = await inFlight;
@@ -149,28 +159,54 @@ describe("opt-in read text processor", () => {
 		}
 	});
 
-	it("rejects a detectable in-place mutation during bounded input acquisition", async () => {
-		const secret = "synthetic-secret-mutation";
+	it("clones the opened inode despite path replacement and removes the private clone", async () => {
+		const original = "synthetic-original-secret";
+		const replacement = "synthetic-replacement-secret";
+		const path = makeFile(original);
+		const snapshot = await readFileBoundedSnapshot(path, 1024, async (source, destination, mode) => {
+			const replacementPath = `${path}.replacement`;
+			writeFileSync(replacementPath, replacement);
+			renameSync(replacementPath, path);
+			await copyFile(source, destination, mode);
+		});
+		expect(snapshot?.toString()).toBe(original);
+		expect(readdirSync(dirname(path))).toEqual(["input.txt"]);
+	});
+
+	it("fails closed on unsupported reflink and removes raw temporary data", async () => {
+		const secret = "synthetic-secret-no-snapshot";
 		const path = makeFile(secret);
-		let mutated = false;
-		const openWithMutation = (async (filePath: string, flags: string) => {
-			const file = await open(filePath, flags);
-			const originalRead = file.read.bind(file);
-			return Object.assign(file, {
-				read: async (...args: Parameters<typeof file.read>) => {
-					const result = await originalRead(...args);
-					if (!mutated) {
-						mutated = true;
-						writeFileSync(path, "replacement-secret");
-					}
-					return result;
-				},
-			});
-		}) as Parameters<typeof readFileBoundedSnapshot>[2];
-		await expect(readFileBoundedSnapshot(path, 1024, openWithMutation)).rejects.toThrow(
-			"Read text input changed while being read",
-		);
-		expect(mutated).toBe(true);
+		await expect(
+			readFileBoundedSnapshot(path, 1024, async () => {
+				throw Object.assign(new Error("reflink unsupported"), { code: "EOPNOTSUPP" });
+			}),
+		).rejects.toThrow("reflink unsupported");
+		expect(readdirSync(dirname(path))).toEqual(["input.txt"]);
+	});
+
+	it("keeps an in-place write coherent while taking a reflink snapshot", async () => {
+		const size = 4 * 1024 * 1024;
+		const first = Buffer.alloc(size, 0x41);
+		const second = Buffer.alloc(size, 0x42);
+		const path = makeFile("x".repeat(size));
+		writeFileSync(path, first);
+		const fd = openSync(path, "r+");
+		const writing = (async () => {
+			for (let index = 0; index < 40; index++) {
+				const data = index % 2 === 0 ? second : first;
+				if (writeSync(fd, data, 0, data.length, 0) !== data.length) throw new Error("short test write");
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+		})();
+		try {
+			const snapshot = await readFileBoundedSnapshot(path, size);
+			expect(snapshot).not.toBeUndefined();
+			expect(snapshot?.equals(first) || snapshot?.equals(second)).toBe(true);
+		} finally {
+			await writing;
+			rmSync(path, { force: true });
+			closeSync(fd);
+		}
 	});
 
 	it("fails closed when bounded input is invalid UTF-8", async () => {
