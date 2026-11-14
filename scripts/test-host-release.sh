@@ -100,6 +100,33 @@ fi
 grep -q 'hardlink' "$tmp/hardlink.out"
 rm "$tmp/release/dist/hardlink" "$tmp/release/dist/hardlink2"
 
+# A fake CLI that mimics version/help and rehashes its tree still cannot pass
+# with the independently captured original manifest digest.
+cp -a "$tmp/release" "$tmp/fake-release"
+chmod -R u+w "$tmp/fake-release"
+cat > "$tmp/fake-release/dist/cli.js" <<EOF
+#!/usr/bin/env node
+require("node:fs").writeFileSync(process.env.RESULT_FILE, "pi 1.0.0\nUsage: pi\n");
+EOF
+chmod +x "$tmp/fake-release/dist/cli.js"
+(cd "$tmp/fake-release" && find . -type f ! -name SHA256SUMS ! -name .host-release.json -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+node - "$tmp/fake-release" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const root = process.argv[2];
+const manifestPath = path.join(root, ".host-release.json");
+const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+manifest.checksumsSha256 = crypto.createHash("sha256").update(fs.readFileSync(path.join(root, "SHA256SUMS"))).digest("hex");
+fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+NODE
+if RESULT_FILE="$tmp/fake-cli-ran" PI_HOST_RELEASE_DIR="$tmp/fake-release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+  "$repo/scripts/pi-host-release" --version > "$tmp/fake-release.out" 2>&1; then
+  fail "launcher accepted a rehashed fake CLI"
+fi
+grep -q 'manifest digest mismatch' "$tmp/fake-release.out"
+test ! -e "$tmp/fake-cli-ran"
+
 # Publisher rejects symlinks and hardlinks, then durably renames a valid stage.
 prepare_stage() {
 	stage=$1
