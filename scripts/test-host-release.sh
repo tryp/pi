@@ -309,6 +309,28 @@ if GIT_NO_LAZY_FETCH=1 git -C "$tmp/materialized-source" cat-file -e "$parent_co
 	fail "materialized source copied unrelated parent history"
 fi
 [ -z "$(git -C "$tmp/materialized-source" status --porcelain=v1)" ] || fail "materialized source is dirty"
+# Archive attributes must not transform bytes or omit files when the materializer
+# claims to reproduce the pinned tree's blob identities.
+mkdir -p "$tmp/attributes-source"
+git -C "$tmp/attributes-source" init -q
+cat > "$tmp/attributes-source/.gitattributes" <<'EOF'
+*.bat text eol=crlf
+substitution.txt export-subst
+ignored.txt export-ignore
+EOF
+printf 'line one\nline two\n' > "$tmp/attributes-source/pi-test.bat"
+printf 'ignored source\n' > "$tmp/attributes-source/ignored.txt"
+printf '%s\n' 'format $Format:%H$' > "$tmp/attributes-source/substitution.txt"
+git -C "$tmp/attributes-source" -c user.name=fixture -c user.email=fixture@example.invalid add .
+git -C "$tmp/attributes-source" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm attributes
+attributes_commit=$(git -C "$tmp/attributes-source" rev-parse HEAD)
+attributes_tree=$(git -C "$tmp/attributes-source" rev-parse HEAD^{tree})
+"$repo/scripts/materialize-host-release-source.sh" "$tmp/attributes-source" "$attributes_commit" "$attributes_tree" "$tmp/materialized-attributes"
+for file in .gitattributes pi-test.bat ignored.txt substitution.txt; do
+	blob=$(git -C "$tmp/attributes-source" rev-parse "$attributes_commit:$file")
+	git -C "$tmp/attributes-source" cat-file blob "$blob" > "$tmp/expected-blob"
+	cmp "$tmp/materialized-attributes/$file" "$tmp/expected-blob"
+done
 required_blob=$(git -C "$tmp/partial-source" rev-parse "$pinned_commit:source.txt")
 required_blob_object="$tmp/partial-source/.git/objects/$(printf '%s' "$required_blob" | cut -c1-2)/$(printf '%s' "$required_blob" | cut -c3-)"
 test -f "$required_blob_object"
@@ -316,7 +338,7 @@ rm -f "$required_blob_object"
 if env GIT_NO_LAZY_FETCH=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_LAZY_FETCH_SENTINEL="$tmp/lazy-fetch-sentinel" "PATH=$tmp/promisor-bin:$PATH" "$repo/scripts/materialize-host-release-source.sh" "$tmp/partial-source" "$pinned_commit" "$pinned_tree" "$tmp/missing-blob-source" >"$tmp/missing-blob.out" 2>&1; then
 	fail "materializer accepted a missing required pinned blob"
 fi
-grep -q 'cannot archive pinned commit from locally available objects' "$tmp/missing-blob.out" || { cat "$tmp/missing-blob.out" >&2; fail "missing required blob did not fail at source archive"; }
+grep -q 'required pinned blob unavailable locally' "$tmp/missing-blob.out" || { cat "$tmp/missing-blob.out" >&2; fail "missing required blob did not fail closed"; }
 test ! -e "$tmp/lazy-fetch-sentinel" || fail "materializer contacted promisor helper for missing required blob"
 # Exercise the actual gate through its preflight, archive verification setup,
 # and failing materialization. A git wrapper asserts the guard is exported on
@@ -341,7 +363,7 @@ if env -u GIT_NO_LAZY_FETCH "PATH=$tmp/gate-bin:$tmp/promisor-bin:$PATH" "GIT_GU
 	"$repo/scripts/test-host-release-live.sh" --source-commit "$pinned_commit" --source-tree "$pinned_tree" --source-dir "$tmp/partial-source" >"$tmp/live-gate-git.out" 2>&1; then
 	fail "live gate unexpectedly passed with a required pinned blob missing"
 fi
-grep -q 'cannot archive pinned commit from locally available objects' "$tmp/live-gate-git.out" || { cat "$tmp/live-gate-git.out" >&2; fail "live gate did not fail on missing required pinned blob"; }
+grep -q 'required pinned blob unavailable locally' "$tmp/live-gate-git.out" || { cat "$tmp/live-gate-git.out" >&2; fail "live gate did not fail on missing required pinned blob"; }
 test "$(wc -l < "$tmp/gate-git.log")" -ge 3 || fail "live gate test did not observe all expected source Git operations"
 if grep -q '^unguarded$' "$tmp/gate-git.log"; then fail "live gate issued Git without GIT_NO_LAZY_FETCH=1"; fi
 test ! -e "$tmp/lazy-fetch-sentinel" || fail "live gate contacted promisor helper for missing required blob"
