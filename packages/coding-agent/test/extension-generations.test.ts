@@ -334,18 +334,28 @@ describe("managed extension generation loader", () => {
 	);
 
 	it.skipIf(isHostChild || !isLinuxX64)(
-		"marked extensions fail closed without an addon and release after import/factory errors",
+		"marked extensions retain leases after import/factory errors and fail closed without an addon",
 		async () => {
 			const missingRoot = path.join(temporaryRoot, "missing-addon");
 			const errorRoot = path.join(temporaryRoot, "error-extension");
-			createGeneration(missingRoot, "generation-a", { "index.js": "export default () => {};" }, ["index.js"]);
+			const missingGeneration = createGeneration(
+				missingRoot,
+				"generation-a",
+				{ "index.js": "export default () => {};" },
+				["index.js"],
+			);
 			createManagedRoot(missingRoot, "generation-a", ["index.js"]);
 			const errorGeneration = createGeneration(
 				errorRoot,
 				"generation-a",
 				{
-					"index.js": "throw new Error('module boom');",
-					"factory.js": "export default () => { throw new Error('factory boom'); };",
+					"index.js": "setTimeout(() => import('./lazy-module.js'), 300); throw new Error('module boom');",
+					"lazy-module.js":
+						"import { writeFileSync } from 'node:fs'; writeFileSync(process.env.PI_GENERATION_MODULE_LAZY, 'imported');",
+					"factory.js":
+						"export default (api) => { api.on('session_start', () => {}); setTimeout(() => import('./lazy-factory.js'), 500); throw new Error('factory boom'); };",
+					"lazy-factory.js":
+						"import { writeFileSync } from 'node:fs'; writeFileSync(process.env.PI_GENERATION_FACTORY_LAZY, 'imported');",
 				},
 				["index.js", "factory.js"],
 			);
@@ -366,6 +376,13 @@ describe("managed extension generation loader", () => {
 			expect(missingResult.errors[0]?.error).toContain("lease addon is missing");
 			const missingExit = await waitForExit(missingChild.child);
 			expect(missingExit.code).toBe(0);
+			expect(
+				tryCollect(
+					path.join(missingGeneration, ".lease.lock"),
+					missingGeneration,
+					path.join(missingRoot, "collected-before-import"),
+				),
+			).toBe(0);
 
 			const errorReady = path.join(temporaryRoot, "error-ready.json");
 			const errorStop = path.join(temporaryRoot, "error-stop");
@@ -378,6 +395,8 @@ describe("managed extension generation loader", () => {
 				PI_GENERATION_INVOKE: path.join(temporaryRoot, "unused-invoke"),
 				PI_GENERATION_FINISHED: path.join(temporaryRoot, "unused-finished"),
 				PI_GENERATION_STOP: errorStop,
+				PI_GENERATION_MODULE_LAZY: path.join(temporaryRoot, "module-lazy-imported"),
+				PI_GENERATION_FACTORY_LAZY: path.join(temporaryRoot, "factory-lazy-imported"),
 			});
 			try {
 				await waitForHostFile(errorReady, errorChild);
@@ -395,7 +414,20 @@ describe("managed extension generation loader", () => {
 						errorGeneration,
 						path.join(errorRoot, "collected"),
 					),
-				).toBe(0);
+				).not.toBe(0);
+				const moduleLazyPath = path.join(temporaryRoot, "module-lazy-imported");
+				const factoryLazyPath = path.join(temporaryRoot, "factory-lazy-imported");
+				await waitForFile(moduleLazyPath);
+				await waitForFile(factoryLazyPath);
+				expect(fs.readFileSync(moduleLazyPath, "utf8")).toBe("imported");
+				expect(fs.readFileSync(factoryLazyPath, "utf8")).toBe("imported");
+				expect(
+					tryCollect(
+						path.join(errorGeneration, ".lease.lock"),
+						errorGeneration,
+						path.join(errorRoot, "collected-after-lazy-import"),
+					),
+				).not.toBe(0);
 				fs.writeFileSync(errorStop, "done");
 				const errorExit = await waitForExit(errorChild.child);
 				expect(errorExit.code).toBe(0);

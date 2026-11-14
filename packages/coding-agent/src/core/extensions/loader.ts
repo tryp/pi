@@ -500,7 +500,11 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 	);
 }
 
-async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
+async function loadExtensionModule(
+	extensionPath: string,
+	cacheToken?: ExtensionCacheToken,
+	onExecutionPossible?: () => void,
+) {
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
 		if (cachedFactory) {
@@ -520,6 +524,8 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 				: { alias: getAliases() }),
 	});
 
+	// From this point, module code or dependencies may execute before import settles.
+	onExecutionPossible?.();
 	const module = await jiti.import(extensionPath, { default: true });
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
@@ -586,14 +592,17 @@ async function loadExtension(
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const discoveredPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 	let managedLease: ReturnType<typeof acquireManagedExtension>;
+	let extensionCodeMayHaveExecuted = false;
 
 	try {
 		managedLease = acquireManagedExtension(discoveredPath);
 		const resolvedPath = managedLease?.entryPath ?? discoveredPath;
-		const factory = await loadExtensionModule(resolvedPath, managedLease ? undefined : cacheToken);
+		const factory = await loadExtensionModule(resolvedPath, managedLease ? undefined : cacheToken, () => {
+			extensionCodeMayHaveExecuted = true;
+		});
 		time(`${extensionPath} module import`, "extensions");
 		if (!factory) {
-			managedLease?.releaseOnFailure();
+			if (!extensionCodeMayHaveExecuted) managedLease?.releaseOnFailure();
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
 
@@ -601,7 +610,7 @@ async function loadExtension(
 
 		return { extension, error: null };
 	} catch (err) {
-		managedLease?.releaseOnFailure();
+		if (!extensionCodeMayHaveExecuted) managedLease?.releaseOnFailure();
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}

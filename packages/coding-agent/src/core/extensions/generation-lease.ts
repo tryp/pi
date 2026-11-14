@@ -20,8 +20,8 @@ const addonDirectories = configuredAddonDirectory
 
 type NativeLease = { acquire(path: string): object; release(handle: object): void };
 type LeaseState = { handle: object; references: number };
-// Successful-generation references stay held until process exit. Runtime reload does not prove
-// old extension callbacks, detached async work, or lazy imports have quiesced.
+// References stay held until process exit once extension import begins, even if import or factory
+// initialization fails: escaped timers, callbacks, and lazy imports cannot be proven quiescent.
 const leases = new Map<string, LeaseState>();
 
 function readJson(filePath: string): Record<string, unknown> {
@@ -178,6 +178,7 @@ export function acquireManagedExtension(
 	let released = false;
 	return {
 		entryPath: resolvedEntry,
+		// Only safe before any extension code can execute. Callers must retain after starting import.
 		releaseOnFailure() {
 			if (released) return;
 			released = true;
