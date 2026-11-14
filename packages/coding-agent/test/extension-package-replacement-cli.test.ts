@@ -171,20 +171,100 @@ describe("extension package replacement CLI", () => {
 			child.stderr.on("data", (chunk: Buffer) => {
 				output += chunk.toString();
 			});
+			const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise) => {
+				child.once("close", (code, signal) => resolvePromise({ code, signal }));
+			});
 			const lockPath = join(generation, ".lease.lock");
+			let timeout: ReturnType<typeof setTimeout> | undefined;
 			try {
 				await waitForFile(replacementMarker, child);
 				await waitForFile(otherMarker, child);
 				expect(existsSync(legacyMarker)).toBe(false);
 				expect(tryExclusiveLock(lockPath)).not.toBe(0);
 				child.stdin.end();
-				const deadline = Date.now() + timeoutMs;
-				while (child.exitCode === null && Date.now() < deadline)
-					await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
-				expect(child.exitCode, output).toBe(0);
+				const exit = await Promise.race([
+					closed,
+					new Promise<never>((_resolvePromise, reject) => {
+						timeout = setTimeout(() => reject(new Error(`CLI did not exit within ${timeoutMs}ms`)), timeoutMs);
+					}),
+				]);
+				expect(exit.code, output).toBe(0);
 				expect(tryExclusiveLock(lockPath)).toBe(0);
 			} finally {
-				if (child.exitCode === null) child.kill("SIGKILL");
+				if (timeout) clearTimeout(timeout);
+				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+				await closed;
+			}
+		},
+		timeoutMs * 2,
+	);
+
+	it(
+		"refuses replacement in an untrusted project without executing the target, replacement, or legacy fallback",
+		async () => {
+			const { projectDir, agentDir, replacement } = prepareTrustedProject();
+			rmSync(join(agentDir, "trust.json"));
+			const target = "./legacy-package";
+			const targetMarker = join(projectDir, "target-loaded");
+			const replacementMarker = join(replacement, "replacement-loaded");
+			createPackage(
+				join(projectDir, ".pi", target),
+				`import { writeFileSync } from "node:fs"; export default () => writeFileSync(${JSON.stringify(targetMarker)}, "loaded");`,
+			);
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ packages: [target] }));
+			createPackage(
+				replacement,
+				`import { writeFileSync } from "node:fs"; export default () => writeFileSync(${JSON.stringify(replacementMarker)}, "loaded");`,
+			);
+			const isolatedHome = join(projectDir, "isolated-home");
+			mkdirSync(isolatedHome, { recursive: true });
+			const child = spawn(
+				process.execPath,
+				[cliPath, "--mode", "rpc", "--replace-extension-package", target, replacement],
+				{
+					cwd: projectDir,
+					stdio: ["pipe", "pipe", "pipe"],
+					env: {
+						...sanitizedEnvironment(),
+						HOME: isolatedHome,
+						USERPROFILE: isolatedHome,
+						XDG_CONFIG_HOME: join(isolatedHome, ".config"),
+						[ENV_AGENT_DIR]: agentDir,
+						[ENV_SESSION_DIR]: join(projectDir, "isolated-sessions"),
+						PI_OFFLINE: "1",
+						TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+					},
+				},
+			);
+			let output = "";
+			child.stdout.on("data", (chunk: Buffer) => {
+				output += chunk.toString();
+			});
+			child.stderr.on("data", (chunk: Buffer) => {
+				output += chunk.toString();
+			});
+			const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise) => {
+				child.once("close", (code, signal) => resolvePromise({ code, signal }));
+			});
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			try {
+				child.stdin.end();
+				const exit = await Promise.race([
+					closed,
+					new Promise<never>((_resolvePromise, reject) => {
+						timeout = setTimeout(() => reject(new Error(`CLI did not exit within ${timeoutMs}ms`)), timeoutMs);
+					}),
+				]);
+				expect(exit.code, output).not.toBe(0);
+				expect(output).toMatch(
+					/expected exactly one configured local package source matching \.\/legacy-package; found 0/,
+				);
+				expect(existsSync(targetMarker)).toBe(false);
+				expect(existsSync(replacementMarker)).toBe(false);
+			} finally {
+				if (timeout) clearTimeout(timeout);
+				if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+				await closed;
 			}
 		},
 		timeoutMs * 2,
