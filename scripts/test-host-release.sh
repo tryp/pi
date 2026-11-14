@@ -349,12 +349,12 @@ import sys
 
 root = sys.argv[1]
 expected = 1700000000
-for relative in (".gitattributes", "pi-test.bat", "ignored.txt", "substitution.txt", "nested/run.sh", "nested/link.bat", "nested"):
+for relative in (".", ".gitattributes", "pi-test.bat", "ignored.txt", "substitution.txt", "nested/run.sh", "nested/link.bat", "nested"):
     path = os.path.join(root, relative)
     info = os.lstat(path)
     assert int(info.st_mtime) == expected, (relative, info.st_mtime)
-if os.utime in os.supports_follow_symlinks:
-    assert int(os.lstat(os.path.join(root, "nested/link.bat")).st_mtime) == expected
+assert os.utime in os.supports_follow_symlinks
+assert int(os.lstat(os.path.join(root, "nested/link.bat")).st_mtime) == expected
 PY
 required_blob=$(git -C "$tmp/partial-source" rev-parse "$pinned_commit:source.txt")
 required_blob_object="$tmp/partial-source/.git/objects/$(printf '%s' "$required_blob" | cut -c1-2)/$(printf '%s' "$required_blob" | cut -c3-)"

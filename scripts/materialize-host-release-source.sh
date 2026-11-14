@@ -63,8 +63,12 @@ for entry in entries.split(b"\0"):
     materialized.append((path, mode))
 
 for path, mode in materialized:
-    if mode != "120000" or os.utime in os.supports_follow_symlinks:
+    if mode == "120000" and os.utime not in os.supports_follow_symlinks:
+        raise SystemExit(f"cannot preserve pinned symlink timestamp on this platform: {os.fsdecode(path)}")
+    try:
         os.utime(path, (commit_timestamp, commit_timestamp), follow_symlinks=False)
+    except (NotImplementedError, OSError) as error:
+        raise SystemExit(f"cannot preserve pinned timestamp: {os.fsdecode(path)}: {error}")
 for path in sorted(directories, key=lambda item: item.count(os.fsencode(os.sep)), reverse=True):
     os.utime(path, (commit_timestamp, commit_timestamp))
 PY
@@ -82,4 +86,19 @@ GIT_NO_LAZY_FETCH=1 git -C "$destination" read-tree "$commit"
 [ "$(GIT_NO_LAZY_FETCH=1 git -C "$destination" rev-parse HEAD)" = "$commit" ] || fail "materialized HEAD does not match reviewed commit"
 [ "$(GIT_NO_LAZY_FETCH=1 git -C "$destination" rev-parse HEAD^{tree})" = "$tree" ] || fail "materialized HEAD tree does not match reviewed tree"
 [ -z "$(GIT_NO_LAZY_FETCH=1 git -C "$destination" status --porcelain=v1)" ] || fail "materialized source checkout is not clean"
+python3 - "$source_repo" "$commit" "$destination" <<'PY'
+import os
+import subprocess
+import sys
+
+source, commit, destination = sys.argv[1:]
+commit_object = subprocess.check_output(
+    ["git", "-C", source, "cat-file", "commit", commit]
+)
+committer = next(
+    line for line in commit_object.split(b"\n") if line.startswith(b"committer ")
+)
+timestamp = int(committer.rsplit(b" ", 2)[-2])
+os.utime(destination, (timestamp, timestamp))
+PY
 printf 'OK: materialized pinned commit %s tree %s without history fetch\n' "$commit" "$tree"
