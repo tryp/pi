@@ -95,4 +95,23 @@ describe("TUI full redraw scrollback handling", () => {
 		assert.ok(terminal.getViewport().some((line) => line.includes("history-29")));
 		tui.stop();
 	});
+
+	it("discards the scrollback when the terminal width changes", async () => {
+		const terminal = new RecordingTerminal(40, 10);
+		const tui = new TuiMainScreen(terminal);
+		tui.addChild(new MutableLines(createLines("history")));
+		tui.start();
+		await terminal.waitForRender();
+		terminal.takeWrites();
+
+		// Width changes re-wrap the stored lines, which makes them unreadable, so this
+		// is the one resize path that must still discard the scrollback. The emitted
+		// bytes are the evidence: VirtualTerminal does not model ESC[3J, so its scroll
+		// buffer holds the same lines whether or not the sequence was sent.
+		terminal.resize(30, 10);
+		await terminal.waitForRender();
+
+		assert.ok(terminal.takeWrites().includes("\x1b[3J"), "width resize must erase the scrollback");
+		tui.stop();
+	});
 });
