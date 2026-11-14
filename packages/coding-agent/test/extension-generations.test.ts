@@ -1,4 +1,5 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -47,6 +48,63 @@ function waitForFile(filePath: string, timeout = timeoutMs): Promise<void> {
 		};
 		poll();
 	});
+}
+
+function buildDistinctTagAddon(outputDirectory: string): void {
+	const sourcePath = path.resolve(import.meta.dirname, "../src/native/flock-lease.cc");
+	const fixtureSource = fs
+		.readFileSync(sourcePath, "utf8")
+		.replace("0x7cf431e0c3d249adULL, 0xb4906fdc2a61e037ULL", "0x7cf431e0c3d249aeULL, 0xb4906fdc2a61e038ULL");
+	if (fixtureSource === fs.readFileSync(sourcePath, "utf8")) throw new Error("could not assign distinct native lease type tag");
+	const fixtureSourcePath = path.join(outputDirectory, "flock-lease-distinct-tag.cc");
+	const artifactPath = path.join(outputDirectory, "flock_lease.node");
+	fs.mkdirSync(outputDirectory, { recursive: true });
+	fs.writeFileSync(fixtureSourcePath, fixtureSource);
+	const includeDirectory =
+		process.env.NODE_INCLUDE_DIR ?? ["/usr/include/node", "/usr/local/include/node"].find((directory) => {
+			try {
+				fs.readFileSync(path.join(directory, "node_api.h"));
+				return true;
+			} catch {
+				return false;
+			}
+		});
+	if (!includeDirectory) throw new Error("Node headers not found; set NODE_INCLUDE_DIR");
+	execFileSync(
+		"g++",
+		[
+			"-std=c++17",
+			"-Wall",
+			"-Wextra",
+			"-Werror",
+			"-shared",
+			"-fPIC",
+			"-DNODE_GYP_MODULE_NAME=flock_lease",
+			"-DNAPI_VERSION=8",
+			`-I${includeDirectory}`,
+			fixtureSourcePath,
+			"-o",
+			artifactPath,
+		],
+		{ stdio: "pipe" },
+	);
+	const sha256 = (contents: Buffer | string) => createHash("sha256").update(contents).digest("hex");
+	fs.writeFileSync(
+		path.join(outputDirectory, "flock_lease.manifest.json"),
+		`${JSON.stringify(
+			{
+				format: 1,
+				os: "linux",
+				arch: "x64",
+				nodeApi: 8,
+				sourceSha256: sha256(fixtureSource),
+				artifactSha256: sha256(fs.readFileSync(artifactPath)),
+				builtWithNode: process.versions.node,
+			},
+			null,
+			2,
+		)}\n`,
+	);
 }
 
 function createGeneration(root: string, id: string, files: Record<string, string>, entries: string[]): string {
@@ -163,10 +221,7 @@ describe("managed extension generation loader", () => {
 		const generation = createGeneration(root, "generation-a", { "index.js": "export default () => {};" }, ["index.js"]);
 		createManagedRoot(root, "generation-a", ["index.js"]);
 		const secondAddonDirectory = path.join(temporaryRoot, "second-addon-instance");
-		fs.mkdirSync(secondAddonDirectory, { recursive: true });
-		for (const name of ["flock_lease.node", "flock_lease.manifest.json"]) {
-			fs.copyFileSync(path.join(addonDirectory, name), path.join(secondAddonDirectory, name));
-		}
+		buildDistinctTagAddon(secondAddonDirectory);
 
 		const lockPath = path.join(generation, ".lease.lock");
 		const originalAddonDirectory = process.env.PI_EXTENSION_LEASE_NATIVE_DIR;
