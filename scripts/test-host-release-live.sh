@@ -147,7 +147,10 @@ done
   "$tmp/reviewed-source/scripts/pi-host-release" --offline --list-models > "$tmp/cli-list-models.out" 2>&1 || { cat "$tmp/cli-list-models.out" >&2; fail "real assembled CLI --offline --list-models failed"; }
 grep -Fq "$version" "$tmp/cli-version.out" || fail "real CLI --version did not report assembled artifact version"
 grep -Eqi 'usage|pi' "$tmp/cli-help.out" || fail "real CLI --help output did not contain help text"
-grep -Eq '^provider[[:space:]]+model[[:space:]]+context' "$tmp/cli-list-models.out" || fail "offline --list-models did not produce a model table"
+if ! bash "$tmp/reviewed-source/scripts/check-model-table.sh" "$tmp/cli-list-models.out"; then
+  cat "$tmp/cli-list-models.out" >&2
+  fail "offline --list-models did not produce a model table"
+fi
 [[ $(sha256sum "$release/dist/cli.js" | awk '{print $1}') == "$expected_cli_sha" ]] || fail "assembled CLI bytes changed during startup checks"
 [[ $(sha256sum "$release/SHA256SUMS" | awk '{print $1}') == "$expected_sums_sha" ]] || fail "assembled release checksum inventory changed during startup checks"
 

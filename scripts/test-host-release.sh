@@ -11,6 +11,15 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# The live gate recognizes the actual listModels table header and rejects the
+# user-facing no-catalog message rather than treating successful exit as proof.
+printf 'provider  model  context  max-out  thinking  images\nanthropic  claude-test  200K  8K  yes  yes\n' > "$tmp/model-table.out"
+bash "$repo/scripts/check-model-table.sh" "$tmp/model-table.out" || fail "model table fixture was rejected"
+printf 'No models available. Use /login to log into a provider. See:\n' > "$tmp/no-models.out"
+if bash "$repo/scripts/check-model-table.sh" "$tmp/no-models.out"; then
+	fail "missing-catalog fixture was accepted as a model table"
+fi
+
 # Synthetic user state must remain outside the release and byte-identical.
 mkdir -p "$tmp/home/.pi/agent/sessions" "$tmp/release/dist" "$tmp/bin"
 printf 'settings sentinel\n' > "$tmp/home/.pi/agent/settings.json"
