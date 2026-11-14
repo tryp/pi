@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { loadExtensions } from "../src/core/extensions/loader.ts";
+import { loadExtensions, loadExtensionsWithPreImportHookForTest } from "../src/core/extensions/loader.ts";
 import type { ExtensionCommandContext } from "../src/core/extensions/types.ts";
 
 const isHostChild = process.env.PI_GENERATION_HOST_CHILD === "1";
@@ -140,15 +140,27 @@ afterAll(() => {
 describe("managed extension generation loader", () => {
 	it.skipIf(!isHostChild)("child host loads, lazily imports, and retains native generation leases", async () => {
 		const entryPaths = JSON.parse(process.env.PI_GENERATION_ENTRY_PATHS ?? "[]") as string[];
-		const loaded = await loadExtensions(entryPaths, process.cwd());
 		const readyPath = process.env.PI_GENERATION_READY;
 		if (!readyPath) throw new Error("missing child ready path");
+		const isPreImportFailure = process.env.PI_GENERATION_MODE === "pre-import-failure";
+		let blockedDuringHook: number | undefined;
+		const loaded = isPreImportFailure
+			? await loadExtensionsWithPreImportHookForTest(entryPaths, process.cwd(), () => {
+					const lockPath = process.env.PI_GENERATION_LOCK;
+					if (!lockPath) throw new Error("missing pre-import lock path");
+					blockedDuringHook = tryExclusiveLock(lockPath);
+					throw new Error("injected pre-import failure");
+				})
+			: await loadExtensions(entryPaths, process.cwd());
+		const releasedAfterHook = isPreImportFailure ? tryExclusiveLock(process.env.PI_GENERATION_LOCK ?? "") : undefined;
 		fs.writeFileSync(
 			readyPath,
 			JSON.stringify({
 				pid: process.pid,
 				errors: loaded.errors,
 				extensions: loaded.extensions.map((extension) => [...extension.commands.keys()]),
+				blockedDuringHook,
+				releasedAfterHook,
 			}),
 		);
 		if (process.env.PI_GENERATION_MODE !== "hold") return;
@@ -434,6 +446,46 @@ describe("managed extension generation loader", () => {
 			} finally {
 				if (errorChild.child.exitCode === null && errorChild.child.signalCode === null)
 					errorChild.child.kill("SIGKILL");
+			}
+		},
+	);
+
+	it.skipIf(isHostChild || !isLinuxX64)(
+		"releases an acquired lease when a pre-import hook fails before extension execution",
+		async () => {
+			const root = path.join(temporaryRoot, "pre-import-failure");
+			const generation = createGeneration(
+				root,
+				"generation-a",
+				{
+					"index.js":
+						"import { writeFileSync } from 'node:fs'; writeFileSync(process.env.PI_GENERATION_EXECUTED, 'yes'); export default () => {};",
+				},
+				["index.js"],
+			);
+			createManagedRoot(root, "generation-a", ["index.js"]);
+			const ready = path.join(temporaryRoot, "pre-import-ready.json");
+			const executed = path.join(temporaryRoot, "pre-import-executed");
+			const child = spawnHost("pre-import-failure", {
+				PI_GENERATION_ENTRY_PATHS: JSON.stringify([path.join(root, "index.js")]),
+				PI_GENERATION_READY: ready,
+				PI_GENERATION_LOCK: path.join(generation, ".lease.lock"),
+				PI_GENERATION_EXECUTED: executed,
+			});
+			try {
+				await waitForHostFile(ready, child);
+				const result = JSON.parse(fs.readFileSync(ready, "utf8")) as {
+					errors: Array<{ error: string }>;
+					blockedDuringHook: number;
+					releasedAfterHook: number;
+				};
+				expect(result.errors[0]?.error).toContain("injected pre-import failure");
+				expect(result.blockedDuringHook).not.toBe(0);
+				expect(result.releasedAfterHook).toBe(0);
+				expect(fs.existsSync(executed)).toBe(false);
+				expect(await waitForExit(child.child)).toMatchObject({ code: 0 });
+			} finally {
+				if (child.child.exitCode === null && child.child.signalCode === null) child.child.kill("SIGKILL");
 			}
 		},
 	);

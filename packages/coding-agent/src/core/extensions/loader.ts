@@ -589,6 +589,7 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	cacheToken?: ExtensionCacheToken,
+	beforeImport?: () => void,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const discoveredPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 	let managedLease: ReturnType<typeof acquireManagedExtension>;
@@ -597,6 +598,7 @@ async function loadExtension(
 	try {
 		managedLease = acquireManagedExtension(discoveredPath);
 		const resolvedPath = managedLease?.entryPath ?? discoveredPath;
+		beforeImport?.();
 		const factory = await loadExtensionModule(resolvedPath, managedLease ? undefined : cacheToken, () => {
 			extensionCodeMayHaveExecuted = true;
 		});
@@ -639,6 +641,7 @@ async function loadExtensionsInternal(
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
 	useCache = false,
+	beforeImport?: () => void,
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
@@ -654,6 +657,7 @@ async function loadExtensionsInternal(
 			resolvedEventBus,
 			resolvedRuntime,
 			cacheToken,
+			beforeImport,
 		);
 
 		if (error) {
@@ -680,6 +684,16 @@ export async function loadExtensions(
 	runtime?: ExtensionRuntime,
 ): Promise<LoadExtensionsResult> {
 	return loadExtensionsInternal(paths, cwd, eventBus, runtime);
+}
+
+/** Internal test seam for deterministic failures after lease acquisition but before module import. */
+export async function loadExtensionsWithPreImportHookForTest(
+	paths: string[],
+	cwd: string,
+	beforeImport: () => void,
+): Promise<LoadExtensionsResult> {
+	if (process.env.NODE_ENV !== "test") throw new Error("Pre-import hook is available only in tests");
+	return loadExtensionsInternal(paths, cwd, undefined, undefined, false, beforeImport);
 }
 
 export async function loadExtensionsCached(
