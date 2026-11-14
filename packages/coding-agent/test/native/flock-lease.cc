@@ -2,15 +2,20 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <new>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 struct Lease {
 	int fd;
 };
+
+static const napi_type_tag leaseTag = {0x7cf431e0c3d249adULL, 0xb4906fdc2a61e037ULL};
 
 static int closeLease(Lease* lease) {
 	if (!lease || lease->fd < 0) return 0;
@@ -32,11 +37,22 @@ static napi_value throwError(napi_env env, const char* message) {
 	return nullptr;
 }
 
+static bool getLease(napi_env env, napi_value value, Lease** result) {
+	napi_valuetype type;
+	if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) return false;
+	bool tagged = false;
+	if (napi_check_object_type_tag(env, value, &leaseTag, &tagged) != napi_ok || !tagged) return false;
+	void* data = nullptr;
+	if (napi_unwrap(env, value, &data) != napi_ok || !data) return false;
+	*result = static_cast<Lease*>(data);
+	return true;
+}
+
 static napi_value acquire(napi_env env, napi_callback_info info) {
-	size_t argc = 1;
-	napi_value argv[1];
+	size_t argc = 2;
+	napi_value argv[2];
 	if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc != 1) {
-		return throwError(env, "acquire(path) requires one absolute lock path");
+		return throwError(env, "acquire(path) requires exactly one absolute lock path");
 	}
 	napi_valuetype type;
 	if (napi_typeof(env, argv[0], &type) != napi_ok || type != napi_string) {
@@ -58,7 +74,7 @@ static napi_value acquire(napi_env env, napi_callback_info info) {
 		return throwError(env, "lock path contains NUL");
 	}
 	int fd;
-	do { fd = open(path, O_RDONLY | O_CLOEXEC); } while (fd < 0 && errno == EINTR);
+	do { fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); } while (fd < 0 && errno == EINTR);
 	delete[] path;
 	if (fd < 0) {
 		char error[256];
@@ -66,13 +82,16 @@ static napi_value acquire(napi_env env, napi_callback_info info) {
 		return throwError(env, error);
 	}
 	struct stat metadata;
-	if (fstat(fd, &metadata) < 0 || !S_ISREG(metadata.st_mode)) {
+	if (fstat(fd, &metadata) < 0) {
 		int saved = errno;
-		if (saved == 0) saved = EINVAL;
 		close(fd);
 		char error[256];
-		snprintf(error, sizeof(error), "lock path must be a regular file: %s", strerror(saved));
+		snprintf(error, sizeof(error), "fstat lock path: %s", strerror(saved));
 		return throwError(env, error);
+	}
+	if (!S_ISREG(metadata.st_mode) || metadata.st_nlink != 1) {
+		close(fd);
+		return throwError(env, "lock path must be a single-link regular file");
 	}
 	int result;
 	do { result = flock(fd, LOCK_SH); } while (result < 0 && errno == EINTR);
@@ -88,28 +107,26 @@ static napi_value acquire(napi_env env, napi_callback_info info) {
 		close(fd);
 		return throwError(env, "out of memory");
 	}
-	napi_value external;
-	if (napi_create_external(env, lease, finalizeLease, nullptr, &external) != napi_ok) {
+	napi_value handle;
+	if (napi_create_object(env, &handle) != napi_ok || napi_type_tag_object(env, handle, &leaseTag) != napi_ok) {
 		finalizeLease(env, lease, nullptr);
 		return throwError(env, "could not create lease handle");
 	}
-	return external;
+	if (napi_wrap(env, handle, lease, finalizeLease, nullptr, nullptr) != napi_ok) {
+		finalizeLease(env, lease, nullptr);
+		return throwError(env, "could not wrap lease handle");
+	}
+	return handle;
 }
 
 static napi_value release(napi_env env, napi_callback_info info) {
-	size_t argc = 1;
-	napi_value argv[1];
+	size_t argc = 2;
+	napi_value argv[2];
 	if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc != 1) {
-		return throwError(env, "release(handle) requires one lease handle");
-	}
-	napi_valuetype type;
-	if (napi_typeof(env, argv[0], &type) != napi_ok || type != napi_external) {
-		return throwError(env, "invalid lease handle");
+		return throwError(env, "release(handle) requires exactly one lease handle");
 	}
 	Lease* lease = nullptr;
-	if (napi_get_value_external(env, argv[0], reinterpret_cast<void**>(&lease)) != napi_ok || !lease) {
-		return throwError(env, "invalid lease handle");
-	}
+	if (!getLease(env, argv[0], &lease)) return throwError(env, "invalid lease handle");
 	int error = closeLease(lease);
 	if (error != 0) {
 		char message[256];
@@ -119,12 +136,36 @@ static napi_value release(napi_env env, napi_callback_info info) {
 	return nullptr;
 }
 
+// Test-only primitive to verify Linux fork inheritance without an intervening exec.
+static napi_value forkLeaseForTest(napi_env env, napi_callback_info info) {
+	size_t argc = 2;
+	napi_value argv[2];
+	if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc != 1) {
+		return throwError(env, "forkLeaseForTest(handle) requires exactly one lease handle");
+	}
+	Lease* lease = nullptr;
+	if (!getLease(env, argv[0], &lease) || lease->fd < 0) return throwError(env, "invalid active lease handle");
+	pid_t pid = fork();
+	if (pid < 0) return throwError(env, "fork failed");
+	if (pid == 0) {
+		for (;;) pause();
+	}
+	napi_value result;
+	if (napi_create_int32(env, static_cast<int32_t>(pid), &result) != napi_ok) {
+		kill(pid, SIGKILL);
+		waitpid(pid, nullptr, 0);
+		return throwError(env, "could not return fork child pid");
+	}
+	return result;
+}
+
 static napi_value initialize(napi_env env, napi_value exports) {
 	napi_property_descriptor properties[] = {
 		{"acquire", nullptr, acquire, nullptr, nullptr, nullptr, napi_default, nullptr},
 		{"release", nullptr, release, nullptr, nullptr, nullptr, napi_default, nullptr},
+		{"forkLeaseForTest", nullptr, forkLeaseForTest, nullptr, nullptr, nullptr, napi_default, nullptr},
 	};
-	if (napi_define_properties(env, exports, 2, properties) != napi_ok) return nullptr;
+	if (napi_define_properties(env, exports, 3, properties) != napi_ok) return nullptr;
 	return exports;
 }
 
