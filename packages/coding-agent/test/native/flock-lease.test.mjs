@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 
-const source = resolve(import.meta.dirname, "flock-lease.cc");
+const source = resolve(import.meta.dirname, "../../src/native/flock-lease.cc");
 const tempDir = mkdtempSync(join(tmpdir(), "pi-flock-lease-"));
 const addon = join(tempDir, "flock_lease.node");
 const foreignAddon = join(tempDir, "foreign_handle.node");

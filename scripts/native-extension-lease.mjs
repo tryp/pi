@@ -7,7 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const source = join(root, "packages/coding-agent/test/native/flock-lease.cc");
+const source = join(root, "packages/coding-agent/src/native/flock-lease.cc");
 const artifactName = "flock_lease.node";
 const manifestName = "flock_lease.manifest.json";
 
@@ -71,7 +71,7 @@ try {
 			if (!first || !second) throw new Error("usage: native-extension-lease.mjs stage ARTIFACT_DIR STAGE_DIR");
 			const artifactDir = resolve(first);
 			verify(artifactDir);
-			const target = join(resolve(second), "native", "linux-x64");
+			const target = join(resolve(second), "dist", "native", "linux-x64");
 			mkdirSync(target, { recursive: true });
 			copyFileSync(join(artifactDir, artifactName), join(target, artifactName));
 			copyFileSync(join(artifactDir, manifestName), join(target, manifestName));

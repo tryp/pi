@@ -12,15 +12,16 @@ Set `NODE_INCLUDE_DIR` if headers are not in `/usr/include/node` or `/usr/local/
 
 ## Optional local packaging prototype
 
-This artifact is not wired into the extension loader and does not make managed extension loading use leases. The normal build remains platform-independent and does not compile native code. For an explicit local Linux x64 build and stage, run `make deploy NATIVE_EXTENSION_LEASE=1`; this compiles only at build time and stages `native/linux-x64/flock_lease.node` plus a manifest. The manifest records Node-API 8, target, source SHA-256, and artifact SHA-256; staging and load verification reject missing, altered, or incompatible artifacts. The loader is not enabled, so there is no unleased fallback path to close yet.
+The production-bound source lives in `packages/coding-agent/src/native/flock-lease.cc`; the prototype tests remain in `test/native`. This artifact is not wired into the extension loader and does not make managed extension loading use leases. The normal build remains platform-independent and does not compile native code. For an explicit local Linux x64 package artifact, run `npm run build:native-extension-lease` from `packages/coding-agent` (or `make build-native-extension-lease` from the repo root), then run `npm pack --ignore-scripts`. The package `files` whitelist includes `dist`, so the opted-in `dist/native/linux-x64` addon and manifest are packed. The same explicit build flag is available for local runtime staging: `make deploy NATIVE_EXTENSION_LEASE=1`. Without the flag, deploy excludes the optional addon even if a previous build left it in `dist`. The manifest records Node-API 8, target, source SHA-256, and artifact SHA-256; staging and load verification reject missing, altered, or incompatible artifacts. No live install compilation or production-loader fallback was added.
 
 The build target intentionally rejects non-Linux or non-x64 hosts. It does not claim arm64, macOS, Windows, or Bun support. Node-API 8 is compiled against local Node headers; the addon was exercised with Node 26.2.0, while the project runtime floor is Node >=22.19.0. This prototype has not established an oldest-Node test matrix or a portable glibc floor: the compiled artifact may require the glibc version of its build host or newer. Keep it local-only until matching CI builds verify supported Node versions and an explicit glibc baseline. Never compile native code at live startup or silently fall back to an unleased managed import.
 
-Packaging regression test (Linux x64 with Node headers and g++):
+Packaging regression test (Linux x64 with Node headers, g++, npm, and tar):
 
 ```sh
 node --test scripts/native-extension-lease.test.mjs
 ```
+It exercises npm pack dry-run and a real temporary tarball, unpacks and loads the shipped bytes, verifies an ordinary package has no addon, rejects missing/unsupported artifacts, and mutates the ELF `e_machine` field to exercise rejection of an AArch64-marked fixture. The latter is a wrong-architecture ELF-header fixture, not a genuine AArch64 compiled binary.
 
 ## Lock-path trust assumptions and limits
 

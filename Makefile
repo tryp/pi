@@ -206,7 +206,7 @@ build-extra: build-ai build-protocol build-client build-tui
 # It is never compiled by the default build or by the live runtime.
 .PHONY: build-native-extension-lease
 build-native-extension-lease:
-	node scripts/native-extension-lease.mjs build packages/coding-agent/native-build/linux-x64
+	node scripts/native-extension-lease.mjs build packages/coding-agent/dist/native/linux-x64
 
 ifeq ($(NATIVE_EXTENSION_LEASE),1)
 deploy: build-native-extension-lease
@@ -229,7 +229,7 @@ verify:  ## Verify deployed dist matches this build (versions + content + exec b
 	[ "$$src" = "$$dep" ] || { echo "FAIL: pi-agent-core version drift: source $$src vs deployed $$dep" >&2; exit 1; }
 	@test -f $(RUNTIME_DIR)/node_modules/grok-mermaid/package.json || { echo "FAIL: grok-mermaid runtime dependency missing (run make deploy)" >&2; exit 1; }
 	@if [ "$(NATIVE_EXTENSION_LEASE)" = 1 ]; then \
-		node scripts/native-extension-lease.mjs load "$(RUNTIME_DIR)/native/linux-x64"; \
+		node scripts/native-extension-lease.mjs load "$(RUNTIME_DIR)/dist/native/linux-x64"; \
 	fi
 	@cmp -s packages/telemetry/dist/index.js \
 		$(RUNTIME_DIR)/node_modules/@earendil-works/pi-telemetry/dist/index.js || { \
