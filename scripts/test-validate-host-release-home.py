@@ -49,6 +49,21 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate(self.home, self.baseline)
 
+    def test_observed_cli_startup_paths_are_exact_and_preserve_sentinels(self):
+        agent = self.home / ".pi/agent"
+        telemetry = agent / "cache-telemetry"
+        telemetry.mkdir(mode=0o700)
+        (agent / "auth.json").write_bytes(b"{}")
+        self.cache().write_bytes(b"{}")
+        telemetry_file = telemetry / "00000000-0000-4000-8000-000000000000.jsonl"
+        telemetry_file.write_bytes(b"")
+        for path in (agent / "auth.json", self.cache(), telemetry_file):
+            path.chmod(0o600)
+        validate(self.home, self.baseline, startup_side_effects=True)
+        (agent / "unexpected.txt").write_text("not allowed")
+        with self.assertRaisesRegex(ValidationError, "known startup paths"):
+            validate(self.home, self.baseline, startup_side_effects=True)
+
     def test_full_end_of_gate_acceptance_preserves_legacy_sentinels_and_cache(self):
         self.cache().write_text(self.serialized_store())
         validate(self.home, self.baseline)

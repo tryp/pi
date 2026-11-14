@@ -41,16 +41,16 @@ run_check() {
   cmp "$home/.pi/agent/sessions/sentinel.jsonl" "$baseline/.pi/agent/sessions/sentinel.jsonl"
   cmp "$home/.pi/agent/db/sentinel.sqlite" "$baseline/.pi/agent/db/sentinel.sqlite"
   cmp "$output_dir/$name-fd-copy" "$baseline/.pi/agent/settings.json"
-  if [[ "$expected_cache" == cache ]]; then
-    python3 "$repo/scripts/validate_host_release_home.py" "$home" "$baseline"
-  else
-    python3 "$repo/scripts/validate_host_release_home.py" --no-cache "$home" "$baseline"
-  fi
+  case "$expected_cache" in
+    startup) python3 "$repo/scripts/validate_host_release_home.py" --startup-side-effects "$home" "$baseline" ;;
+    no-cache) python3 "$repo/scripts/validate_host_release_home.py" --no-cache "$home" "$baseline" ;;
+    *) echo "FAIL: unknown expected HOME state: $expected_cache" >&2; return 1 ;;
+  esac
 }
 
-run_check version cache no-key --version
-run_check help cache no-key --help
-run_check list cache key --offline --list-models
+run_check version no-cache no-key --version
+run_check help startup no-key --help
+run_check list startup key --offline --list-models
 grep -Fq "$version" "$output_dir/cli-version.out" || { echo "FAIL: real CLI --version did not report assembled artifact version" >&2; exit 1; }
 grep -Eqi 'usage|pi' "$output_dir/cli-help.out" || { echo "FAIL: real CLI --help output did not contain help text" >&2; exit 1; }
 bash "$repo/scripts/check-model-table.sh" "$output_dir/cli-list.out" || { cat "$output_dir/cli-list.out" >&2; echo "FAIL: offline --list-models did not produce a model table" >&2; exit 1; }

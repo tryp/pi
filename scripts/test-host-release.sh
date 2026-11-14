@@ -404,8 +404,8 @@ test ! -e "$tmp/lazy-fetch-sentinel" || fail "live gate contacted promisor helpe
 echo "OK: exact release inventory, manifest digest, link rejection, uncertain commit, live sentinel fd preservation, lock/collision guards, failed stage cleanup, and guarded gate-wide promisor source materialization"
 
 # Exercise the exact version/help/list sequence through the real isolation helper.
-# Each synthetic CLI startup writes a cache, reproducing the cache-before-list
-# failure while proving each invocation starts from its own clean baseline.
+# The fixture reproduces observed startup behavior: version creates nothing,
+# while help/list create auth, cache, and telemetry paths from clean baselines.
 cat > "$tmp/sequence-cli" <<'EOF_SEQUENCE'
 #!/bin/sh
 set -eu
@@ -419,8 +419,14 @@ case "$*" in
   *) exit 32 ;;
 esac
 [ "$*" = '--offline --list-models' ] || [ -z "${ANTHROPIC_API_KEY:-}" ] || exit 33
-mkdir -p "$HOME/.pi/agent"
-printf '{"fixture-provider":{"models":[{"id":"fixture","name":"Fixture","api":"fixture-api"}]}}\n' > "$HOME/.pi/agent/models-store.json"
+if [ "$*" != '--version' ]; then
+  agent="$HOME/.pi/agent"
+  mkdir -m 700 "$agent/cache-telemetry"
+  printf '{}' > "$agent/auth.json"
+  printf '{}' > "$agent/models-store.json"
+  : > "$agent/cache-telemetry/00000000-0000-4000-8000-000000000000.jsonl"
+  chmod 600 "$agent/auth.json" "$agent/models-store.json" "$agent/cache-telemetry/00000000-0000-4000-8000-000000000000.jsonl"
+fi
 EOF_SEQUENCE
 chmod +x "$tmp/sequence-cli"
 mkdir -p "$tmp/sequence-output"
