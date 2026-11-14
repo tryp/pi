@@ -147,6 +147,8 @@ for arg in --version --help; do
   "${clean_env[@]}" PI_HOST_RELEASE_DIR="$release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" \
     "$tmp/reviewed-source/scripts/pi-host-release" "$arg" > "$output" 2>&1 || { cat "$output" >&2; fail "real assembled CLI $arg failed"; }
 done
+models_store="$tmp/home/.pi/agent/models-store.json"
+[[ ! -e "$models_store" && ! -L "$models_store" ]] || fail "models-store.json existed before offline model listing"
 "${clean_env[@]}" ANTHROPIC_API_KEY=pi-offline-test-key PI_HOST_RELEASE_DIR="$release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" \
   "$tmp/reviewed-source/scripts/pi-host-release" --offline --list-models > "$tmp/cli-list-models.out" 2>&1 || { cat "$tmp/cli-list-models.out" >&2; fail "real assembled CLI --offline --list-models failed"; }
 grep -Fq "$version" "$tmp/cli-version.out" || fail "real CLI --version did not report assembled artifact version"
@@ -190,20 +192,10 @@ cmp "$tmp/home/.pi/agent/settings.json" "$tmp/legacy-expected/settings.json"
 cmp "$tmp/home/.pi/agent/sessions/sentinel.jsonl" "$tmp/legacy-expected/sessions/sentinel.jsonl"
 cmp "$tmp/home/.pi/agent/db/sentinel.sqlite" "$tmp/legacy-expected/db/sentinel.sqlite"
 
-# --offline --list-models constructs the JSON-backed model cache while loading
-# provider catalogs. Permit only that expected file, and require its content to
-# be a valid object-shaped provider catalog before including it in the snapshot.
-models_store="$tmp/home/.pi/agent/models-store.json"
-[[ -f "$models_store" && ! -L "$models_store" ]] || fail "offline model listing did not create a regular models-store.json"
-node - "$models_store" <<'NODE' || fail "offline model listing created invalid models-store.json"
-const fs = require("node:fs");
-const value = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-if (typeof value !== "object" || value === null || Array.isArray(value)) process.exit(1);
-for (const entry of Object.values(value)) {
-  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) process.exit(1);
-}
-NODE
-cp "$models_store" "$tmp/legacy-expected/models-store.json"
+# The initial snapshot must not contain the cache. Offline listing may create
+# only that exact path; the helper compares every other entry and validates its
+# catalog schema without adopting post-run state into the expected snapshot.
+python3 "$tmp/reviewed-source/scripts/validate_host_release_home.py" "$tmp/home" "$tmp/legacy-expected" || fail "offline model listing changed unexpected HOME state or created an invalid cache"
 [[ ! -e "$release/.pi" ]] || fail "release created user state under its own tree"
 touch "$tmp/legacy-stop"
 wait "$legacy_pid"
