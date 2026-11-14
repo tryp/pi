@@ -21,7 +21,7 @@ function getAddonDirectories(): string[] {
 }
 
 type NativeLease = { acquire(path: string): object; release(handle: object): void };
-type LeaseState = { handle: object; references: number };
+type LeaseState = { addon: NativeLease; handle: object; references: number };
 // References stay held until process exit once extension import begins, even if import or factory
 // initialization fails: escaped timers, callbacks, and lazy imports cannot be proven quiescent.
 const leases = new Map<string, LeaseState>();
@@ -160,7 +160,7 @@ export function acquireManagedExtension(
 	let state = leases.get(key);
 	const newlyAcquired = !state;
 	if (!state) {
-		state = { handle: addon.acquire(lockPath), references: 0 };
+		state = { addon, handle: addon.acquire(lockPath), references: 0 };
 		leases.set(key, state);
 	}
 	try {
@@ -176,7 +176,7 @@ export function acquireManagedExtension(
 		}
 	} catch (error) {
 		if (newlyAcquired) {
-			addon.release(state.handle);
+			state.addon.release(state.handle);
 			leases.delete(key);
 		}
 		throw error;
@@ -193,7 +193,7 @@ export function acquireManagedExtension(
 			if (!active) return;
 			active.references--;
 			if (active.references === 0) {
-				addon.release(active.handle);
+				active.addon.release(active.handle);
 				leases.delete(key);
 			}
 		},

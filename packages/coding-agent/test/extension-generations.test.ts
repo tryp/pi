@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { createJiti as createJitiFunction } from "jiti/static";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { acquireManagedExtension } from "../src/core/extensions/generation-lease.ts";
 import { loadExtensions } from "../src/core/extensions/loader.ts";
 import type { ExtensionCommandContext } from "../src/core/extensions/types.ts";
 
@@ -157,6 +158,47 @@ afterAll(() => {
 });
 
 describe("managed extension generation loader", () => {
+	it.skipIf(isHostChild || !isLinuxX64)("releases shared leases through the addon instance that acquired them", () => {
+		const root = path.join(temporaryRoot, "addon-owner-switch");
+		const generation = createGeneration(root, "generation-a", { "index.js": "export default () => {};" }, ["index.js"]);
+		createManagedRoot(root, "generation-a", ["index.js"]);
+		const secondAddonDirectory = path.join(temporaryRoot, "second-addon-instance");
+		fs.mkdirSync(secondAddonDirectory, { recursive: true });
+		for (const name of ["flock_lease.node", "flock_lease.manifest.json"]) {
+			fs.copyFileSync(path.join(addonDirectory, name), path.join(secondAddonDirectory, name));
+		}
+
+		const lockPath = path.join(generation, ".lease.lock");
+		const originalAddonDirectory = process.env.PI_EXTENSION_LEASE_NATIVE_DIR;
+		const originalLeaseOptIn = process.env.PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE;
+		let firstLease: ReturnType<typeof acquireManagedExtension>;
+		let secondLease: ReturnType<typeof acquireManagedExtension>;
+		try {
+			process.env.PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE = "1";
+			process.env.PI_EXTENSION_LEASE_NATIVE_DIR = addonDirectory;
+			firstLease = acquireManagedExtension(path.join(root, "index.js"));
+			expect(firstLease).toBeDefined();
+
+			process.env.PI_EXTENSION_LEASE_NATIVE_DIR = secondAddonDirectory;
+			secondLease = acquireManagedExtension(path.join(root, "index.js"));
+			expect(secondLease).toBeDefined();
+			expect(addonDirectory).not.toBe(secondAddonDirectory);
+			expect(tryExclusiveLock(lockPath)).not.toBe(0);
+
+			firstLease?.releaseOnFailure();
+			expect(tryExclusiveLock(lockPath)).not.toBe(0);
+			secondLease?.releaseOnFailure();
+			expect(tryExclusiveLock(lockPath)).toBe(0);
+		} finally {
+			firstLease?.releaseOnFailure();
+			secondLease?.releaseOnFailure();
+			if (originalAddonDirectory === undefined) delete process.env.PI_EXTENSION_LEASE_NATIVE_DIR;
+			else process.env.PI_EXTENSION_LEASE_NATIVE_DIR = originalAddonDirectory;
+			if (originalLeaseOptIn === undefined) delete process.env.PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE;
+			else process.env.PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE = originalLeaseOptIn;
+		}
+	});
+
 	it.skipIf(!isHostChild)("child host loads, lazily imports, and retains native generation leases", async () => {
 		const entryPaths = JSON.parse(process.env.PI_GENERATION_ENTRY_PATHS ?? "[]") as string[];
 		const readyPath = process.env.PI_GENERATION_READY;
