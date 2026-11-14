@@ -96,6 +96,8 @@ node "$source_snapshot/scripts/native-extension-lease.mjs" verify "$source_snaps
 cp "$source_snapshot/packages/coding-agent/install-lock/package.json" "$stage/package.json"
 cp "$source_snapshot/packages/coding-agent/install-lock/package-lock.json" "$stage/package-lock.json"
 npm ci --prefix "$stage" --ignore-scripts --omit=dev --no-audit --no-fund
+# npm creates executable symlinks under .bin; the release launcher does not use them.
+rm -rf -- "$stage/node_modules/.bin"
 rsync -a --delete --exclude=/native/linux-x64 "$source_snapshot/packages/coding-agent/dist/" "$stage/dist/"
 cp "$source_snapshot/packages/coding-agent/package.json" "$stage/package.json"
 for pkg in telemetry agent ai client protocol tui; do
