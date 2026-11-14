@@ -160,13 +160,53 @@ describe("managed extension generation loader", () => {
 			return;
 		}
 		const invokePath = process.env.PI_GENERATION_INVOKE;
-		if (!invokePath) throw new Error("missing child invoke path");
+		const reloadPath = process.env.PI_GENERATION_RELOAD;
+		const reloadedPath = process.env.PI_GENERATION_RELOADED;
+		const retainedPath = process.env.PI_GENERATION_RETAINED;
+		const retainedDonePath = process.env.PI_GENERATION_RETAINED_DONE;
+		const resumePath = process.env.PI_GENERATION_RESUME;
+		const startedPath = process.env.PI_GENERATION_STARTED;
+		if (
+			!invokePath ||
+			!reloadPath ||
+			!reloadedPath ||
+			!retainedPath ||
+			!retainedDonePath ||
+			!resumePath ||
+			!startedPath
+		) {
+			throw new Error("missing child synchronization paths");
+		}
 		await waitForFile(invokePath);
-		for (const extension of loaded.extensions) {
+		const oldCommands = new Map(loaded.extensions.flatMap((extension) => [...extension.commands]));
+		const oldMain = oldCommands.get("main");
+		if (!oldMain) throw new Error("old generation main command did not load");
+		const inFlightMain = oldMain.handler("", {} as ExtensionCommandContext);
+		await waitForFile(startedPath);
+		await waitForFile(reloadPath);
+
+		const reloaded = await loadExtensions(entryPaths, process.cwd());
+		if (reloaded.errors.length > 0) throw new Error(JSON.stringify(reloaded.errors));
+		for (const extension of reloaded.extensions) {
 			for (const command of extension.commands.values()) {
 				await command.handler("", {} as ExtensionCommandContext);
 			}
 		}
+		fs.writeFileSync(
+			reloadedPath,
+			JSON.stringify(reloaded.extensions.map((extension) => [...extension.commands.keys()])),
+		);
+
+		await waitForFile(retainedPath);
+		for (const name of ["alias", "second"]) {
+			const retained = oldCommands.get(name);
+			if (!retained) throw new Error(`retained old command ${name} was unavailable`);
+			await retained.handler("", {} as ExtensionCommandContext);
+		}
+		fs.writeFileSync(retainedDonePath, "done");
+		await waitForFile(resumePath);
+		await inFlightMain;
+		await oldMain.handler("", {} as ExtensionCommandContext);
 		fs.writeFileSync(finishedPath, "done");
 		await waitForFile(stopPath);
 	});
@@ -178,10 +218,10 @@ describe("managed extension generation loader", () => {
 			const rootB = path.join(temporaryRoot, "extension-b");
 			const entriesA = ["main.js", "alias.js", "second.js"];
 			const entriesB = ["index.js"];
-			const code = (command: string, lazyFile: string) =>
-				`import { writeFileSync } from "node:fs"; export default (pi) => pi.registerCommand("${command}", {handler: async () => { const m = await import("./${lazyFile}"); writeFileSync(process.env.PI_GENERATION_RESULTS + ".${command}", m.value); }});`;
+			const code = (command: string, lazyFile: string, pause = false) =>
+				`import { existsSync, writeFileSync } from "node:fs"; export default (pi) => pi.registerCommand("${command}", {handler: async () => { ${pause ? 'writeFileSync(process.env.PI_GENERATION_STARTED, "started"); while (!existsSync(process.env.PI_GENERATION_RESUME)) await new Promise((resolve) => setTimeout(resolve, 5));' : ""} const m = await import("./${lazyFile}"); writeFileSync(process.env.PI_GENERATION_RESULTS + "." + m.value, m.value); }});`;
 			const aFiles = {
-				"main.js": code("main", "lazy-main.js"),
+				"main.js": code("main", "lazy-main.js", true),
 				"alias-real.js": code("alias", "lazy-alias.js"),
 				"second.js": code("second", "lazy-second.js"),
 				"lazy-main.js": "export const value = 'A-main';",
@@ -190,17 +230,19 @@ describe("managed extension generation loader", () => {
 			};
 			const bFiles = { "index.js": code("other", "lazy.js"), "lazy.js": "export const value = 'B-root';" };
 			const generationA = createGeneration(rootA, "generation-a", aFiles, entriesA);
-			createGeneration(
+			const generationAB = createGeneration(
 				rootA,
 				"generation-b",
 				{
 					...aFiles,
+					"main.js": code("main", "lazy-main.js"),
 					"lazy-main.js": "export const value = 'B-main';",
 					"lazy-alias.js": "export const value = 'B-alias';",
 					"lazy-second.js": "export const value = 'B-second';",
 				},
 				entriesA,
 			);
+			fs.symlinkSync("alias-real.js", path.join(generationAB, "alias.js"));
 			const generationB = createGeneration(rootB, "generation-b", bFiles, entriesB);
 			createManagedRoot(rootA, "generation-a", entriesA);
 			createManagedRoot(rootB, "generation-b", entriesB);
@@ -212,6 +254,12 @@ describe("managed extension generation loader", () => {
 
 			const ready = path.join(temporaryRoot, "host-ready.json");
 			const invoke = path.join(temporaryRoot, "invoke");
+			const started = path.join(temporaryRoot, "started");
+			const reload = path.join(temporaryRoot, "reload");
+			const reloaded = path.join(temporaryRoot, "reloaded.json");
+			const retained = path.join(temporaryRoot, "retained");
+			const retainedDone = path.join(temporaryRoot, "retained-done");
+			const resume = path.join(temporaryRoot, "resume");
 			const finished = path.join(temporaryRoot, "finished");
 			const stop = path.join(temporaryRoot, "stop");
 			const results = path.join(temporaryRoot, "result");
@@ -220,6 +268,12 @@ describe("managed extension generation loader", () => {
 				PI_GENERATION_ENTRY_PATHS: JSON.stringify(stableEntries),
 				PI_GENERATION_READY: ready,
 				PI_GENERATION_INVOKE: invoke,
+				PI_GENERATION_STARTED: started,
+				PI_GENERATION_RELOAD: reload,
+				PI_GENERATION_RELOADED: reloaded,
+				PI_GENERATION_RETAINED: retained,
+				PI_GENERATION_RETAINED_DONE: retainedDone,
+				PI_GENERATION_RESUME: resume,
 				PI_GENERATION_FINISHED: finished,
 				PI_GENERATION_STOP: stop,
 				PI_GENERATION_RESULTS: results,
@@ -247,10 +301,22 @@ describe("managed extension generation loader", () => {
 				expect(fs.existsSync(generationA)).toBe(true);
 
 				fs.writeFileSync(invoke, "go");
-				await waitForFile(finished);
-				expect(fs.readFileSync(`${results}.main`, "utf8")).toBe("A-main");
-				expect(fs.readFileSync(`${results}.alias`, "utf8")).toBe("A-alias");
-				expect(fs.readFileSync(`${results}.second`, "utf8")).toBe("A-second");
+				await waitForHostFile(started, { child, output });
+				fs.writeFileSync(reload, "reload");
+				await waitForHostFile(reloaded, { child, output });
+				expect(fs.readFileSync(`${results}.B-main`, "utf8")).toBe("B-main");
+				expect(fs.readFileSync(`${results}.B-alias`, "utf8")).toBe("B-alias");
+				expect(fs.readFileSync(`${results}.B-second`, "utf8")).toBe("B-second");
+				expect(fs.readFileSync(`${results}.B-root`, "utf8")).toBe("B-root");
+				expect(tryCollect(lockA, generationA, collectedA)).not.toBe(0);
+
+				fs.writeFileSync(retained, "run retained callbacks");
+				await waitForHostFile(retainedDone, { child, output });
+				expect(fs.readFileSync(`${results}.A-alias`, "utf8")).toBe("A-alias");
+				expect(fs.readFileSync(`${results}.A-second`, "utf8")).toBe("A-second");
+				fs.writeFileSync(resume, "resume in-flight callback");
+				await waitForHostFile(finished, { child, output });
+				expect(fs.readFileSync(`${results}.A-main`, "utf8")).toBe("A-main");
 
 				child.kill("SIGKILL");
 				const exit = await waitForExit(child);

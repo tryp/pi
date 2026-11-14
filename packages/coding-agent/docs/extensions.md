@@ -50,6 +50,7 @@ See [examples/extensions/](../examples/extensions/) for working implementations.
   - [Dynamic Tool Loading](#dynamic-tool-loading)
 - [Custom UI](#custom-ui)
 - [Error Handling](#error-handling)
+- [Managed Generation Leases](#managed-generation-leases)
 - [Mode Behavior](#mode-behavior)
 - [Examples Reference](#examples-reference)
 
@@ -222,6 +223,21 @@ This pattern makes the fetched models available during normal startup and to `pi
 Extension factories may run in invocations that never start a session. Do not start background resources such as processes, sockets, file watchers, or timers from the factory.
 
 Defer background resource startup until `session_start` or the command/tool/event that needs the resource. Register an idempotent `session_shutdown` handler to close any session-scoped resources you start.
+
+## Managed Generation Leases
+
+Managed-generation loading is experimental and opt-in. A marked extension root selects an immutable generation and holds that generation's shared native `flock` lease in the Node host before importing it. Missing or incompatible native support fails the managed extension load; unmarked extensions keep the ordinary loading path.
+
+A successful lease is retained until host-process exit. `AgentSession.reload()` awaits registered `session_shutdown` handler results, invalidates the old runner, reloads resources, and installs a replacement runner. This does not prove old extension code is quiescent:
+
+- A shutdown handler can start detached promises, timers, or other work and return while that work still imports modules or holds callbacks.
+- A callback can do `await ctx.reload(); await import("./lazy.js")`. The callback resumes after the new runtime is installed and can still use its old module graph.
+- `AgentSession._refreshToolRegistry()` replaces wrapped tool definitions, but does not drain an already-running tool `execute` callback. Event handlers and other captured callbacks likewise have no active-call counter.
+- `ExtensionRunner.invalidate()` invalidates stale host API operations; it does not stop arbitrary JavaScript or cancel/drain extension-owned work.
+
+Releasing a lease at shutdown/reload would therefore allow collection while old extension code can still execute. Current retention grows by one native handle and map entry per distinct managed `(root, generation)` successfully loaded by the process. It is monotonic until host exit: growth is bounded by the number of versions loaded during that process lifetime, not by a fixed count, so repeated reloads in a long-lived host can accumulate leases. Host exit, including abrupt termination, closes the descriptors in the kernel.
+
+A safe unload boundary needs to own extension execution, not just its registrations. The robust structural option is a supervised extension worker/process that owns the lease and runs extension code behind an RPC boundary; terminating that worker fences callbacks and lazy imports and releases its lease. An in-process alternative would need a complete callback/tool registry, cancellation and drain tracking, and a restriction preventing detached work or direct Node APIs from outliving the scope. The current extension API does not enforce those restrictions, so the host must not release successful leases early.
 
 ### Extension Styles
 

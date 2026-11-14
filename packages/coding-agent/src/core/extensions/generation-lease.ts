@@ -20,6 +20,8 @@ const addonDirectories = configuredAddonDirectory
 
 type NativeLease = { acquire(path: string): object; release(handle: object): void };
 type LeaseState = { handle: object; references: number };
+// Successful-generation references stay held until process exit. Runtime reload does not prove
+// old extension callbacks, detached async work, or lazy imports have quiesced.
 const leases = new Map<string, LeaseState>();
 
 function readJson(filePath: string): Record<string, unknown> {

@@ -22,6 +22,39 @@ function runNpmPack(packageDir, destination) {
 	return spawnSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", destination], { cwd: packageDir, encoding: "utf8" });
 }
 
+function waitForOutput(child, expected, timeoutMs = 5000) {
+	return new Promise((resolveOutput, rejectOutput) => {
+		let output = "";
+		const timer = setTimeout(() => rejectOutput(new Error(`Timed out waiting for ${expected}: ${output}`)), timeoutMs);
+		child.stdout.setEncoding("utf8");
+		child.stderr.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => {
+			output += chunk;
+			if (output.includes(expected)) {
+				clearTimeout(timer);
+				resolveOutput(output);
+			}
+		});
+		child.stderr.on("data", (chunk) => { output += chunk; });
+		child.once("error", (error) => {
+			clearTimeout(timer);
+			rejectOutput(error);
+		});
+		child.once("exit", (code, signal) => {
+			if (output.includes(expected)) return;
+			clearTimeout(timer);
+			rejectOutput(new Error(`Packed addon host exited before ${expected} (${code ?? signal}): ${output}`));
+		});
+	});
+}
+
+function waitForExit(child) {
+	if (child.exitCode !== null || child.signalCode !== null) {
+		return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+	}
+	return new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
+}
+
 function sha256(bytes) {
 	return createHash("sha256").update(bytes).digest("hex");
 }
@@ -124,6 +157,32 @@ process.exitCode = result.status === 0 ? 0 : 1;
 			const unpackedArtifact = join(unpacked, "package", "dist", "native", "linux-x64");
 			const loaded = run("load", unpackedArtifact);
 			assert.equal(loaded.status, 0, loaded.stderr);
+
+			// Exercise the addon bytes from the packed runtime, not a separately compiled test addon.
+			const packedAddon = join(unpackedArtifact, "flock_lease.node");
+			const packedLock = join(temp, "packed-generation.lease.lock");
+			writeFileSync(packedLock, "");
+			const packedHost = spawn(process.execPath, [
+				"-e",
+				`const lease=require(process.argv[1]); lease.acquire(process.argv[2]); process.stdout.write("PACKED_HOST_READY\\n"); setInterval(() => {}, 1000);`,
+				packedAddon,
+				packedLock,
+			], { stdio: ["ignore", "pipe", "pipe"] });
+			try {
+				await waitForOutput(packedHost, "PACKED_HOST_READY");
+				const blockedCollector = spawnSync("flock", ["--nonblock", "--exclusive", packedLock, "true"], { encoding: "utf8" });
+				assert.notEqual(blockedCollector.status, 0, "packed addon must hold the shared lock in its host process");
+				packedHost.kill("SIGKILL");
+				const packedHostExit = await waitForExit(packedHost);
+				assert.equal(packedHostExit.signal, "SIGKILL");
+				const releasedCollector = spawnSync("flock", ["--nonblock", "--exclusive", packedLock, "true"], { encoding: "utf8" });
+				assert.equal(releasedCollector.status, 0, releasedCollector.stderr);
+			} finally {
+				if (packedHost.exitCode === null && packedHost.signalCode === null) {
+					packedHost.kill("SIGKILL");
+					await waitForExit(packedHost);
+				}
+			}
 
 			// Ordinary --ignore-scripts pack after the opt-in pack still sees stale source-tree bytes.
 			assert.ok(existsSync(join(staleDist, "flock_lease.node")));
