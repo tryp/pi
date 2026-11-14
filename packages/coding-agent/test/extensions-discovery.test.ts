@@ -45,7 +45,10 @@ describe("extensions discovery", () => {
 		const generation = path.join(managedRoot, "generations", "generation-a");
 		fs.mkdirSync(generation, { recursive: true });
 		fs.writeFileSync(path.join(managedRoot, "managed-extension.json"), JSON.stringify({ protocol: 1 }));
-		fs.writeFileSync(path.join(managedRoot, "active.json"), JSON.stringify({ protocol: 1, generation: "generations/generation-a" }));
+		fs.writeFileSync(
+			path.join(managedRoot, "active.json"),
+			JSON.stringify({ protocol: 1, generation: "generations/generation-a" }),
+		);
 		fs.writeFileSync(path.join(generation, "extension.json"), JSON.stringify({ protocol: 1, entry: "index.js" }));
 		fs.writeFileSync(path.join(generation, ".lease.lock"), "");
 		fs.writeFileSync(path.join(generation, "index.js"), extensionCode);

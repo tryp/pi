@@ -585,7 +585,7 @@ async function loadExtension(
 	cacheToken?: ExtensionCacheToken,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const discoveredPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
-	let managedLease: ReturnType<typeof acquireManagedExtension> = undefined;
+	let managedLease: ReturnType<typeof acquireManagedExtension>;
 
 	try {
 		managedLease = acquireManagedExtension(discoveredPath);
