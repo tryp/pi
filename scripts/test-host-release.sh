@@ -21,13 +21,16 @@ cat > "$tmp/release/.host-release.json" <<'EOF'
 {"format":1,"fixture":true}
 EOF
 chmod +x "$tmp/release/dist/cli.js"
-(cd "$tmp/release" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+(cd "$tmp/release" && find . -type f ! -name SHA256SUMS ! -name .host-release.json -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+checksums_digest=$(sha256sum "$tmp/release/SHA256SUMS" | awk '{print $1}')
+printf '{"format":1,"fixture":true,"checksumsSha256":"%s"}\n' "$checksums_digest" > "$tmp/release/.host-release.json"
+manifest_digest=$(sha256sum "$tmp/release/.host-release.json" | awk '{print $1}')
 cat > "$tmp/bin/node" <<'EOF'
 #!/bin/sh
 exec /usr/bin/node "$@"
 EOF
 chmod +x "$tmp/bin/node"
-RESULT_FILE="$tmp/result.json" EXPECTED_TMPDIR="$tmp/custom-tmp" PI_HOST_RELEASE_DIR="$tmp/release" HOME="$tmp/home" TMPDIR="$tmp/custom-tmp" PATH="$tmp/bin:$PATH" \
+RESULT_FILE="$tmp/result.json" EXPECTED_TMPDIR="$tmp/custom-tmp" PI_HOST_RELEASE_DIR="$tmp/release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" HOME="$tmp/home" TMPDIR="$tmp/custom-tmp" PATH="$tmp/bin:$PATH" \
 	"$repo/scripts/pi-host-release" --json-mode 'two words'
 EXPECTED_TMPDIR="$tmp/custom-tmp" node - "$tmp/result.json" <<'NODE'
 const assert = require("node:assert/strict");
@@ -44,12 +47,43 @@ test ! -e "$tmp/release/.pi/agent"
 
 # Tampering with any packaged file blocks execution.
 printf 'tampered\n' >> "$tmp/release/dist/cli.js"
-if RESULT_FILE="$tmp/should-not-exist" PI_HOST_RELEASE_DIR="$tmp/release" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+if RESULT_FILE="$tmp/should-not-exist" PI_HOST_RELEASE_DIR="$tmp/release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
 	"$repo/scripts/pi-host-release" --version >"$tmp/tamper.out" 2>&1; then
 	fail "launcher accepted a modified release"
 fi
-grep -q 'release verification failed' "$tmp/tamper.out"
+grep -Eq 'manifest digest mismatch|checksum index digest mismatch|release verification failed' "$tmp/tamper.out"
 test ! -e "$tmp/should-not-exist"
+# The independently supplied digest is mandatory; a matching checksum list alone is insufficient.
+if RESULT_FILE="$tmp/no-digest" PI_HOST_RELEASE_DIR="$tmp/release" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+	"$repo/scripts/pi-host-release" --version >"$tmp/no-digest.out" 2>&1; then
+	fail "launcher accepted a release without operator-provided digest"
+fi
+grep -q 'set PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256' "$tmp/no-digest.out"
+# A symlink cannot redirect a release payload outside its root.
+cp "$tmp/release/dist/cli.js" "$tmp/cli.expected"
+rm "$tmp/release/dist/cli.js"
+ln -s "$tmp/cli.expected" "$tmp/release/dist/cli.js"
+if RESULT_FILE="$tmp/symlink-result" PI_HOST_RELEASE_DIR="$tmp/release" PI_HOST_RELEASE_EXPECTED_MANIFEST_SHA256="$manifest_digest" HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+	"$repo/scripts/pi-host-release" --version >"$tmp/symlink.out" 2>&1; then
+	fail "launcher accepted a symlink in the release"
+fi
+grep -q 'release tree contains symlinks' "$tmp/symlink.out"
+rm "$tmp/release/dist/cli.js"
+mv "$tmp/cli.expected" "$tmp/release/dist/cli.js"
+
+# Publisher rejects symlinks, then durably renames an ordinary staged payload.
+mkdir -p "$tmp/publish-parent/.symlink-stage"
+ln -s "$tmp/cli.expected" "$tmp/publish-parent/.symlink-stage/escape"
+if python3 "$repo/scripts/publish-host-release.py" "$tmp/publish-parent/.symlink-stage" "$tmp/publish-parent/rejected" >"$tmp/publish-symlink.out" 2>&1; then
+	fail "publisher accepted a symlinked stage"
+fi
+grep -q 'symlink in release tree' "$tmp/publish-symlink.out"
+rm -rf "$tmp/publish-parent/.symlink-stage"
+mkdir "$tmp/publish-parent/.durable-stage"
+printf 'durable payload\n' > "$tmp/publish-parent/.durable-stage/payload"
+python3 "$repo/scripts/publish-host-release.py" "$tmp/publish-parent/.durable-stage" "$tmp/publish-parent/release"
+test "$(cat "$tmp/publish-parent/release/payload")" = 'durable payload'
+test ! -e "$tmp/publish-parent/.durable-stage"
 
 # A path collision and a concurrent publication lock both refuse without damage.
 mkdir -p "$tmp/output/existing" "$tmp/source/packages/coding-agent/install-lock"
@@ -114,4 +148,4 @@ grep -q 'synthetic npm stage failure' "$tmp/stage-failure.out" || { cat "$tmp/st
 test ! -e "$tmp/output/$release_key"
 test "$(cat "$tmp/output/existing/sentinel")" = 'release sentinel'
 test -z "$(find "$tmp/output" -maxdepth 1 -name '.*.stage.*')"
-echo "OK: launcher checksum, argument/TMPDIR/config isolation, sentinel preservation, lock/collision guards, and failed stage cleanup"
+echo "OK: launcher checksum and independent manifest digest, argument/TMPDIR/config isolation, sentinel preservation, lock/collision guards, and failed stage cleanup"

@@ -79,24 +79,32 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-# Build all seven local packages and the target-specific native addon from this exact checkout.
-make -C "$source_dir" check-tree-clean build-telemetry build-extra build-agent build-coding-agent build-native-extension-lease
-node "$source_dir/scripts/native-extension-lease.mjs" verify "$source_dir/packages/coding-agent/native-artifacts/linux-x64"
+# Build from a private extraction of the reviewed commit, never shared checkout outputs.
 stage=$(mktemp -d "$output_root/.${release_name}.stage.XXXXXX") || fail "cannot create private stage"
+source_snapshot="$stage/.source"
+mkdir "$source_snapshot"
+git -C "$source_dir" archive --format=tar "$actual_commit" > "$stage/source.tar" || fail "cannot archive reviewed source commit"
+tar -xf "$stage/source.tar" -C "$source_snapshot"
+rm "$stage/source.tar"
+git -C "$source_snapshot" init -q
+git -C "$source_snapshot" -c user.name=host-release -c user.email=host-release@example.invalid add -A
+git -C "$source_snapshot" -c user.name=host-release -c user.email=host-release@example.invalid commit -qm "private reviewed source snapshot"
+make -C "$source_snapshot" check-tree-clean build-telemetry build-extra build-agent build-coding-agent build-native-extension-lease
+node "$source_snapshot/scripts/native-extension-lease.mjs" verify "$source_snapshot/packages/coding-agent/native-artifacts/linux-x64"
 
-cp "$source_dir/packages/coding-agent/install-lock/package.json" "$stage/package.json"
-cp "$source_dir/packages/coding-agent/install-lock/package-lock.json" "$stage/package-lock.json"
+cp "$source_snapshot/packages/coding-agent/install-lock/package.json" "$stage/package.json"
+cp "$source_snapshot/packages/coding-agent/install-lock/package-lock.json" "$stage/package-lock.json"
 npm ci --prefix "$stage" --ignore-scripts --omit=dev --no-audit --no-fund
-rsync -a --delete --exclude=/native/linux-x64 "$source_dir/packages/coding-agent/dist/" "$stage/dist/"
-cp "$source_dir/packages/coding-agent/package.json" "$stage/package.json"
+rsync -a --delete --exclude=/native/linux-x64 "$source_snapshot/packages/coding-agent/dist/" "$stage/dist/"
+cp "$source_snapshot/packages/coding-agent/package.json" "$stage/package.json"
 for pkg in telemetry agent ai client protocol tui; do
-	module_name=$(node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(p.name)' "$source_dir/packages/$pkg/package.json")
+	module_name=$(node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.stdout.write(p.name)' "$source_snapshot/packages/$pkg/package.json")
 	module_dir="$stage/node_modules/$module_name"
 	mkdir -p "$module_dir"
-	rsync -a --delete "$source_dir/packages/$pkg/dist/" "$module_dir/dist/"
-	cp "$source_dir/packages/$pkg/package.json" "$module_dir/package.json"
+	rsync -a --delete "$source_snapshot/packages/$pkg/dist/" "$module_dir/dist/"
+	cp "$source_snapshot/packages/$pkg/package.json" "$module_dir/package.json"
 done
-node "$source_dir/scripts/native-extension-lease.mjs" stage "$source_dir/packages/coding-agent/native-artifacts/linux-x64" "$stage"
+node "$source_snapshot/scripts/native-extension-lease.mjs" stage "$source_snapshot/packages/coding-agent/native-artifacts/linux-x64" "$stage"
 test -x "$stage/dist/cli.js" && test -x "$stage/dist/rpc-entry.js" && test -x "$stage/dist/bundle/cli.js" || fail "coding-agent dist incomplete"
 test -f "$stage/node_modules/grok-mermaid/package.json" || fail "runtime dependency closure incomplete"
 # Exercise real module resolution/imports from the assembled release, before publication.
@@ -104,11 +112,11 @@ node --input-type=module -e 'await import(process.argv[1]); await import(process
 	"$stage/node_modules/@earendil-works/pi-agent-core/dist/agent.js" \
 	"$stage/node_modules/@earendil-works/pi-ai/dist/index.js" \
 	"$stage/dist/index.js"
-node "$source_dir/scripts/native-extension-lease.mjs" load "$stage/dist/native/linux-x64"
+node "$source_snapshot/scripts/native-extension-lease.mjs" load "$stage/dist/native/linux-x64"
 
-lock_sha=$(sha256sum "$source_dir/packages/coding-agent/install-lock/package-lock.json" | awk '{print $1}')
+lock_sha=$(sha256sum "$source_snapshot/packages/coding-agent/install-lock/package-lock.json" | awk '{print $1}')
 tree=$(git -C "$source_dir" rev-parse HEAD^{tree})
-node - "$stage" "$actual_commit" "$tree" "$node_version" "$lock_sha" "$source_dir" <<'NODE'
+node - "$stage" "$actual_commit" "$tree" "$node_version" "$lock_sha" "$source_snapshot" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
 const [stage, commit, tree, nodeVersion, lockSha, source] = process.argv.slice(2);
@@ -124,12 +132,29 @@ const addon = JSON.parse(fs.readFileSync(path.join(stage, "dist/native/linux-x64
 const metadata = { format: 1, sourceCommit: commit, sourceTree: tree, source: path.basename(source), platform: "linux-x64", nodeVersion, nodeApi: addon.nodeApi, lockfileSha256: lockSha, packageVersions: versions, addon };
 fs.writeFileSync(path.join(stage, ".host-release.json"), JSON.stringify(metadata, null, 2) + "\n", { flag: "wx" });
 NODE
-(cd "$stage" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+rm -rf -- "$source_snapshot"
+[ -z "$(find "$stage" -type l -print -quit)" ] || fail "release tree contains symlinks"
+(cd "$stage" && find . -type f ! -name SHA256SUMS ! -name .host-release.json -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+node - "$stage" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const stage = process.argv[2];
+const manifestPath = path.join(stage, ".host-release.json");
+const metadata = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+metadata.checksumsSha256 = require("node:crypto").createHash("sha256").update(fs.readFileSync(path.join(stage, "SHA256SUMS"))).digest("hex");
+fs.writeFileSync(manifestPath, JSON.stringify(metadata, null, 2) + "\n");
+NODE
 # Make the completed payload read-only before its single atomic, no-clobber rename.
 find "$stage" -type f -exec chmod a-w {} +
 find "$stage" -type d -exec chmod a-w {} +
 [ ! -e "$release_dir" ] && [ ! -L "$release_dir" ] || fail "release appeared during build; refusing overwrite: $release_dir"
-python3 "$script_dir/publish-host-release.py" "$stage" "$release_dir" || fail "atomic no-clobber release publication failed"
+if python3 "$script_dir/publish-host-release.py" "$stage" "$release_dir"; then
+	:
+else
+	publish_status=$?
+	if [ "$publish_status" -eq 3 ]; then fail "COMMITTED-BUT-UNCERTAIN: release exists at $release_dir; parent directory durability was not confirmed"; fi
+	fail "atomic no-clobber release publication failed"
+fi
 stage=
 echo "OK: immutable host release published: $release_dir"
 echo "Manifest: $release_dir/.host-release.json"
