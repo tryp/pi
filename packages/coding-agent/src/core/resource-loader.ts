@@ -388,7 +388,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		// extensions/packages out while still loading user/global and temporary CLI extensions.
 		this.settingsManager.setProjectTrusted(false);
 		await this.settingsManager.reload();
-		return this.loadCurrentExtensionSet({ includeInlineFactories: true });
+		return this.loadCurrentExtensionSet({ includeInlineFactories: true, applyPackageReplacement: false });
 	}
 
 	async reload(options?: ResourceLoaderReloadOptions): Promise<void> {
@@ -628,7 +628,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		);
 	}
 
-	private async loadCurrentExtensionSet(options: { includeInlineFactories: boolean }): Promise<LoadExtensionsResult> {
+	private async loadCurrentExtensionSet(options: {
+		includeInlineFactories: boolean;
+		applyPackageReplacement?: boolean;
+	}): Promise<LoadExtensionsResult> {
 		const resolvedPaths = await this.packageManager.resolve();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
 			temporary: true,
@@ -638,10 +641,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
 			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
-		const finalExtensionPaths = await this.applyConfiguredExtensionPackageReplacement(
-			resolvedPaths.extensions,
-			extensionPaths,
-		);
+		const finalExtensionPaths =
+			options.applyPackageReplacement === false
+				? extensionPaths
+				: await this.applyConfiguredExtensionPackageReplacement(resolvedPaths.extensions, extensionPaths);
 		const extensionsResult = await loadExtensionsCached(finalExtensionPaths, this.cwd, this.eventBus);
 		if (!options.includeInlineFactories) {
 			return extensionsResult;

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -79,6 +79,88 @@ describe("DefaultResourceLoader", () => {
 				expect(extension?.commands.has(root.split(/[\\/]/).pop() ?? "")).toBe(true);
 			}
 			expect(loader.getExtensions().errors).toEqual([]);
+		});
+
+		it("waits for trust before resolving a project-only replacement target", async () => {
+			const projectTarget = join(cwd, ".pi", "project-context");
+			const managed = join(tempDir, "managed-context");
+			const executedPath = join(tempDir, "executed");
+			for (const root of [projectTarget, managed]) {
+				mkdirSync(join(root, "extensions"), { recursive: true });
+				writeFileSync(
+					join(root, "extensions", "index.ts"),
+					`import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(executedPath)}, ${JSON.stringify(root)}); export default function(pi) { pi.registerCommand(${JSON.stringify(root === managed ? "managed-context" : "project-context")}, { description: "loaded", handler: async () => {} }); }`,
+				);
+				writeFileSync(join(root, "package.json"), JSON.stringify({ pi: { extensions: ["extensions/index.ts"] } }));
+			}
+			mkdirSync(join(cwd, ".pi"), { recursive: true });
+			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ packages: [projectTarget] }));
+			const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager,
+				extensionPackageReplacement: { source: projectTarget, replacement: managed },
+			});
+			let trustResolved = false;
+
+			await loader.reload({
+				resolveProjectTrust: async ({ extensionsResult }) => {
+					trustResolved = true;
+					expect(extensionsResult.extensions.map((extension) => extension.path)).not.toContain(
+						join(projectTarget, "extensions", "index.ts"),
+					);
+					expect(existsSync(executedPath)).toBe(false);
+					return true;
+				},
+			});
+
+			expect(trustResolved).toBe(true);
+			expect(readFileSync(executedPath, "utf8")).toBe(managed);
+			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual([
+				join(managed, "extensions", "index.ts"),
+			]);
+			expect(loader.getExtensions().extensions[0]?.commands.has("managed-context")).toBe(true);
+			expect(existsSync(join(agentDir, "tmp", "extensions"))).toBe(false);
+		});
+
+		it("keeps project-only targets and replacements unexecuted when trust is denied", async () => {
+			const projectTarget = join(cwd, ".pi", "project-context");
+			const managed = join(tempDir, "managed-context");
+			const executedPath = join(tempDir, "executed");
+			for (const root of [projectTarget, managed]) {
+				mkdirSync(join(root, "extensions"), { recursive: true });
+				writeFileSync(
+					join(root, "extensions", "index.ts"),
+					`import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(executedPath)}, ${JSON.stringify(root)}); export default function(pi) {}`,
+				);
+				writeFileSync(join(root, "package.json"), JSON.stringify({ pi: { extensions: ["extensions/index.ts"] } }));
+			}
+			mkdirSync(join(cwd, ".pi"), { recursive: true });
+			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ packages: [projectTarget] }));
+			const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager,
+				extensionPackageReplacement: { source: projectTarget, replacement: managed },
+			});
+			let trustResolved = false;
+
+			await expect(
+				loader.reload({
+					resolveProjectTrust: async ({ extensionsResult }) => {
+						trustResolved = true;
+						expect(extensionsResult.extensions.map((extension) => extension.path)).not.toContain(
+							join(projectTarget, "extensions", "index.ts"),
+						);
+						return false;
+					},
+				}),
+			).rejects.toThrow("exactly one configured local package source");
+
+			expect(trustResolved).toBe(true);
+			expect(existsSync(executedPath)).toBe(false);
 		});
 
 		it("fails closed when the configured replacement target is absent", async () => {
