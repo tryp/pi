@@ -206,7 +206,7 @@ build-extra: build-ai build-protocol build-client build-tui
 # It is never compiled by the default build or by the live runtime.
 .PHONY: build-native-extension-lease
 build-native-extension-lease:
-	node scripts/native-extension-lease.mjs build packages/coding-agent/dist/native/linux-x64
+	node scripts/native-extension-lease.mjs build packages/coding-agent/native-artifacts/linux-x64
 
 ifeq ($(NATIVE_EXTENSION_LEASE),1)
 deploy: build-native-extension-lease

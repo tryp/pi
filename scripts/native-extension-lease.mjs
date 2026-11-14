@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -87,17 +87,12 @@ try {
 			console.log("Loaded verified Linux x64 Node-API 8 addon");
 			break;
 		}
-		case "prepare-pack": {
-			const artifactDir = join(root, "packages/coding-agent/dist/native/linux-x64");
-			if (process.env.PI_NATIVE_EXTENSION_LEASE === "1") {
-				verify(artifactDir);
-			} else {
-				rmSync(artifactDir, { recursive: true, force: true });
-			}
+		case "verify":
+			if (!first) throw new Error("usage: native-extension-lease.mjs verify ARTIFACT_DIR");
+			verify(resolve(first));
 			break;
-		}
 		default:
-			throw new Error("usage: native-extension-lease.mjs {build|stage|load|prepare-pack} ...");
+			throw new Error("usage: native-extension-lease.mjs {build|stage|load|verify} ...");
 	}
 } catch (error) {
 	console.error(`native extension lease: ${error instanceof Error ? error.message : String(error)}`);

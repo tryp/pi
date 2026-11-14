@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -10,93 +10,139 @@ const root = resolve(import.meta.dirname, "..");
 const packageRoot = join(root, "packages/coding-agent");
 const packageManifest = join(packageRoot, "package.json");
 const source = join(packageRoot, "src/native/flock-lease.cc");
-const script = join(root, "scripts/native-extension-lease.mjs");
+const nativeScript = join(root, "scripts/native-extension-lease.mjs");
+const packScript = join(root, "scripts/pack-coding-agent-native.mjs");
 const testable = process.platform === "linux" && process.arch === "x64";
 
 function run(...args) {
-	return spawnSync(process.execPath, [script, ...args], { encoding: "utf8" });
+	return spawnSync(process.execPath, [nativeScript, ...args], { encoding: "utf8" });
 }
 
-function pack(directory, { dryRun = false, nativeOptIn = false, destination = directory } = {}) {
-	const args = ["pack", "--json"];
-	if (dryRun) args.push("--dry-run");
-	else args.push("--pack-destination", destination);
-	const env = { ...process.env };
-	if (nativeOptIn) env.PI_NATIVE_EXTENSION_LEASE = "1";
-	else delete env.PI_NATIVE_EXTENSION_LEASE;
-	const result = spawnSync("npm", args, { cwd: directory, encoding: "utf8", env });
-	return { ...result, packed: result.status === 0 ? JSON.parse(result.stdout)[0] : undefined };
+function runNpmPack(packageDir, destination) {
+	return spawnSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", destination], { cwd: packageDir, encoding: "utf8" });
 }
 
 function sha256(bytes) {
 	return createHash("sha256").update(bytes).digest("hex");
 }
 
+function startWorker(workerScript, packageDir, helperScript, mode, destination, barrier) {
+	const child = spawn(process.execPath, [workerScript], {
+		cwd: packageDir,
+		stdio: ["ignore", "pipe", "pipe"],
+		env: {
+			...process.env,
+			PI_PACK_MODE: mode,
+			PI_PACK_DESTINATION: destination,
+			PI_PACK_BARRIER: barrier,
+			PI_PACK_HELPER: helperScript,
+		},
+	});
+	let output = "";
+	let error = "";
+	child.stdout.setEncoding("utf8");
+	child.stderr.setEncoding("utf8");
+	child.stdout.on("data", (chunk) => { output += chunk; });
+	child.stderr.on("data", (chunk) => { error += chunk; });
+	const ready = new Promise((resolveReady, rejectReady) => {
+		const check = () => {
+			if (output.includes("READY\n")) resolveReady();
+		};
+		child.stdout.on("data", check);
+		child.once("error", rejectReady);
+	});
+	const result = new Promise((resolveResult, rejectResult) => {
+		child.once("error", rejectResult);
+		child.once("close", (status) => {
+			const line = output.split("\n").find((entry) => entry.startsWith("RESULT:"));
+			if (!line) return rejectResult(new Error(`pack worker did not report result (${status}): ${error}\n${output}`));
+			resolveResult({ status, error, result: JSON.parse(line.slice("RESULT:".length)) });
+		});
+	});
+	return { ready, result };
+}
+
 describe("optional Linux x64 native lease npm packaging", { skip: !testable }, () => {
-	it("keeps opt-in packs verified and removes stale addon bytes before ordinary packs", () => {
+	it("isolates opt-in packs and structurally excludes stale binaries from concurrent ordinary packs", async () => {
 		const temp = mkdtempSync(join(tmpdir(), "pi-native-lease-pack-"));
 		try {
-			const built = join(temp, "built");
 			const workspace = join(temp, "workspace");
 			const packageDir = join(workspace, "packages/coding-agent");
+			const artifactDir = join(packageDir, "native-artifacts/linux-x64");
+			const staleDist = join(packageDir, "dist/native/linux-x64");
 			const unpacked = join(temp, "unpacked");
+			const workerScript = join(temp, "pack-worker.cjs");
+			const stagedPackScript = join(workspace, "scripts/pack-coding-agent-native.mjs");
+			const barrier = join(temp, "start-packs");
 			const optPackDir = join(temp, "opt-pack");
-			mkdirSync(join(workspace, "scripts"), { recursive: true });
-			mkdirSync(join(packageDir, "src/native"), { recursive: true });
-			mkdirSync(unpacked);
-			mkdirSync(optPackDir);
+			const concurrentOrdinaryDir = join(temp, "concurrent-ordinary");
+			const sequentialOrdinaryDir = join(temp, "sequential-ordinary");
+			for (const directory of [join(workspace, "scripts"), join(packageDir, "src/native"), join(packageDir, "dist"), artifactDir, staleDist, unpacked, optPackDir, concurrentOrdinaryDir, sequentialOrdinaryDir]) {
+				mkdirSync(directory, { recursive: true });
+			}
 			copyFileSync(packageManifest, join(packageDir, "package.json"));
 			copyFileSync(source, join(packageDir, "src/native/flock-lease.cc"));
-			copyFileSync(script, join(workspace, "scripts/native-extension-lease.mjs"));
+			copyFileSync(nativeScript, join(workspace, "scripts/native-extension-lease.mjs"));
+			copyFileSync(packScript, join(workspace, "scripts/pack-coding-agent-native.mjs"));
+			writeFileSync(join(packageDir, "dist/index.js"), "export {};\n");
+			writeFileSync(join(staleDist, "flock_lease.node"), "stale addon from an earlier build");
+			writeFileSync(join(staleDist, "flock_lease.manifest.json"), "stale manifest\n");
+			execFileSync(process.execPath, [nativeScript, "build", artifactDir], { stdio: "pipe" });
 
-			// Build once, then pack this same package workspace with opt-in and without it.
-			execFileSync(process.execPath, [script, "build", built], { stdio: "pipe" });
-			const nativeDist = join(packageDir, "dist/native/linux-x64");
-			const copyBuildOutput = () => {
-				mkdirSync(nativeDist, { recursive: true });
-				copyFileSync(join(built, "flock_lease.node"), join(nativeDist, "flock_lease.node"));
-				copyFileSync(join(built, "flock_lease.manifest.json"), join(nativeDist, "flock_lease.manifest.json"));
-			};
-			copyBuildOutput();
+			const workerContents = `const { existsSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const mode = process.env.PI_PACK_MODE;
+process.stdout.write("READY\\n");
+while (!existsSync(process.env.PI_PACK_BARRIER)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+const command = mode === "native" ? process.execPath : "npm";
+const args = mode === "native"
+  ? [process.env.PI_PACK_HELPER, "--pack-destination", process.env.PI_PACK_DESTINATION]
+  : ["pack", "--ignore-scripts", "--json", "--pack-destination", process.env.PI_PACK_DESTINATION];
+const result = spawnSync(command, args, { cwd: process.cwd(), encoding: "utf8" });
+process.stdout.write("RESULT:" + JSON.stringify({ status: result.status, stdout: result.stdout, stderr: result.stderr }) + "\\n");
+process.exitCode = result.status === 0 ? 0 : 1;
+`;
+			writeFileSync(workerScript, workerContents);
 
-			const optedDryRun = pack(packageDir, { dryRun: true, nativeOptIn: true });
-			assert.equal(optedDryRun.status, 0, optedDryRun.stderr);
-			assert.ok(optedDryRun.packed.files.some(({ path }) => path === "dist/native/linux-x64/flock_lease.node"));
-			assert.ok(optedDryRun.packed.files.some(({ path }) => path === "dist/native/linux-x64/flock_lease.manifest.json"));
+			const readyOrdinary = startWorker(workerScript, packageDir, stagedPackScript, "ordinary", concurrentOrdinaryDir, barrier);
+			const readyNative = startWorker(workerScript, packageDir, stagedPackScript, "native", optPackDir, barrier);
+			await Promise.all([readyOrdinary.ready, readyNative.ready]);
+			writeFileSync(barrier, "go");
+			const [ordinaryConcurrent, nativeConcurrent] = await Promise.all([readyOrdinary.result, readyNative.result]);
+			assert.equal(ordinaryConcurrent.status, 0, ordinaryConcurrent.error);
+			assert.equal(ordinaryConcurrent.result.status, 0, ordinaryConcurrent.result.stderr);
+			assert.equal(nativeConcurrent.status, 0, nativeConcurrent.error);
+			assert.equal(nativeConcurrent.result.status, 0, nativeConcurrent.result.stderr);
 
-			const optedPack = pack(packageDir, { nativeOptIn: true, destination: optPackDir });
-			assert.equal(optedPack.status, 0, optedPack.stderr);
-			execFileSync("tar", ["-xzf", join(optPackDir, optedPack.packed.filename), "-C", unpacked]);
+			const ordinaryMetadata = JSON.parse(ordinaryConcurrent.result.stdout)[0];
+			assert.ok(!ordinaryMetadata.files.some(({ path }) => path.endsWith(".node")));
+			const nativeMetadata = JSON.parse(nativeConcurrent.result.stdout);
+			assert.ok(nativeMetadata.files.some(({ path }) => path === "dist/native/linux-x64/flock_lease.node"));
+			assert.ok(nativeMetadata.files.some(({ path }) => path === "dist/native/linux-x64/flock_lease.manifest.json"));
+			const nativeTarball = join(optPackDir, nativeMetadata.filename);
+			execFileSync("tar", ["-xzf", nativeTarball, "-C", unpacked]);
 			const unpackedArtifact = join(unpacked, "package", "dist", "native", "linux-x64");
 			const loaded = run("load", unpackedArtifact);
 			assert.equal(loaded.status, 0, loaded.stderr);
 
-			// The ordinary pack runs in the same workspace while opt-in bytes are still present.
-			assert.ok(existsSync(join(nativeDist, "flock_lease.node")));
-			const ordinaryDryRun = pack(packageDir, { dryRun: true });
-			assert.equal(ordinaryDryRun.status, 0, ordinaryDryRun.stderr);
-			assert.ok(!ordinaryDryRun.packed.files.some(({ path }) => path.endsWith(".node")));
-			assert.ok(!existsSync(nativeDist), "ordinary prepack removes stale native output");
-			const ordinaryPackDir = join(temp, "ordinary-pack");
-			mkdirSync(ordinaryPackDir);
-			const ordinaryPack = pack(packageDir, { destination: ordinaryPackDir });
-			assert.equal(ordinaryPack.status, 0, ordinaryPack.stderr);
-			assert.ok(!ordinaryPack.packed.files.some(({ path }) => path.endsWith(".node")));
+			// Ordinary --ignore-scripts pack after the opt-in pack still sees stale source-tree bytes.
+			assert.ok(existsSync(join(staleDist, "flock_lease.node")));
+			assert.ok(existsSync(join(artifactDir, "flock_lease.node")));
+			const ordinarySequential = runNpmPack(packageDir, sequentialOrdinaryDir);
+			assert.equal(ordinarySequential.status, 0, ordinarySequential.stderr);
+			const ordinaryMetadataSequential = JSON.parse(ordinarySequential.stdout)[0];
+			assert.ok(!ordinaryMetadataSequential.files.some(({ path }) => path.endsWith(".node")));
+			assert.ok(existsSync(join(staleDist, "flock_lease.node")), "ordinary pack must not mutate shared dist");
 
-			// A stale or corrupt artifact is rejected for opt-in and removed for ordinary packing.
-			copyBuildOutput();
-			writeFileSync(join(nativeDist, "flock_lease.node"), Buffer.from("corrupt stale addon"));
-			const corruptOptIn = pack(packageDir, { dryRun: true, nativeOptIn: true });
+			// Opt-in packaging rejects corrupt/missing build output without touching source dist.
+			writeFileSync(join(artifactDir, "flock_lease.node"), "corrupt build artifact");
+			const corruptOptIn = spawnSync(process.execPath, [stagedPackScript, "--dry-run"], { cwd: packageDir, encoding: "utf8" });
 			assert.notEqual(corruptOptIn.status, 0);
-			assert.match(`${corruptOptIn.stderr}${corruptOptIn.stdout}`, /checksum mismatch/);
-			const corruptOrdinary = pack(packageDir, { dryRun: true });
-			assert.equal(corruptOrdinary.status, 0, corruptOrdinary.stderr);
-			assert.ok(!corruptOrdinary.packed.files.some(({ path }) => path.endsWith(".node")));
-			assert.ok(!existsSync(nativeDist));
-
-			const missingOptIn = pack(packageDir, { dryRun: true, nativeOptIn: true });
+			assert.match(corruptOptIn.stderr, /checksum mismatch/);
+			rmSync(artifactDir, { recursive: true, force: true });
+			const missingOptIn = spawnSync(process.execPath, [stagedPackScript, "--dry-run"], { cwd: packageDir, encoding: "utf8" });
 			assert.notEqual(missingOptIn.status, 0);
-			assert.match(`${missingOptIn.stderr}${missingOptIn.stdout}`, /ENOENT/);
+			assert.match(missingOptIn.stderr, /ENOENT/);
 
 			const manifestPath = join(unpackedArtifact, "flock_lease.manifest.json");
 			const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
