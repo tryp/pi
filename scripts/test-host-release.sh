@@ -22,7 +22,7 @@ fi
 
 # Synthetic user state must remain outside the release and byte-identical.
 mkdir -p "$tmp/home/.pi/agent/sessions" "$tmp/release/dist" "$tmp/bin"
-printf 'settings sentinel\n' > "$tmp/home/.pi/agent/settings.json"
+printf '{}\n' > "$tmp/home/.pi/agent/settings.json"
 printf 'session sentinel\n' > "$tmp/home/.pi/agent/sessions/session.jsonl"
 cp "$tmp/home/.pi/agent/settings.json" "$tmp/settings.expected"
 cp "$tmp/home/.pi/agent/sessions/session.jsonl" "$tmp/session.expected"

@@ -102,7 +102,10 @@ if actual != seen:
 PY
 }
 verify_archive_blobs
-printf 'legacy settings sentinel\n' > "$tmp/home/.pi/agent/settings.json"
+printf '{}\n' > "$tmp/home/.pi/agent/settings.json"
+# Synthetic, non-secret API key enables the built-in Anthropic catalog without
+# any provider requests; PI_OFFLINE keeps model discovery local.
+printf '{"anthropic":{"type":"api_key","key":"offline-test-key-not-real"}}\n' > "$tmp/home/.pi/agent/auth.json"
 printf 'legacy session sentinel\n' > "$tmp/home/.pi/agent/sessions/sentinel.jsonl"
 printf 'legacy database sentinel\n' > "$tmp/home/.pi/agent/db/sentinel.sqlite"
 cp -a "$tmp/home/.pi/agent" "$tmp/legacy-expected"
