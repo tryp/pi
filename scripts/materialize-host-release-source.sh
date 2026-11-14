@@ -22,9 +22,18 @@ import subprocess
 import sys
 
 source, commit, destination = sys.argv[1:]
+commit_object = subprocess.check_output(
+    ["git", "-C", source, "cat-file", "commit", commit]
+)
+committer = next(
+    line for line in commit_object.split(b"\n") if line.startswith(b"committer ")
+)
+commit_timestamp = int(committer.rsplit(b" ", 2)[-2])
 entries = subprocess.check_output(
     ["git", "-C", source, "ls-tree", "-rz", "--full-tree", commit]
 )
+directories = set()
+materialized = []
 for entry in entries.split(b"\0"):
     if not entry:
         continue
@@ -37,13 +46,27 @@ for entry in entries.split(b"\0"):
     except subprocess.CalledProcessError:
         raise SystemExit(f"required pinned blob unavailable locally: {os.fsdecode(rel)}")
     path = os.path.join(os.fsencode(destination), rel)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    while parent != os.fsencode(destination):
+        directories.add(parent)
+        next_parent = os.path.dirname(parent)
+        if next_parent == parent:
+            break
+        parent = next_parent
     if mode == "120000":
         os.symlink(os.fsdecode(data), path)
     else:
         with open(path, "xb") as stream:
             stream.write(data)
         os.chmod(path, 0o755 if mode == "100755" else 0o644)
+    materialized.append((path, mode))
+
+for path, mode in materialized:
+    if mode != "120000" or os.utime in os.supports_follow_symlinks:
+        os.utime(path, (commit_timestamp, commit_timestamp), follow_symlinks=False)
+for path in sorted(directories, key=lambda item: item.count(os.fsencode(os.sep)), reverse=True):
+    os.utime(path, (commit_timestamp, commit_timestamp))
 PY
 git -C "$destination" init -q
 # Reconstruct the exact tree from the raw files, retaining the original tree object ID.

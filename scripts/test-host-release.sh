@@ -321,16 +321,41 @@ EOF
 printf 'line one\nline two\n' > "$tmp/attributes-source/pi-test.bat"
 printf 'ignored source\n' > "$tmp/attributes-source/ignored.txt"
 printf '%s\n' 'format $Format:%H$' > "$tmp/attributes-source/substitution.txt"
+mkdir -p "$tmp/attributes-source/nested"
+printf 'executable fixture\n' > "$tmp/attributes-source/nested/run.sh"
+chmod +x "$tmp/attributes-source/nested/run.sh"
+ln -s ../pi-test.bat "$tmp/attributes-source/nested/link.bat"
 git -C "$tmp/attributes-source" -c user.name=fixture -c user.email=fixture@example.invalid add .
-git -C "$tmp/attributes-source" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm attributes
+GIT_AUTHOR_DATE='@1700000000 +0000' GIT_COMMITTER_DATE='@1700000000 +0000' \
+	git -C "$tmp/attributes-source" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm attributes
 attributes_commit=$(git -C "$tmp/attributes-source" rev-parse HEAD)
 attributes_tree=$(git -C "$tmp/attributes-source" rev-parse HEAD^{tree})
 "$repo/scripts/materialize-host-release-source.sh" "$tmp/attributes-source" "$attributes_commit" "$attributes_tree" "$tmp/materialized-attributes"
-for file in .gitattributes pi-test.bat ignored.txt substitution.txt; do
+for file in .gitattributes pi-test.bat ignored.txt substitution.txt nested/run.sh nested/link.bat; do
 	blob=$(git -C "$tmp/attributes-source" rev-parse "$attributes_commit:$file")
 	git -C "$tmp/attributes-source" cat-file blob "$blob" > "$tmp/expected-blob"
-	cmp "$tmp/materialized-attributes/$file" "$tmp/expected-blob"
+	if [ -L "$tmp/materialized-attributes/$file" ]; then
+		printf '%s' "$(readlink "$tmp/materialized-attributes/$file")" > "$tmp/actual-blob"
+		cmp "$tmp/actual-blob" "$tmp/expected-blob"
+	else
+		cmp "$tmp/materialized-attributes/$file" "$tmp/expected-blob"
+	fi
 done
+test -x "$tmp/materialized-attributes/nested/run.sh" || fail "materializer lost executable mode"
+test "$(readlink "$tmp/materialized-attributes/nested/link.bat")" = '../pi-test.bat' || fail "materializer changed symlink target"
+python3 - "$tmp/materialized-attributes" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+expected = 1700000000
+for relative in (".gitattributes", "pi-test.bat", "ignored.txt", "substitution.txt", "nested/run.sh", "nested/link.bat", "nested"):
+    path = os.path.join(root, relative)
+    info = os.lstat(path)
+    assert int(info.st_mtime) == expected, (relative, info.st_mtime)
+if os.utime in os.supports_follow_symlinks:
+    assert int(os.lstat(os.path.join(root, "nested/link.bat")).st_mtime) == expected
+PY
 required_blob=$(git -C "$tmp/partial-source" rev-parse "$pinned_commit:source.txt")
 required_blob_object="$tmp/partial-source/.git/objects/$(printf '%s' "$required_blob" | cut -c1-2)/$(printf '%s' "$required_blob" | cut -c3-)"
 test -f "$required_blob_object"
