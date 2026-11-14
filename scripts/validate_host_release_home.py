@@ -13,24 +13,25 @@ class ValidationError(Exception):
     pass
 
 
-def inventory(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
-    entries: dict[str, tuple[str, bytes | str | None]] = {}
+def inventory(root: Path) -> dict[str, tuple[str, int, bytes | str | None]]:
+    entries: dict[str, tuple[str, int, bytes | str | None]] = {}
     for current, dirs, files in os.walk(root, followlinks=False):
         current_path = Path(current)
         for name in list(dirs) + files:
             path = current_path / name
             relative = path.relative_to(root).as_posix()
             mode = path.lstat().st_mode
+            permissions = stat.S_IMODE(mode)
             if stat.S_ISLNK(mode):
-                entries[relative] = ("symlink", os.readlink(path))
+                entries[relative] = ("symlink", permissions, os.readlink(path))
                 if name in dirs:
                     dirs.remove(name)
             elif stat.S_ISDIR(mode):
-                entries[relative] = ("directory", None)
+                entries[relative] = ("directory", permissions, None)
             elif stat.S_ISREG(mode):
-                entries[relative] = ("file", path.read_bytes())
+                entries[relative] = ("file", permissions, path.read_bytes())
             else:
-                entries[relative] = ("special", None)
+                entries[relative] = ("special", permissions, None)
     return entries
 
 

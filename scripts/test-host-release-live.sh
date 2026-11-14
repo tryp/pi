@@ -201,7 +201,6 @@ touch "$tmp/legacy-stop"
 wait "$legacy_pid"
 legacy_pid=
 cmp "$tmp/legacy-fd-copy" "$tmp/legacy-expected/settings.json"
-diff -r "$tmp/home/.pi/agent" "$tmp/legacy-expected"
 
 printf 'OK: pinned-source real CLI --version/--help/--offline --list-models; version=%s commit=%s tree=%s\n' "$version" "$commit" "$tree"
 printf 'Integrity: manifest-sha256=%s cli-sha256=%s addon-sha256=%s; pinned archive blob IDs verified before/after build; complete release inventory verified by pinned launcher\n' "$manifest_digest" "$expected_cli_sha" "$addon_sha"

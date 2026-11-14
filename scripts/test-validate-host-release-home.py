@@ -30,11 +30,15 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate(self.home, self.baseline)
 
-    def test_legitimate_new_cache_is_accepted(self):
+    def test_full_end_of_gate_acceptance_preserves_legacy_sentinels_and_cache(self):
         self.cache().write_text(json.dumps({"fixture-provider": {"models": [
             {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
         ]}}))
         validate(self.home, self.baseline)
+        self.assertEqual((self.home / ".pi/agent/settings.json").read_text(), "{}\n")
+        self.assertEqual((self.home / ".pi/agent/sessions/sentinel.jsonl").read_text(), "session\n")
+        self.assertEqual((self.home / ".pi/agent/db/sentinel.sqlite").read_bytes(), b"db sentinel")
+        self.assertTrue(self.cache().is_file())
 
     def test_cache_preexisting_in_baseline_is_rejected(self):
         path = self.baseline / ".pi/agent/models-store.json"
@@ -63,6 +67,13 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
             {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
         ]}}))
         (self.home / ".pi/agent/unexpected.txt").write_text("not allowed")
+        self.assert_invalid()
+
+    def test_changed_permissions_are_rejected(self):
+        self.cache().write_text(json.dumps({"fixture-provider": {"models": [
+            {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
+        ]}}))
+        (self.home / ".pi/agent/settings.json").chmod(0o600)
         self.assert_invalid()
 
     def test_empty_catalog_is_rejected_as_not_meaningful(self):
