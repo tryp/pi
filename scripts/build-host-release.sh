@@ -89,6 +89,7 @@ rm "$stage/source.tar"
 git -C "$source_snapshot" init -q
 git -C "$source_snapshot" -c user.name=host-release -c user.email=host-release@example.invalid add -A
 git -C "$source_snapshot" -c user.name=host-release -c user.email=host-release@example.invalid commit -qm "private reviewed source snapshot"
+npm ci --prefix "$source_snapshot" --ignore-scripts --no-audit --no-fund
 make -C "$source_snapshot" check-tree-clean build-telemetry build-extra build-agent build-coding-agent build-native-extension-lease
 node "$source_snapshot/scripts/native-extension-lease.mjs" verify "$source_snapshot/packages/coding-agent/native-artifacts/linux-x64"
 
