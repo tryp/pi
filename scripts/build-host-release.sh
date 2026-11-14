@@ -39,7 +39,7 @@ if [ "$status_only" -eq 1 ]; then
 	find "$output_root" -mindepth 2 -maxdepth 2 -name .host-release.json -type f -print | sort | while IFS= read -r manifest; do
 		release_dir=$(dirname "$manifest")
 		printf '%s ' "$release_dir"
-		if (cd "$release_dir" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then echo VERIFIED; else echo INVALID; fi
+		if [ -x "$release_dir/dist/cli.js" ] && (cd "$release_dir" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then echo VERIFIED; else echo INVALID; fi
 	done
 	exit 0
 fi
