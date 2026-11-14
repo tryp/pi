@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
@@ -32,11 +33,19 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<number> {
 	});
 }
 
-function respond(request: IncomingMessage, response: ServerResponse, requests: RequestSummary[], failFirst: boolean) {
+function respond(
+	request: IncomingMessage,
+	response: ServerResponse,
+	requests: RequestSummary[],
+	sessionHeaderValues: string[],
+	failFirst: boolean,
+) {
+	const sessionHeader = request.headers["x-opencode-session"];
+	if (typeof sessionHeader === "string") sessionHeaderValues.push(sessionHeader);
 	requests.push({
 		method: request.method ?? "",
 		path: new URL(request.url ?? "/", "http://127.0.0.1").pathname,
-		sessionHeaderPresent: request.headers["x-opencode-session"] !== undefined,
+		sessionHeaderPresent: sessionHeader !== undefined,
 	});
 	request.resume();
 	request.once("end", () => {
@@ -52,14 +61,21 @@ function respond(request: IncomingMessage, response: ServerResponse, requests: R
 
 const server = createServer();
 const requests: RequestSummary[] = [];
-server.on("request", (request, response) => respond(request, response, requests, true));
+const sessionHeaderValues: string[] = [];
+server.on("request", (request, response) => respond(request, response, requests, sessionHeaderValues, true));
 
 describe("OpenCode session header CLI integration", () => {
 	it.each([
 		["opencode-go", "claude-haiku-5-5"],
 		["opencode", "claude-fable-5"],
 	])("sends session routing on POST /v1/messages and retries consistently for %s", async (provider, model) => {
+		if (!existsSync(cliPath)) {
+			throw new Error(
+				`Built CLI bundle is missing at ${cliPath}; run npm run test:opencode-session-header-cli to rebuild and test it.`,
+			);
+		}
 		requests.length = 0;
+		sessionHeaderValues.length = 0;
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(0, "127.0.0.1", () => resolve());
@@ -87,6 +103,8 @@ describe("OpenCode session header CLI integration", () => {
 				await runCli(["-p", "local mock integration", "--model", `${provider}/${model}`, "--no-tools"], env),
 			).toBe(0);
 			expect(requests).toHaveLength(2);
+			expect(sessionHeaderValues).toHaveLength(2);
+			expect(sessionHeaderValues[0] === sessionHeaderValues[1]).toBe(true);
 			expect(requests).toEqual([
 				{ method: "POST", path: "/v1/messages", sessionHeaderPresent: true },
 				{ method: "POST", path: "/v1/messages", sessionHeaderPresent: true },
