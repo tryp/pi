@@ -189,6 +189,21 @@ kill -0 "$legacy_pid" || fail "legacy FD holder exited before checks completed"
 cmp "$tmp/home/.pi/agent/settings.json" "$tmp/legacy-expected/settings.json"
 cmp "$tmp/home/.pi/agent/sessions/sentinel.jsonl" "$tmp/legacy-expected/sessions/sentinel.jsonl"
 cmp "$tmp/home/.pi/agent/db/sentinel.sqlite" "$tmp/legacy-expected/db/sentinel.sqlite"
+
+# --offline --list-models constructs the JSON-backed model cache while loading
+# provider catalogs. Permit only that expected file, and require its content to
+# be a valid object-shaped provider catalog before including it in the snapshot.
+models_store="$tmp/home/.pi/agent/models-store.json"
+[[ -f "$models_store" && ! -L "$models_store" ]] || fail "offline model listing did not create a regular models-store.json"
+node - "$models_store" <<'NODE' || fail "offline model listing created invalid models-store.json"
+const fs = require("node:fs");
+const value = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (typeof value !== "object" || value === null || Array.isArray(value)) process.exit(1);
+for (const entry of Object.values(value)) {
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) process.exit(1);
+}
+NODE
+cp "$models_store" "$tmp/legacy-expected/models-store.json"
 [[ ! -e "$release/.pi" ]] || fail "release created user state under its own tree"
 touch "$tmp/legacy-stop"
 wait "$legacy_pid"
