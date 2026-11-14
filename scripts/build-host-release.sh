@@ -114,7 +114,9 @@ const path = require("node:path");
 const [stage, commit, tree, nodeVersion, lockSha, source] = process.argv.slice(2);
 const names = ["telemetry", "agent", "ai", "client", "protocol", "tui", "coding-agent"];
 const versions = Object.fromEntries(names.map((name) => {
-  const file = name === "coding-agent" ? path.join(stage, "package.json") : path.join(stage, "node_modules/@earendil-works/pi-" + name, "package.json");
+  const sourceManifest = name === "coding-agent" ? null : JSON.parse(fs.readFileSync(path.join(source, "packages", name, "package.json"), "utf8"));
+  const moduleName = name === "coding-agent" ? null : sourceManifest.name;
+  const file = name === "coding-agent" ? path.join(stage, "package.json") : path.join(stage, "node_modules", moduleName, "package.json");
   const p = JSON.parse(fs.readFileSync(file, "utf8"));
   return [p.name, p.version];
 }));
