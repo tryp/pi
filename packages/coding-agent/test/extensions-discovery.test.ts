@@ -40,6 +40,24 @@ describe("extensions discovery", () => {
 		}
 	`;
 
+	it("fails closed for a marked extension when the native lease addon is unavailable", async () => {
+		const managedRoot = path.join(extensionsDir, "managed");
+		const generation = path.join(managedRoot, "generations", "generation-a");
+		fs.mkdirSync(generation, { recursive: true });
+		fs.writeFileSync(path.join(managedRoot, "managed-extension.json"), JSON.stringify({ protocol: 1 }));
+		fs.writeFileSync(path.join(managedRoot, "active.json"), JSON.stringify({ protocol: 1, generation: "generations/generation-a" }));
+		fs.writeFileSync(path.join(generation, "extension.json"), JSON.stringify({ protocol: 1, entry: "index.js" }));
+		fs.writeFileSync(path.join(generation, ".lease.lock"), "");
+		fs.writeFileSync(path.join(generation, "index.js"), extensionCode);
+		fs.writeFileSync(path.join(managedRoot, "index.js"), extensionCode);
+
+		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+
+		expect(result.extensions).toHaveLength(0);
+		expect(result.errors).toHaveLength(1);
+		expect(result.errors[0].error).toContain("lease addon is missing");
+	});
+
 	it("discovers direct .ts files in extensions/", async () => {
 		fs.writeFileSync(path.join(extensionsDir, "foo.ts"), extensionCode);
 		fs.writeFileSync(path.join(extensionsDir, "bar.ts"), extensionCode);

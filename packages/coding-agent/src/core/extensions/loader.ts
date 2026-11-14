@@ -32,6 +32,7 @@ import { execCommand } from "../exec.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
+import { acquireManagedExtension } from "./generation-lease.ts";
 import type {
 	EntryRenderer,
 	Extension,
@@ -583,12 +584,16 @@ async function loadExtension(
 	runtime: ExtensionRuntime,
 	cacheToken?: ExtensionCacheToken,
 ): Promise<{ extension: Extension | null; error: string | null }> {
-	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
+	const discoveredPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
+	let managedLease: ReturnType<typeof acquireManagedExtension> = undefined;
 
 	try {
-		const factory = await loadExtensionModule(resolvedPath, cacheToken);
+		managedLease = acquireManagedExtension(discoveredPath);
+		const resolvedPath = managedLease?.entryPath ?? discoveredPath;
+		const factory = await loadExtensionModule(resolvedPath, managedLease ? undefined : cacheToken);
 		time(`${extensionPath} module import`, "extensions");
 		if (!factory) {
+			managedLease?.releaseOnFailure();
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
 
@@ -596,6 +601,7 @@ async function loadExtension(
 
 		return { extension, error: null };
 	} catch (err) {
+		managedLease?.releaseOnFailure();
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
