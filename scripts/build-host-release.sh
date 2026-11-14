@@ -80,7 +80,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 # Build all seven local packages and the target-specific native addon from this exact checkout.
-make -C "$source_dir" check-tree-clean build-telemetry build-agent build-extra build-coding-agent build-native-extension-lease
+make -C "$source_dir" check-tree-clean build-telemetry build-extra build-agent build-coding-agent build-native-extension-lease
 node "$source_dir/scripts/native-extension-lease.mjs" verify "$source_dir/packages/coding-agent/native-artifacts/linux-x64"
 stage=$(mktemp -d "$output_root/.${release_name}.stage.XXXXXX") || fail "cannot create private stage"
 
