@@ -122,6 +122,9 @@ while [[ ! -e "$tmp/legacy-ready" ]]; do sleep 0.05; done
 clean_env=(env -i "PATH=$PATH" "HOME=$tmp/home" "TMPDIR=$tmp" "GIT_NO_LAZY_FETCH=1" "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" "npm_config_cache=$tmp/npm-cache" "npm_config_userconfig=$tmp/npmrc" "npm_config_globalconfig=$tmp/global-npmrc" "npm_config_audit=false" "npm_config_fund=false")
 "${clean_env[@]}" "$tmp/reviewed-source/scripts/build-host-release.sh" --source-dir "$tmp/reviewed-source" --source-commit "$commit" --output-root "$tmp/output"
 verify_archive_blobs
+# Snapshot the complete isolated HOME outside itself after the build and before
+# any CLI startup; the agent-only copy remains the legacy sentinel/FD baseline.
+cp -a "$tmp/home" "$tmp/initial-home"
 release=$(find "$tmp/output" -mindepth 2 -maxdepth 2 -name .host-release.json -type f -print -quit)
 [[ -n "$release" ]] || fail "assembled release manifest was not published"
 release=${release%/.host-release.json}
@@ -195,7 +198,7 @@ cmp "$tmp/home/.pi/agent/db/sentinel.sqlite" "$tmp/legacy-expected/db/sentinel.s
 # The initial snapshot must not contain the cache. Offline listing may create
 # only that exact path; the helper compares every other entry and validates its
 # catalog schema without adopting post-run state into the expected snapshot.
-python3 "$tmp/reviewed-source/scripts/validate_host_release_home.py" "$tmp/home" "$tmp/legacy-expected" || fail "offline model listing changed unexpected HOME state or created an invalid cache"
+python3 "$tmp/reviewed-source/scripts/validate_host_release_home.py" "$tmp/home" "$tmp/initial-home" || fail "offline model listing changed unexpected HOME state or created an invalid cache"
 [[ ! -e "$release/.pi" ]] || fail "release created user state under its own tree"
 touch "$tmp/legacy-stop"
 wait "$legacy_pid"

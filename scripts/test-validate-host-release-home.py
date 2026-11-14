@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,7 +16,9 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.home = root / "home"
-        self.baseline = root / "baseline"
+        self.baseline = root / "initial-home"
+        self.assertNotEqual(self.baseline, self.home)
+        self.assertFalse(self.baseline.is_relative_to(self.home))
         for path in (self.home, self.baseline):
             (path / ".pi/agent/sessions").mkdir(parents=True)
             (path / ".pi/agent/db").mkdir(parents=True)
@@ -39,6 +42,13 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
         self.assertEqual((self.home / ".pi/agent/sessions/sentinel.jsonl").read_text(), "session\n")
         self.assertEqual((self.home / ".pi/agent/db/sentinel.sqlite").read_bytes(), b"db sentinel")
         self.assertTrue(self.cache().is_file())
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("validate_host_release_home.py")), str(self.home), str(self.baseline)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_cache_preexisting_in_baseline_is_rejected(self):
         path = self.baseline / ".pi/agent/models-store.json"
@@ -74,6 +84,13 @@ class ValidateHostReleaseHomeTests(unittest.TestCase):
             {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
         ]}}))
         (self.home / ".pi/agent/settings.json").chmod(0o600)
+        self.assert_invalid()
+
+    def test_modified_legacy_path_is_rejected(self):
+        self.cache().write_text(json.dumps({"fixture-provider": {"models": [
+            {"id": "fixture-model", "name": "Fixture Model", "api": "fixture-api"}
+        ]}}))
+        (self.home / ".pi/agent/sessions/sentinel.jsonl").write_text("modified session\\n")
         self.assert_invalid()
 
     def test_empty_catalog_is_rejected_as_not_meaningful(self):
