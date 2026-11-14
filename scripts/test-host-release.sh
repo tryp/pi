@@ -279,12 +279,27 @@ git -C "$tmp/partial-source" add source.txt
 git -C "$tmp/partial-source" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm pinned
 pinned_commit=$(git -C "$tmp/partial-source" rev-parse HEAD)
 pinned_tree=$(git -C "$tmp/partial-source" rev-parse HEAD^{tree})
+# Configure an actual promisor remote backed by a sentinel helper. First prove
+# the helper is reachable without the guard, then require zero access while the
+# materializer and gate-equivalent source Git operations run with the guard.
+mkdir -p "$tmp/promisor-bin"
+cat > "$tmp/promisor-bin/git-remote-sentinel" <<'EOF'
+#!/bin/sh
+touch "$GIT_LAZY_FETCH_SENTINEL"
+exit 1
+EOF
+chmod +x "$tmp/promisor-bin/git-remote-sentinel"
+git -C "$tmp/partial-source" config extensions.partialClone origin
+git -C "$tmp/partial-source" config remote.origin.promisor true
+git -C "$tmp/partial-source" config remote.origin.url sentinel::fixture
 parent_object="$tmp/partial-source/.git/objects/$(printf '%s' "$parent_commit" | cut -c1-2)/$(printf '%s' "$parent_commit" | cut -c3-)"
 test -f "$parent_object"
 rm -f "$parent_object"
-if GIT_NO_LAZY_FETCH=1 git -C "$tmp/partial-source" cat-file -e "$parent_commit^{commit}" 2>/dev/null; then
-	fail "synthetic source still contains unrelated parent object"
+if env -u GIT_NO_LAZY_FETCH "GIT_LAZY_FETCH_SENTINEL=$tmp/lazy-fetch-sentinel" "PATH=$tmp/promisor-bin:$PATH" git -C "$tmp/partial-source" cat-file -e "$parent_commit^{commit}" 2>/dev/null; then
+	fail "synthetic source unexpectedly has unrelated parent object"
 fi
+test -e "$tmp/lazy-fetch-sentinel" || fail "synthetic promisor helper was not reached without the lazy-fetch guard"
+rm -f "$tmp/lazy-fetch-sentinel"
 "$repo/scripts/materialize-host-release-source.sh" "$tmp/partial-source" "$pinned_commit" "$pinned_tree" "$tmp/materialized-source"
 test "$(git -C "$tmp/materialized-source" rev-parse HEAD)" = "$pinned_commit"
 test "$(git -C "$tmp/materialized-source" rev-parse HEAD^{tree})" = "$pinned_tree"
@@ -298,8 +313,36 @@ required_blob=$(git -C "$tmp/partial-source" rev-parse "$pinned_commit:source.tx
 required_blob_object="$tmp/partial-source/.git/objects/$(printf '%s' "$required_blob" | cut -c1-2)/$(printf '%s' "$required_blob" | cut -c3-)"
 test -f "$required_blob_object"
 rm -f "$required_blob_object"
-if "$repo/scripts/materialize-host-release-source.sh" "$tmp/partial-source" "$pinned_commit" "$pinned_tree" "$tmp/missing-blob-source" >"$tmp/missing-blob.out" 2>&1; then
+if env GIT_NO_LAZY_FETCH=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_LAZY_FETCH_SENTINEL="$tmp/lazy-fetch-sentinel" "PATH=$tmp/promisor-bin:$PATH" "$repo/scripts/materialize-host-release-source.sh" "$tmp/partial-source" "$pinned_commit" "$pinned_tree" "$tmp/missing-blob-source" >"$tmp/missing-blob.out" 2>&1; then
 	fail "materializer accepted a missing required pinned blob"
 fi
 grep -q 'cannot archive pinned commit from locally available objects' "$tmp/missing-blob.out" || { cat "$tmp/missing-blob.out" >&2; fail "missing required blob did not fail at source archive"; }
-echo "OK: exact release inventory, manifest digest, link rejection, uncertain commit, live sentinel fd preservation, lock/collision guards, failed stage cleanup, and pinned source/history/object validation"
+test ! -e "$tmp/lazy-fetch-sentinel" || fail "materializer contacted promisor helper for missing required blob"
+# Exercise the actual gate through its preflight, archive verification setup,
+# and failing materialization. A git wrapper asserts the guard is exported on
+# every gate Git invocation; fake node avoids unrelated runtime requirements.
+real_git=$(command -v git)
+mkdir -p "$tmp/gate-bin"
+cat > "$tmp/gate-bin/git" <<'EOF'
+#!/bin/sh
+if [ "${GIT_NO_LAZY_FETCH:-}" != 1 ]; then
+	printf 'unguarded\n' >> "$GIT_GUARD_LOG"
+	exit 90
+fi
+printf 'guarded\n' >> "$GIT_GUARD_LOG"
+exec "$REAL_GIT" "$@"
+EOF
+cat > "$tmp/gate-bin/node" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$tmp/gate-bin/git" "$tmp/gate-bin/node"
+if env -u GIT_NO_LAZY_FETCH "PATH=$tmp/gate-bin:$tmp/promisor-bin:$PATH" "GIT_GUARD_LOG=$tmp/gate-git.log" "REAL_GIT=$real_git" GIT_LAZY_FETCH_SENTINEL="$tmp/lazy-fetch-sentinel" \
+	"$repo/scripts/test-host-release-live.sh" --source-commit "$pinned_commit" --source-tree "$pinned_tree" --source-dir "$tmp/partial-source" >"$tmp/live-gate-git.out" 2>&1; then
+	fail "live gate unexpectedly passed with a required pinned blob missing"
+fi
+grep -q 'cannot archive pinned commit from locally available objects' "$tmp/live-gate-git.out" || { cat "$tmp/live-gate-git.out" >&2; fail "live gate did not fail on missing required pinned blob"; }
+test "$(wc -l < "$tmp/gate-git.log")" -ge 3 || fail "live gate test did not observe all expected source Git operations"
+if grep -q '^unguarded$' "$tmp/gate-git.log"; then fail "live gate issued Git without GIT_NO_LAZY_FETCH=1"; fi
+test ! -e "$tmp/lazy-fetch-sentinel" || fail "live gate contacted promisor helper for missing required blob"
+echo "OK: exact release inventory, manifest digest, link rejection, uncertain commit, live sentinel fd preservation, lock/collision guards, failed stage cleanup, and guarded gate-wide promisor source materialization"

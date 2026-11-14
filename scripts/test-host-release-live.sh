@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Opt-in real assembled-release startup gate. Requires independently supplied pins.
 set -euo pipefail
+# Never let gate Git commands or inherited build/verification processes lazily
+# fetch missing promisor objects. This environment switch takes precedence over
+# repository config; ignore system/global config as well.
+export GIT_NO_LAZY_FETCH=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 
 repo=$(cd "$(dirname "$0")/.." && pwd -P)
 source_dir=$repo
@@ -11,9 +15,10 @@ usage() {
 Usage: scripts/test-host-release-live.sh --source-commit FULL_COMMIT --source-tree FULL_TREE [--source-dir CLEAN_CHECKOUT]
 
 Builds and starts the actual assembled host release in an isolated temporary
-HOME. This is an opt-in networked integration gate: npm ci resolves the exact
-reviewed lockfile and may contact the npm registry/catalog. Supply commit and
-tree pins from an independent review record, not from this checkout's output.
+HOME. This is an opt-in integration gate: npm ci resolves the exact reviewed
+lockfile and may contact the npm registry/catalog; Git lazy fetching is disabled
+for the gate and all inherited build processes. Supply commit and tree pins from
+an independent review record, not from this checkout's output.
 Linux x86_64, Node >=22.19.0, make, g++, npm, git, rsync, sha256sum, and Python
 are required. No live deployment or real user state is used.
 EOF
@@ -113,7 +118,7 @@ while [[ ! -e "$tmp/legacy-ready" ]]; do sleep 0.05; done
 
 # Scrub inherited credentials/configuration, including npm config; only isolated
 # HOME/cache/userconfig and required build tools are visible to the build.
-clean_env=(env -i "PATH=$PATH" "HOME=$tmp/home" "TMPDIR=$tmp" "npm_config_cache=$tmp/npm-cache" "npm_config_userconfig=$tmp/npmrc" "npm_config_globalconfig=$tmp/global-npmrc" "npm_config_audit=false" "npm_config_fund=false")
+clean_env=(env -i "PATH=$PATH" "HOME=$tmp/home" "TMPDIR=$tmp" "GIT_NO_LAZY_FETCH=1" "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" "npm_config_cache=$tmp/npm-cache" "npm_config_userconfig=$tmp/npmrc" "npm_config_globalconfig=$tmp/global-npmrc" "npm_config_audit=false" "npm_config_fund=false")
 "${clean_env[@]}" "$tmp/reviewed-source/scripts/build-host-release.sh" --source-dir "$tmp/reviewed-source" --source-commit "$commit" --output-root "$tmp/output"
 verify_archive_blobs
 release=$(find "$tmp/output" -mindepth 2 -maxdepth 2 -name .host-release.json -type f -print -quit)
