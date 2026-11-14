@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { discoverAndLoadExtensions } from "../src/core/extensions/loader.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -18,6 +18,7 @@ describe("extensions discovery", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllEnvs();
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -40,7 +41,30 @@ describe("extensions discovery", () => {
 		}
 	`;
 
-	it("fails closed for a marked extension when the native lease addon is unavailable", async () => {
+	it("requires explicit opt-in before activating managed generation leases", async () => {
+		vi.stubEnv("PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE", "");
+		const managedRoot = path.join(extensionsDir, "managed");
+		const generation = path.join(managedRoot, "generations", "generation-a");
+		fs.mkdirSync(generation, { recursive: true });
+		fs.writeFileSync(path.join(managedRoot, "managed-extension.json"), JSON.stringify({ protocol: 1 }));
+		fs.writeFileSync(
+			path.join(managedRoot, "active.json"),
+			JSON.stringify({ protocol: 1, generation: "generations/generation-a" }),
+		);
+		fs.writeFileSync(path.join(generation, "extension.json"), JSON.stringify({ protocol: 1, entry: "index.js" }));
+		fs.writeFileSync(path.join(generation, ".lease.lock"), "");
+		fs.writeFileSync(path.join(generation, "index.js"), extensionCode);
+		fs.writeFileSync(path.join(managedRoot, "index.js"), extensionCode);
+
+		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+
+		expect(result.extensions).toHaveLength(0);
+		expect(result.errors).toHaveLength(1);
+		expect(result.errors[0].error).toContain("experimental and disabled by default");
+	});
+
+	it("fails clearly when opted in without the native lease addon", async () => {
+		vi.stubEnv("PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE", "1");
 		const managedRoot = path.join(extensionsDir, "managed");
 		const generation = path.join(managedRoot, "generations", "generation-a");
 		fs.mkdirSync(generation, { recursive: true });

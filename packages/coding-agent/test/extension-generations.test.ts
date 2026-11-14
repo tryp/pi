@@ -128,6 +128,7 @@ function spawnHost(mode: string, environment: Record<string, string>) {
 			...process.env,
 			PI_GENERATION_HOST_CHILD: "1",
 			PI_GENERATION_MODE: mode,
+			PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE: "1",
 			PI_EXTENSION_LEASE_NATIVE_DIR: addonDirectory,
 			...environment,
 		},

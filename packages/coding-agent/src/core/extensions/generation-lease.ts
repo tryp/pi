@@ -84,6 +84,11 @@ export function acquireManagedExtension(
 ): { entryPath: string; releaseOnFailure(): void } | undefined {
 	const rootCandidate = findManagedRoot(entryPath);
 	if (!rootCandidate) return undefined;
+	if (process.env.PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE !== "1") {
+		throw new Error(
+			"Managed extension generation leases are experimental and disabled by default; set PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE=1 on Linux x64 with the verified native addon installed",
+		);
+	}
 	const root = fs.realpathSync(rootCandidate);
 	const markerPath = path.join(root, markerName);
 	assertRegularFile(markerPath);
