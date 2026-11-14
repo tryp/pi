@@ -9,14 +9,16 @@ const markerName = "managed-extension.json";
 const activeName = "active.json";
 const manifestName = "extension.json";
 const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
-const configuredAddonDirectory = process.env.PI_EXTENSION_LEASE_NATIVE_DIR;
-const addonDirectories = configuredAddonDirectory
-	? [path.resolve(configuredAddonDirectory)]
-	: [
-			path.resolve(moduleDirectory, "../../../native/linux-x64"),
-			path.resolve(moduleDirectory, "../../../dist/native/linux-x64"),
-			path.resolve(moduleDirectory, "../../../native-artifacts/linux-x64"),
-		];
+function getAddonDirectories(): string[] {
+	const configuredAddonDirectory = process.env.PI_EXTENSION_LEASE_NATIVE_DIR;
+	return configuredAddonDirectory
+		? [path.resolve(configuredAddonDirectory)]
+		: [
+				path.resolve(moduleDirectory, "../../../native/linux-x64"),
+				path.resolve(moduleDirectory, "../../../dist/native/linux-x64"),
+				path.resolve(moduleDirectory, "../../../native-artifacts/linux-x64"),
+			];
+}
 
 type NativeLease = { acquire(path: string): object; release(handle: object): void };
 type LeaseState = { handle: object; references: number };
@@ -41,7 +43,7 @@ function assertRegularFile(filePath: string): fs.Stats {
 function loadAddon(): NativeLease {
 	if (process.platform !== "linux" || process.arch !== "x64")
 		throw new Error(`Managed extensions require Linux x64 (got ${process.platform}-${process.arch})`);
-	const addonDirectory = addonDirectories.find((directory) =>
+	const addonDirectory = getAddonDirectories().find((directory) =>
 		fs.existsSync(path.join(directory, "flock_lease.manifest.json")),
 	);
 	if (!addonDirectory)

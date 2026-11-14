@@ -65,6 +65,9 @@ describe("extensions discovery", () => {
 
 	it("fails clearly when opted in without the native lease addon", async () => {
 		vi.stubEnv("PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE", "1");
+		const isolatedAddonDirectory = path.join(tempDir, "runtime", "native");
+		fs.mkdirSync(isolatedAddonDirectory, { recursive: true });
+		vi.stubEnv("PI_EXTENSION_LEASE_NATIVE_DIR", isolatedAddonDirectory);
 		const managedRoot = path.join(extensionsDir, "managed");
 		const generation = path.join(managedRoot, "generations", "generation-a");
 		fs.mkdirSync(generation, { recursive: true });
