@@ -1,20 +1,21 @@
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ENV_AGENT_DIR } from "../src/config.ts";
+import { ENV_AGENT_DIR, ENV_SESSION_DIR } from "../src/config.ts";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const temporaryRoots: string[] = [];
+const timeoutMs = 20_000;
 
 afterEach(() => {
 	for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function createPackage(root: string): void {
+function createPackage(root: string, extensionBody = "export default function() {};"): void {
 	mkdirSync(join(root, "extensions"), { recursive: true });
-	writeFileSync(join(root, "extensions", "index.ts"), "export default function() {};");
+	writeFileSync(join(root, "extensions", "index.ts"), extensionBody);
 	writeFileSync(join(root, "package.json"), JSON.stringify({ pi: { extensions: ["extensions/index.ts"] } }));
 }
 
@@ -62,7 +63,133 @@ function prepareTrustedProject() {
 	return { projectDir, agentDir, replacement };
 }
 
+function waitForFile(filePath: string, child: ReturnType<typeof spawn>): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	return new Promise((resolvePromise, reject) => {
+		const poll = () => {
+			if (existsSync(filePath)) return resolvePromise();
+			if (child.exitCode !== null || child.signalCode !== null)
+				return reject(new Error("CLI exited before extension load"));
+			if (Date.now() >= deadline) return reject(new Error(`Timed out waiting for ${filePath}`));
+			setTimeout(poll, 20);
+		};
+		poll();
+	});
+}
+
+function tryExclusiveLock(lockPath: string): number {
+	return spawnSync("flock", ["--nonblock", "--exclusive", lockPath, "true"], { stdio: "ignore" }).status ?? -1;
+}
+
+function buildLeaseAddon(outputDirectory: string): void {
+	const script = resolve(__dirname, "../../../scripts/native-extension-lease.mjs");
+	execFileSync(process.execPath, [script, "build", outputDirectory], { stdio: "pipe" });
+}
+
+function createManagedReplacement(root: string, markerPath: string): string {
+	const generation = join(root, "generations", "replacement-generation");
+	mkdirSync(generation, { recursive: true });
+	writeFileSync(join(generation, ".lease.lock"), "");
+	writeFileSync(join(generation, "extension.json"), JSON.stringify({ protocol: 1, entry: "extensions/index.js" }));
+	writeFileSync(join(generation, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions/index.js"] } }));
+	mkdirSync(join(generation, "extensions"), { recursive: true });
+	writeFileSync(
+		join(generation, "extensions/index.js"),
+		`import { writeFileSync } from "node:fs"; export default (pi) => { writeFileSync(${JSON.stringify(markerPath)}, "loaded"); pi.registerCommand("fixture", { description: "fixture", handler() {} }); };`,
+	);
+	writeFileSync(join(root, "managed-extension.json"), JSON.stringify({ protocol: 1 }));
+	writeFileSync(
+		join(root, "active.json"),
+		JSON.stringify({ protocol: 1, generation: "generations/replacement-generation" }),
+	);
+	writeFileSync(join(root, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions/index.js"] } }));
+	mkdirSync(join(root, "extensions"), { recursive: true });
+	writeFileSync(join(root, "extensions/index.js"), "export default function() {};");
+	return generation;
+}
+
+function sanitizedEnvironment(): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	for (const key of Object.keys(env)) {
+		if (/(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)/i.test(key)) delete env[key];
+	}
+	return env;
+}
+
 describe("extension package replacement CLI", () => {
+	it(
+		"loads the replacement and other trusted project extension in a child process, pins its generation, and releases it at exit",
+		async () => {
+			if (process.platform !== "linux" || process.arch !== "x64") return;
+			const { projectDir, agentDir, replacement } = prepareTrustedProject();
+			const legacy = "./legacy-package";
+			const other = "./other-package";
+			const legacyRoot = join(projectDir, ".pi", legacy);
+			const otherRoot = join(projectDir, ".pi", other);
+			const legacyMarker = join(projectDir, "legacy-loaded");
+			const otherMarker = join(projectDir, "other-loaded");
+			createPackage(
+				legacyRoot,
+				`import { writeFileSync } from "node:fs"; export default (pi) => { writeFileSync(${JSON.stringify(legacyMarker)}, "loaded"); pi.registerCommand("legacy", { description: "legacy", handler() {} }); };`,
+			);
+			createPackage(
+				otherRoot,
+				`import { writeFileSync } from "node:fs"; export default (pi) => { writeFileSync(${JSON.stringify(otherMarker)}, "loaded"); pi.registerCommand("other", { description: "other", handler() {} }); };`,
+			);
+			const replacementMarker = join(projectDir, "replacement-loaded");
+			const generation = createManagedReplacement(replacement, replacementMarker);
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ packages: [legacy, other] }));
+			const addonDirectory = join(projectDir, "isolated-native-addon");
+			buildLeaseAddon(addonDirectory);
+			const isolatedHome = join(projectDir, "isolated-home");
+			mkdirSync(isolatedHome, { recursive: true });
+			const sessionDir = join(projectDir, "isolated-sessions");
+			const child = spawn(
+				process.execPath,
+				[cliPath, "--mode", "rpc", "--replace-extension-package", legacy, replacement],
+				{
+					cwd: projectDir,
+					stdio: ["pipe", "pipe", "pipe"],
+					env: {
+						...sanitizedEnvironment(),
+						HOME: isolatedHome,
+						USERPROFILE: isolatedHome,
+						XDG_CONFIG_HOME: join(isolatedHome, ".config"),
+						[ENV_AGENT_DIR]: agentDir,
+						[ENV_SESSION_DIR]: sessionDir,
+						PI_OFFLINE: "1",
+						PI_EXPERIMENTAL_NATIVE_EXTENSION_LEASE: "1",
+						PI_EXTENSION_LEASE_NATIVE_DIR: addonDirectory,
+						TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+					},
+				},
+			);
+			let output = "";
+			child.stdout.on("data", (chunk: Buffer) => {
+				output += chunk.toString();
+			});
+			child.stderr.on("data", (chunk: Buffer) => {
+				output += chunk.toString();
+			});
+			const lockPath = join(generation, ".lease.lock");
+			try {
+				await waitForFile(replacementMarker, child);
+				await waitForFile(otherMarker, child);
+				expect(existsSync(legacyMarker)).toBe(false);
+				expect(tryExclusiveLock(lockPath)).not.toBe(0);
+				child.stdin.end();
+				const deadline = Date.now() + timeoutMs;
+				while (child.exitCode === null && Date.now() < deadline)
+					await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+				expect(child.exitCode, output).toBe(0);
+				expect(tryExclusiveLock(lockPath)).toBe(0);
+			} finally {
+				if (child.exitCode === null) child.kill("SIGKILL");
+			}
+		},
+		timeoutMs * 2,
+	);
+
 	it("exits nonzero for a missing target without modifying configured packages", () => {
 		const { projectDir, agentDir, replacement } = prepareTrustedProject();
 		const globalOther = "./global-other";
