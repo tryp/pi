@@ -66,9 +66,10 @@ describe("issue #7253: manual compaction during an active response", () => {
 
 		expect(harness.session.isStreaming).toBe(true);
 		const compactPromise = harness.session.compact();
-		const compactExpectation = expect(compactPromise).resolves.toMatchObject({ summary: "manual summary" });
 		releaseSecondResponse();
-		await Promise.all([promptPromise, compactExpectation]);
+		const compactResult = await compactPromise;
+		expect(compactResult).toMatchObject({ summary: "manual summary" });
+		await promptPromise;
 		await harness.session.prompt("follow up after compaction");
 
 		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["manual"]);
