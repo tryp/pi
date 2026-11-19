@@ -108,6 +108,7 @@ import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
+import { flushStdout } from "../../utils/flush-stdout.ts";
 import { parseGitUrl } from "../../utils/git.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import { getCwdRelativePath } from "../../utils/paths.ts";
@@ -2073,6 +2074,7 @@ export class InteractiveMode {
 		this.showError(`${prefix}: ${message}`);
 		stopThemeWatcher();
 		this.stop("transcript");
+		await flushStdout();
 		process.exit(1);
 	}
 
@@ -4079,6 +4081,7 @@ export class InteractiveMode {
 			this.themeController.disableAutoSync();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
+			await flushStdout();
 			process.exit(0);
 		}
 
@@ -4098,6 +4101,7 @@ export class InteractiveMode {
 			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
 		}
 
+		await flushStdout();
 		process.exit(0);
 	}
 
