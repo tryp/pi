@@ -142,6 +142,8 @@ export interface CompactionSettings {
 	maxContextFraction?: number;
 	triggerFraction?: number;
 	borderlineFraction?: number;
+	cacheExpiryPreflight?: boolean;
+	cacheExpiryPreflightMinTokens?: number;
 	triggerFractions?: Record<string, number>;
 }
 
@@ -153,6 +155,8 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	maxContextFraction: undefined,
 	triggerFraction: 0.88,
 	borderlineFraction: 0.9,
+	cacheExpiryPreflight: false,
+	cacheExpiryPreflightMinTokens: 60_000,
 	triggerFractions: {},
 };
 

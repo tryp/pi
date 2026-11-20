@@ -4,12 +4,12 @@ import type { ExtensionFactory } from "../../../src/index.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 type SessionWithCompactionInternals = {
-	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
+	_runAutoCompaction: (reason: "overflow" | "threshold" | "cache-expiry", willRetry: boolean) => Promise<boolean>;
 };
 
 interface RecordedCompactionEvent {
 	type: "session_before_compact" | "session_compact";
-	reason: "manual" | "extension" | "threshold" | "overflow";
+	reason: "manual" | "extension" | "threshold" | "overflow" | "cache-expiry";
 	willRetry: boolean;
 }
 

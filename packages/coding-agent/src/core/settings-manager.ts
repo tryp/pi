@@ -51,6 +51,10 @@ export interface CompactionSettings {
 	maxContextFraction?: number;
 	/** Fraction of trigger at which pre-send compaction begins. Default: DEFAULT_COMPACTION_SETTINGS.borderlineFraction. */
 	borderlineFraction?: number;
+	/** Precompact before submit after prompt-cache expiry. Opt in only with an algorithmic/cheap compactor such as pi-vcc; core LLM summarization can cost as much as the re-prefill it avoids. Default: false. */
+	cacheExpiryPreflight?: boolean;
+	/** Minimum estimated context tokens for cache-expiry preflight. Default: 60000. */
+	cacheExpiryPreflightMinTokens?: number;
 	triggerFractions?: Record<string, number>; // provider/model-id overrides
 }
 
@@ -922,6 +926,8 @@ export class SettingsManager {
 		maxContextFraction?: number;
 		triggerFraction: number;
 		borderlineFraction: number;
+		cacheExpiryPreflight: boolean;
+		cacheExpiryPreflightMinTokens: number;
 		triggerFractions: Record<string, number>;
 	} {
 		const raw = this.settings.compaction;
@@ -989,8 +995,27 @@ export class SettingsManager {
 			maxContextFraction,
 			triggerFraction,
 			borderlineFraction,
+			cacheExpiryPreflight: this.readCacheExpiryPreflightSetting(raw?.cacheExpiryPreflight),
+			cacheExpiryPreflightMinTokens: this.readCacheExpiryPreflightMinTokens(raw?.cacheExpiryPreflightMinTokens),
 			triggerFractions,
 		};
+	}
+
+	private readCacheExpiryPreflightSetting(value: unknown): boolean {
+		if (value === undefined) return DEFAULT_COMPACTION_SETTINGS.cacheExpiryPreflight!;
+		if (typeof value === "boolean") return value;
+		this.warnCompactionSetting("cacheExpiryPreflight", "Invalid compaction.cacheExpiryPreflight; expected a boolean");
+		return DEFAULT_COMPACTION_SETTINGS.cacheExpiryPreflight!;
+	}
+
+	private readCacheExpiryPreflightMinTokens(value: unknown): number {
+		if (value === undefined) return DEFAULT_COMPACTION_SETTINGS.cacheExpiryPreflightMinTokens!;
+		if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+		this.warnCompactionSetting(
+			"cacheExpiryPreflightMinTokens",
+			"Invalid compaction.cacheExpiryPreflightMinTokens; expected a finite non-negative token count",
+		);
+		return DEFAULT_COMPACTION_SETTINGS.cacheExpiryPreflightMinTokens!;
 	}
 
 	private validateCompactionFraction(value: unknown, name: string): number | undefined {

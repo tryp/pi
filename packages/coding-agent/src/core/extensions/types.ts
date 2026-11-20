@@ -601,7 +601,7 @@ export interface SessionBeforeForkEvent {
  * `ctx.compact()`; it is kept distinct so telemetry can tell a user action from
  * background maintenance.
  */
-export type CompactionEventReason = "manual" | "extension" | "threshold" | "overflow";
+export type CompactionEventReason = "manual" | "extension" | "threshold" | "overflow" | "cache-expiry";
 
 /** Fired before context compaction (can be cancelled or customized) */
 export interface SessionBeforeCompactEvent {
@@ -611,8 +611,8 @@ export interface SessionBeforeCompactEvent {
 	customInstructions?: string;
 	/**
 	 * What triggered the compaction: a user `/compact` (`manual`), an extension
-	 * calling `ctx.compact()` (`extension`), the context threshold, or context
-	 * overflow recovery.
+	 * calling `ctx.compact()` (`extension`), the context threshold, context
+	 * overflow recovery, or cache-expiry preflight before submit.
 	 */
 	reason: CompactionEventReason;
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
@@ -647,8 +647,8 @@ export interface SessionCompactEvent {
 	fromExtension: boolean;
 	/**
 	 * What triggered the compaction: a user `/compact` (`manual`), an extension
-	 * calling `ctx.compact()` (`extension`), the context threshold, or context
-	 * overflow recovery.
+	 * calling `ctx.compact()` (`extension`), the context threshold, context
+	 * overflow recovery, or cache-expiry preflight before submit.
 	 */
 	reason: CompactionEventReason;
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
@@ -680,8 +680,8 @@ export interface SessionCompactFailedEvent {
 	type: "session_compact_failed";
 	/**
 	 * What triggered the compaction: a user `/compact` (`manual`), an extension
-	 * calling `ctx.compact()` (`extension`), the context threshold, or context
-	 * overflow recovery.
+	 * calling `ctx.compact()` (`extension`), the context threshold, context
+	 * overflow recovery, or cache-expiry preflight before submit.
 	 */
 	reason: CompactionEventReason;
 	/** Error text when compaction failed for a non-abort reason. */

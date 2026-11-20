@@ -54,6 +54,7 @@ import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
+import { CACHE_TTL_MS } from "./cache-stats.ts";
 import type { CacheMissAttribution } from "./cache-telemetry.ts";
 import {
 	type CompactionPreparation,
@@ -1615,10 +1616,29 @@ export class AgentSession {
 		}
 	}
 
+	/** Last successful request timestamp, using cache-miss attribution's criteria. */
+	private _lastCacheMissReferenceTimestamp(): number | undefined {
+		const branch = this.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			// Cache-miss attribution resets its prior request at a branch summary.
+			if (entry.type === "branch_summary") return undefined;
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const message = entry.message;
+			if (message.stopReason === "error" || message.stopReason === "aborted") continue;
+			const usage = message.usage;
+			if (usage.input + usage.cacheRead + usage.cacheWrite <= 0) continue;
+			return Number.isFinite(message.timestamp) ? message.timestamp : undefined;
+		}
+		return undefined;
+	}
+
 	/**
 	 * Pre-send gate: compact before the request is built when the context is close
 	 * to the hard limit, so the request is submitted from compacted state instead
-	 * of being refused by {@link guardContextForRequest} or trimmed.
+	 * of being refused by {@link guardContextForRequest} or trimmed. When the opt-in
+	 * cache-expiry preflight is enabled, it also compacts an eligible large context
+	 * after the previous request's prompt-cache TTL has elapsed.
 	 *
 	 * Uses the guard's provider-context estimate: usage already includes request
 	 * overhead; without usage, system prompt and tool schemas are estimated once.
@@ -1627,13 +1647,12 @@ export class AgentSession {
 	 * Best effort by construction: this calls the same `prepareCompaction` the
 	 * manual path uses, and that returns `undefined` when the branch ends inside an
 	 * in-progress turn, where the only valid cut point is the turn start and there
-	 * is nothing left to summarize. Measured in a live session at 10242 estimated
-	 * tokens against an 8000 limit: the gate declined, the guard refused, and the
+	 * is nothing left to summarize. Measured in a live session at 10,242 estimated
+	 * tokens against an 8,000 limit: the gate declined, the guard refused, and the
 	 * refusal's own compaction then succeeded, because the failed assistant message
-	 * supplies the turn boundary preparation needs. The turn continued and
-	 * completed. The gate is therefore an optimization that avoids the refusal in
-	 * the common case, not the mechanism that guarantees recovery - the guard's
-	 * refusal path is.
+	 * supplies the turn boundary preparation needs. The turn continued and completed.
+	 * The gate is therefore an optimization that avoids refusal in the common case,
+	 * not the mechanism that guarantees recovery - the guard's refusal path is.
 	 *
 	 * @returns The compacted message list when a compaction ran, so the caller can
 	 * build the request from it; `undefined` when no compaction was needed or the
@@ -1641,21 +1660,76 @@ export class AgentSession {
 	 */
 	async compactBeforeSubmit(): Promise<AgentMessage[] | undefined> {
 		const settings = this.settingsManager.getCompactionSettings();
+		const cacheExpiryPreflight = settings.cacheExpiryPreflight ?? false;
+		const cacheExpiryPreflightMinTokens =
+			settings.cacheExpiryPreflightMinTokens ?? DEFAULT_COMPACTION_SETTINGS.cacheExpiryPreflightMinTokens!;
+		const messages = this.agent.state.messages;
+		const estimatedTokens = estimateProviderContextTokens(
+			messages,
+			this.agent.state.systemPrompt,
+			this.agent.state.tools,
+		).tokens;
+		const lastRequestTimestamp = this._lastCacheMissReferenceTimestamp();
+		const idleMs = lastRequestTimestamp === undefined ? null : Math.max(0, Date.now() - lastRequestTimestamp);
+
+		let skippedReason:
+			| "setting-disabled"
+			| "no-prior-request"
+			| "cache-live"
+			| "below-min-tokens"
+			| "compaction-disabled"
+			| "compacting"
+			| "already-compacted"
+			| null = null;
+		if (!cacheExpiryPreflight) skippedReason = "setting-disabled";
+		else if (idleMs === null) skippedReason = "no-prior-request";
+		else if (idleMs < CACHE_TTL_MS) skippedReason = "cache-live";
+		else if (estimatedTokens < cacheExpiryPreflightMinTokens) skippedReason = "below-min-tokens";
+		else if (!settings.enabled) skippedReason = "compaction-disabled";
+		else if (this.isCompacting) skippedReason = "compacting";
+		else if (messages.length === this._lastPreSendCompactionLength) skippedReason = "already-compacted";
+
+		let fired = false;
+		let tokensAfter: number | null = null;
+		let savedTokens: number | null = null;
+		if (skippedReason === null) {
+			fired = true;
+			// This is deliberately a distinct reason: it is neither threshold recovery
+			// nor a caller compaction that should schedule a continuation.
+			await this._runAutoCompaction("cache-expiry", false);
+			const compacted = this.agent.state.messages;
+			if (compacted !== messages) {
+				this._lastPreSendCompactionLength = compacted.length;
+				tokensAfter = estimateProviderContextTokens(
+					compacted,
+					this.agent.state.systemPrompt,
+					this.agent.state.tools,
+				).tokens;
+				savedTokens = estimatedTokens - tokensAfter;
+			}
+		}
+		this._appendDiagnostic({
+			kind: "cache_expiry_preflight",
+			idleMs,
+			ttlMs: CACHE_TTL_MS,
+			estimatedTokens,
+			minTokens: cacheExpiryPreflightMinTokens,
+			fired,
+			skippedReason,
+			tokensAfter,
+			savedTokens,
+			model: this.model?.id ?? null,
+			provider: this.model?.provider ?? null,
+		});
+
+		if (fired && tokensAfter !== null) return this.agent.state.messages;
 		if (!settings.enabled || this.isCompacting) return undefined;
 		const { trigger, borderlineFraction } = resolveCompactionTrigger(
 			this.model,
 			this.model?.contextWindow ?? 0,
 			settings,
 		);
-
-		const messages = this.agent.state.messages;
 		if (messages.length === this._lastPreSendCompactionLength) return undefined;
-
-		const estimatedTokens = estimateProviderContextTokens(
-			messages,
-			this.agent.state.systemPrompt,
-			this.agent.state.tools,
-		).tokens;
 		if (estimatedTokens < borderlineFraction * trigger) return undefined;
 
 		// `_runAutoCompaction` rewrites agent state from the new session context, so a
@@ -3290,16 +3364,19 @@ export class AgentSession {
 	}
 
 	/**
-	 * Execute threshold or overflow compaction. Manual compaction uses
-	 * `AgentSession.compact()` instead. Both paths call the lower-level `compact()`
+	 * Execute threshold, overflow, or cache-expiry preflight compaction. Manual compaction uses
+	 * `AgentSession.compact()` instead. All paths call the lower-level `compact()`
 	 * function imported from `./compaction/index.ts` after preparation and extension
 	 * interception.
 	 *
-	 * @param reason Automatic trigger selected by `_checkCompaction()`
+	 * @param reason Automatic trigger selected by `_checkCompaction()` or cache-expiry preflight
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold" | "cache-expiry",
+		willRetry: boolean,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		const resolution = this._resolveCompactionTrigger(settings);
 		const compactionLimits = this._compactionEventLimits(settings, resolution);

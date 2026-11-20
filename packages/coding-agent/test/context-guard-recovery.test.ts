@@ -14,6 +14,7 @@ import {
 	isContextGuardRefusal,
 } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { CACHE_TTL_MS } from "../src/core/cache-stats.ts";
 import {
 	estimateContextTokens,
 	estimateToolSchemaTokens,
@@ -22,7 +23,7 @@ import {
 } from "../src/core/compaction/compaction.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
+import { type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 
@@ -63,13 +64,18 @@ function estimate(messages: AgentMessage[], tools: readonly unknown[] = []): num
  */
 type SessionInternals = {
 	_checkCompaction(message: AssistantMessage, skipAbortedCheck?: boolean): Promise<boolean>;
-	_runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean>;
+	_runAutoCompaction(reason: "overflow" | "threshold" | "cache-expiry", willRetry: boolean): Promise<boolean>;
 	_isRetryableError(message: AssistantMessage): boolean;
 	_transportAbortRetryAllowed(): boolean;
 	_transportAbortRetryHasCompactionBudget(): boolean;
 	compactBeforeSubmit(): Promise<AgentMessage[] | undefined>;
-	_resolveCompactionTrigger(settings: ReturnType<SettingsManager["getCompactionSettings"]>): ReturnType<typeof resolveCompactionTrigger>;
-	_compactionEventLimits(settings: ReturnType<SettingsManager["getCompactionSettings"]>, resolution: ReturnType<typeof resolveCompactionTrigger>): Record<string, unknown>;
+	_resolveCompactionTrigger(
+		settings: ReturnType<SettingsManager["getCompactionSettings"]>,
+	): ReturnType<typeof resolveCompactionTrigger>;
+	_compactionEventLimits(
+		settings: ReturnType<SettingsManager["getCompactionSettings"]>,
+		resolution: ReturnType<typeof resolveCompactionTrigger>,
+	): Record<string, unknown>;
 };
 
 const internals = AgentSession.prototype as unknown as SessionInternals;
@@ -85,27 +91,64 @@ function fakeSession(options: {
 	compactionCalls?: Array<[string, boolean]>;
 	overflowRecoveryAttempted?: boolean;
 	tools?: readonly unknown[];
+	cacheExpiryPreflight?: boolean;
+	cacheExpiryPreflightMinTokens?: number;
+	priorRequestTimestamp?: number | null;
+	alreadyCompacted?: boolean;
+	isCompacting?: boolean;
 }) {
 	const emitted: Array<Record<string, unknown>> = [];
+	const diagnostics: Array<Record<string, unknown>> = [];
+	const priorRequest =
+		options.priorRequestTimestamp == null
+			? []
+			: ([
+					{
+						type: "message",
+						id: "prior-request",
+						parentId: null,
+						timestamp: options.priorRequestTimestamp,
+						message: {
+							role: "assistant",
+							provider: "anthropic",
+							model: "claude-sonnet-4-5",
+							content: [{ type: "text", text: "previous" }],
+							usage: {
+								input: 1_000,
+								cacheRead: 0,
+								cacheWrite: 0,
+								output: 0,
+								totalTokens: 1_000,
+								cost: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
+							},
+							stopReason: "stop",
+							timestamp: options.priorRequestTimestamp,
+						},
+					},
+				] as unknown as SessionEntry[]);
 	const session = {
 		model: { provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 },
-		isCompacting: false,
+		isCompacting: options.isCompacting ?? false,
 		agent: { state: { messages: options.messages, tools: options.tools ?? [], systemPrompt: "system" } },
-		sessionManager: { getBranch: () => [] },
+		sessionManager: { getBranch: () => priorRequest },
+		_lastCacheMissReferenceTimestamp: () => options.priorRequestTimestamp ?? undefined,
 		settingsManager: {
 			getCompactionSettings: () => ({
 				enabled: options.enabled ?? true,
 				maxContextTokens: options.maxContextTokens,
 				reserveTokens: 16_384,
 				keepRecentTokens: 1,
+				cacheExpiryPreflight: options.cacheExpiryPreflight ?? false,
+				cacheExpiryPreflightMinTokens: options.cacheExpiryPreflightMinTokens ?? 60_000,
 			}),
 		},
+		_appendDiagnostic: (data: Record<string, unknown>) => diagnostics.push(data),
 		_emit: (event: Record<string, unknown>) => {
 			emitted.push(event);
 		},
+		_lastPreSendCompactionLength: options.alreadyCompacted ? options.messages.length : -1,
 		_emitSessionCompactFailed: async () => {},
 		_overflowRecoveryAttempted: options.overflowRecoveryAttempted ?? false,
-		_lastPreSendCompactionLength: -1,
 		_runAutoCompaction: async (reason: string, willRetry: boolean) => {
 			options.compactionCalls?.push([reason, willRetry]);
 			// Stand in for the real rewrite of agent state from the new session context.
@@ -113,7 +156,7 @@ function fakeSession(options: {
 			return true;
 		},
 	};
-	return { session, emitted };
+	return { session, emitted, diagnostics };
 }
 
 describe("context guard refusal classification", () => {
@@ -284,6 +327,124 @@ describe("pre-send compaction gate", () => {
 		expect(await internals.compactBeforeSubmit.call(session as unknown as SessionInternals)).toBeUndefined();
 		expect(calls).toHaveLength(2);
 	});
+
+	it("precompacts before submit when the cache expired and context exceeds the minimum", async () => {
+		const messages = [userMessage("m".repeat(60_000 * 4))];
+		const calls: Array<[string, boolean]> = [];
+		const { session, diagnostics } = fakeSession({
+			messages,
+			cacheExpiryPreflight: true,
+			priorRequestTimestamp: Date.now() - CACHE_TTL_MS,
+			compactionCalls: calls,
+		});
+
+		const compacted = await internals.compactBeforeSubmit.call(session as unknown as SessionInternals);
+
+		expect(calls).toEqual([["cache-expiry", false]]);
+		expect(compacted).toEqual([userMessage("compacted")]);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({
+			kind: "cache_expiry_preflight",
+			idleMs: expect.any(Number),
+			ttlMs: CACHE_TTL_MS,
+			minTokens: 60_000,
+			fired: true,
+			skippedReason: null,
+			tokensAfter: expect.any(Number),
+			savedTokens: expect.any(Number),
+			model: "claude-sonnet-4-5",
+			provider: "anthropic",
+		});
+		expect(diagnostics[0].savedTokens).toBeGreaterThan(0);
+	});
+
+	it("does not route cache-expiry compaction through guard recovery or overflow handling", async () => {
+		const diagnostics: Array<Record<string, unknown>> = [];
+		const session = {
+			model: undefined,
+			settingsManager: { getCompactionSettings: () => ({ enabled: true, reserveTokens: 16_384 }) },
+			_resolveCompactionTrigger: () => ({ hardLimit: 100_000, reserveTokens: 16_384 }),
+			_compactionEventLimits: () => ({}),
+			_overflowRecoveryOutcome: "none",
+			_appendDiagnostic: (data: Record<string, unknown>) => diagnostics.push(data),
+			_emit: () => {},
+		};
+
+		await internals._runAutoCompaction.call(session as unknown as SessionInternals, "cache-expiry", false);
+
+		expect(session._overflowRecoveryOutcome).toBe("none");
+		expect(diagnostics).toEqual([]);
+	});
+
+	it.each([
+		{
+			label: "cache live",
+			options: { priorRequestTimestamp: Date.now() - CACHE_TTL_MS + 60_000 },
+			reason: "cache-live",
+		},
+		{
+			label: "below minimum tokens",
+			options: { priorRequestTimestamp: Date.now() - CACHE_TTL_MS, cacheExpiryPreflightMinTokens: 100_000 },
+			reason: "below-min-tokens",
+		},
+		{ label: "no prior request", options: { priorRequestTimestamp: null }, reason: "no-prior-request" },
+		{ label: "setting disabled", options: { priorRequestTimestamp: now - CACHE_TTL_MS }, reason: "setting-disabled" },
+		{
+			label: "compaction disabled",
+			options: { priorRequestTimestamp: Date.now() - CACHE_TTL_MS, enabled: false },
+			reason: "compaction-disabled",
+			enabled: true,
+		},
+		{
+			label: "already compacted",
+			options: { priorRequestTimestamp: Date.now() - CACHE_TTL_MS, alreadyCompacted: true },
+			reason: "already-compacted",
+		},
+		{
+			label: "compaction in progress",
+			options: { priorRequestTimestamp: Date.now() - CACHE_TTL_MS, isCompacting: true },
+			reason: "compacting",
+		},
+	])(
+		"records a declined preflight when $label",
+		async ({
+			options,
+			reason,
+			enabled,
+		}: {
+			label: string;
+			options: {
+				priorRequestTimestamp?: number | null;
+				cacheExpiryPreflightMinTokens?: number;
+				enabled?: boolean;
+				alreadyCompacted?: boolean;
+				isCompacting?: boolean;
+			};
+			reason: string;
+			enabled?: boolean;
+		}) => {
+			const messages = [userMessage("m".repeat(60_000 * 4))];
+			const calls: Array<[string, boolean]> = [];
+			const { session, diagnostics } = fakeSession({
+				messages,
+				cacheExpiryPreflight: enabled ?? reason !== "setting-disabled",
+				compactionCalls: calls,
+				...options,
+			});
+
+			await internals.compactBeforeSubmit.call(session as unknown as SessionInternals);
+
+			expect(calls).toEqual([]);
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]).toMatchObject({
+				kind: "cache_expiry_preflight",
+				fired: false,
+				skippedReason: reason,
+				tokensAfter: null,
+				savedTokens: null,
+			});
+		},
+	);
 });
 
 it("recovers a refusal that crosses the limit only once tool schemas are counted", async () => {
@@ -369,10 +530,9 @@ describe("pre-send gate end to end", () => {
 		if (tempDir) rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	async function createRecoverySession(options: {
-		beforeCompact?: "cancel" | "non-reducing";
-		maxContextTokens?: number | null;
-	} = {}) {
+	async function createRecoverySession(
+		options: { beforeCompact?: "cancel" | "non-reducing"; maxContextTokens?: number | null } = {},
+	) {
 		const api: Api = "openai-completions";
 		const model: Model<Api> = {
 			id: "capture-model",
@@ -471,13 +631,37 @@ describe("pre-send gate end to end", () => {
 			model.contextWindowSource = "backend";
 			const settings = session.settingsManager.getCompactionSettings();
 			const resolution = internals._resolveCompactionTrigger.call(session as unknown as SessionInternals, settings);
-			const payload = internals._compactionEventLimits.call(session as unknown as SessionInternals, settings, resolution);
+			const payload = internals._compactionEventLimits.call(
+				session as unknown as SessionInternals,
+				settings,
+				resolution,
+			);
 			expect(Object.keys(payload)).toEqual([
-				"provider", "model", "contextWindow", "contextWindowSource", "effectiveContextWindow", "effectiveBudget",
-				"firstCostTierBoundary", "costTierBoundarySource", "triggerTokens", "triggerBasis", "triggerFraction",
-				"reserveTokens", "effectiveReserveTokens", "reserveClampApplied", "capApplied", "capValue", "capSource", "windowSource",
+				"provider",
+				"model",
+				"contextWindow",
+				"contextWindowSource",
+				"effectiveContextWindow",
+				"effectiveBudget",
+				"firstCostTierBoundary",
+				"costTierBoundarySource",
+				"triggerTokens",
+				"triggerBasis",
+				"triggerFraction",
+				"reserveTokens",
+				"effectiveReserveTokens",
+				"reserveClampApplied",
+				"capApplied",
+				"capValue",
+				"capSource",
+				"windowSource",
 			]);
-			expect(payload).toMatchObject({ provider: "capture-provider", model: "capture-model", contextWindow: 128_000, contextWindowSource: "backend" });
+			expect(payload).toMatchObject({
+				provider: "capture-provider",
+				model: "capture-model",
+				contextWindow: 128_000,
+				contextWindowSource: "backend",
+			});
 		} finally {
 			session.dispose();
 			modelRegistry.unregisterProvider(model.provider);

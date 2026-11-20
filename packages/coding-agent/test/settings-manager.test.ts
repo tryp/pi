@@ -635,6 +635,29 @@ describe("SettingsManager", () => {
 			expect(manager.getCompactionReserveTokens()).toBe(DEFAULT_COMPACTION_SETTINGS.reserveTokens);
 			expect(settings.triggerFraction).toBe(DEFAULT_COMPACTION_SETTINGS.triggerFraction);
 			expect(settings.borderlineFraction).toBe(DEFAULT_COMPACTION_SETTINGS.borderlineFraction);
+			expect(settings.cacheExpiryPreflight).toBe(false);
+			expect(settings.cacheExpiryPreflightMinTokens).toBe(60_000);
+		});
+
+		it("returns configured cache-expiry preflight settings", () => {
+			const manager = SettingsManager.inMemory({
+				compaction: { cacheExpiryPreflight: true, cacheExpiryPreflightMinTokens: 90_000 },
+			});
+			expect(manager.getCompactionSettings()).toMatchObject({
+				cacheExpiryPreflight: true,
+				cacheExpiryPreflightMinTokens: 90_000,
+			});
+		});
+
+		it("falls back and records an error for invalid cache-expiry preflight settings", () => {
+			const manager = SettingsManager.inMemory({
+				compaction: { cacheExpiryPreflight: "yes", cacheExpiryPreflightMinTokens: -1 } as never,
+			});
+			expect(manager.getCompactionSettings()).toMatchObject({
+				cacheExpiryPreflight: false,
+				cacheExpiryPreflightMinTokens: 60_000,
+			});
+			expect(manager.drainErrors().some((entry) => entry.error.message.includes("cacheExpiryPreflight"))).toBe(true);
 		});
 
 		it("keeps branch-summary response reserve independent from compaction input reserve", () => {

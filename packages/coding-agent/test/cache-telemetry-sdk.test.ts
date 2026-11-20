@@ -279,30 +279,42 @@ it("tracks the current session ID through new-session and resume replacements", 
 	let disposed = false;
 	try {
 		const initialManager = SessionManager.create(cwd, join(agentDir, "sessions"));
-		const initial = await createOfflineCodexSession(agentDir, cwd, 390_000, undefined, false, undefined, initialManager);
+		const initial = await createOfflineCodexSession(
+			agentDir,
+			cwd,
+			390_000,
+			undefined,
+			false,
+			undefined,
+			initialManager,
+		);
 		initial.session.agent.transport = "sse";
 		const initialId = initialManager.getSessionId();
 		const initialSessionFile = initialManager.getSessionFile();
 		if (!initialSessionFile) throw new Error("Initial session is not persisted");
 
-		runtime = new AgentSessionRuntime(initial.session, initial.services, async ({ cwd, agentDir, sessionManager }) => {
-			const created = await createOfflineCodexSession(
-				agentDir,
-				cwd,
-				390_000,
-				undefined,
-				false,
-				undefined,
-				sessionManager,
-			);
-			created.session.agent.transport = "sse";
-			return {
-				session: created.session,
-				extensionsResult: created.extensionsResult,
-				services: created.services,
-				diagnostics: [],
-			};
-		});
+		runtime = new AgentSessionRuntime(
+			initial.session,
+			initial.services,
+			async ({ cwd, agentDir, sessionManager }) => {
+				const created = await createOfflineCodexSession(
+					agentDir,
+					cwd,
+					390_000,
+					undefined,
+					false,
+					undefined,
+					sessionManager,
+				);
+				created.session.agent.transport = "sse";
+				return {
+					session: created.session,
+					extensionsResult: created.extensionsResult,
+					services: created.services,
+					diagnostics: [],
+				};
+			},
+		);
 
 		await runtime.session.prompt("initial session request");
 		await runtime.newSession();
@@ -813,8 +825,15 @@ it("activates SDK telemetry by default and writes paired private local records u
 			]);
 			expect(session.agent.state.messages).toBe(stateMessagesBefore);
 			expect(session.agent.state.systemPrompt).toBe(systemPromptBefore);
-			expect(session.sessionManager.getEntries()).toEqual(sessionEntriesBefore);
-			expect(session.sessionManager.getLeafId()).toBe(leafBefore);
+			const addedEntries = session.sessionManager.getEntries().slice(sessionEntriesBefore.length);
+			expect(addedEntries).toHaveLength(1);
+			expect(addedEntries[0]).toMatchObject({
+				type: "custom",
+				customType: "pi.session_diagnostic",
+				parentId: leafBefore,
+				data: { kind: "cache_expiry_preflight", fired: false, skippedReason: "setting-disabled" },
+			});
+			expect(session.sessionManager.getLeafId()).toBe(addedEntries[0]!.id);
 			const ids = observer.observeRequest({
 				provider: "openai",
 				model: "gpt-5.4",

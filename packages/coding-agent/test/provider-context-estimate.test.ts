@@ -384,6 +384,8 @@ describe("usage-backed provider context estimate", () => {
 		const session = {
 			settingsManager: { getCompactionSettings: () => ({ enabled: true, maxContextTokens: THRESHOLD }) },
 			isCompacting: false,
+			_lastCacheMissReferenceTimestamp: () => undefined,
+			_appendDiagnostic: () => {},
 			agent: { state: context },
 			_lastPreSendCompactionLength: -1,
 			_runAutoCompaction: async () => {
