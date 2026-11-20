@@ -93,11 +93,13 @@ function fakeSession(options: {
 	tools?: readonly unknown[];
 	cacheExpiryPreflight?: boolean;
 	cacheExpiryPreflightMinTokens?: number;
+	hasExtensionCompactor?: boolean;
 	priorRequestTimestamp?: number | null;
 	alreadyCompacted?: boolean;
 	isCompacting?: boolean;
 }) {
 	const emitted: Array<Record<string, unknown>> = [];
+	const failedEvents: Array<Record<string, unknown>> = [];
 	const diagnostics: Array<Record<string, unknown>> = [];
 	const priorRequest =
 		options.priorRequestTimestamp == null
@@ -143,20 +145,25 @@ function fakeSession(options: {
 			}),
 		},
 		_appendDiagnostic: (data: Record<string, unknown>) => diagnostics.push(data),
+		_extensionRunner: { hasHandlers: () => options.hasExtensionCompactor ?? false },
+		_cacheExpiryPreflightOutcome: undefined as string | undefined,
 		_emit: (event: Record<string, unknown>) => {
 			emitted.push(event);
 		},
 		_lastPreSendCompactionLength: options.alreadyCompacted ? options.messages.length : -1,
-		_emitSessionCompactFailed: async () => {},
+		_emitSessionCompactFailed: async (event: Record<string, unknown>) => {
+			failedEvents.push(event);
+		},
 		_overflowRecoveryAttempted: options.overflowRecoveryAttempted ?? false,
 		_runAutoCompaction: async (reason: string, willRetry: boolean) => {
 			options.compactionCalls?.push([reason, willRetry]);
+			if (reason === "cache-expiry") session._cacheExpiryPreflightOutcome = "compacted";
 			// Stand in for the real rewrite of agent state from the new session context.
 			session.agent.state.messages = [userMessage("compacted")];
 			return true;
 		},
 	};
-	return { session, emitted, diagnostics };
+	return { session, emitted, failedEvents, diagnostics };
 }
 
 describe("context guard refusal classification", () => {
@@ -334,6 +341,7 @@ describe("pre-send compaction gate", () => {
 		const { session, diagnostics } = fakeSession({
 			messages,
 			cacheExpiryPreflight: true,
+			hasExtensionCompactor: true,
 			priorRequestTimestamp: Date.now() - CACHE_TTL_MS,
 			compactionCalls: calls,
 		});
@@ -356,6 +364,67 @@ describe("pre-send compaction gate", () => {
 			provider: "anthropic",
 		});
 		expect(diagnostics[0].savedTokens).toBeGreaterThan(0);
+	});
+
+	it("skips cache-expiry preflight without a session_before_compact handler", async () => {
+		const messages = [userMessage("m".repeat(60_000 * 4))];
+		const calls: Array<[string, boolean]> = [];
+		const { session, diagnostics, emitted, failedEvents } = fakeSession({
+			messages,
+			cacheExpiryPreflight: true,
+			priorRequestTimestamp: Date.now() - CACHE_TTL_MS,
+			compactionCalls: calls,
+		});
+
+		await internals.compactBeforeSubmit.call(session as unknown as SessionInternals);
+
+		expect(calls).toEqual([]);
+		expect(emitted).toEqual([]);
+		expect(failedEvents).toEqual([]);
+		expect(diagnostics[0]).toMatchObject({
+			kind: "cache_expiry_preflight",
+			fired: false,
+			skippedReason: "no-extension-compactor",
+			tokensAfter: null,
+			savedTokens: null,
+		});
+	});
+
+	it("still runs threshold compaction when cache-expiry declines near the limit", async () => {
+		const messages = [userMessage("m".repeat(60_000 * 4))];
+		const size = estimate(messages);
+		const calls: Array<[string, boolean]> = [];
+		const { session, diagnostics } = fakeSession({
+			messages,
+			maxContextTokens: Math.ceil(size / 0.95),
+			cacheExpiryPreflight: true,
+			hasExtensionCompactor: true,
+			priorRequestTimestamp: Date.now() - CACHE_TTL_MS,
+			compactionCalls: calls,
+		});
+		session._runAutoCompaction = async (reason: string, willRetry: boolean) => {
+			calls.push([reason, willRetry]);
+			if (reason === "cache-expiry") {
+				session._cacheExpiryPreflightOutcome = "declined-no-extension-compactor";
+				return false;
+			}
+			session.agent.state.messages = [userMessage("threshold compacted")];
+			return false;
+		};
+
+		const compacted = await internals.compactBeforeSubmit.call(session as unknown as SessionInternals);
+
+		expect(calls).toEqual([
+			["cache-expiry", false],
+			["threshold", false],
+		]);
+		expect(compacted).toEqual([userMessage("threshold compacted")]);
+		expect(diagnostics[0]).toMatchObject({
+			fired: false,
+			skippedReason: "no-extension-compactor",
+			tokensAfter: null,
+			savedTokens: null,
+		});
 	});
 
 	it("does not route cache-expiry compaction through guard recovery or overflow handling", async () => {
@@ -531,7 +600,12 @@ describe("pre-send gate end to end", () => {
 	});
 
 	async function createRecoverySession(
-		options: { beforeCompact?: "cancel" | "non-reducing"; maxContextTokens?: number | null } = {},
+		options: {
+			beforeCompact?: "cancel" | "non-reducing" | "nothing" | "compaction";
+			maxContextTokens?: number | null;
+			cacheExpiryPreflight?: boolean;
+			cacheExpiryPreflightMinTokens?: number;
+		} = {},
 	) {
 		const api: Api = "openai-completions";
 		const model: Model<Api> = {
@@ -551,6 +625,8 @@ describe("pre-send gate end to end", () => {
 				enabled: true,
 				...(options.maxContextTokens === null ? {} : { maxContextTokens: options.maxContextTokens ?? 20_000 }),
 				keepRecentTokens: 20_000,
+				cacheExpiryPreflightMinTokens: options.cacheExpiryPreflightMinTokens ?? 60_000,
+				cacheExpiryPreflight: options.cacheExpiryPreflight ?? false,
 			},
 		});
 		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
@@ -568,6 +644,7 @@ describe("pre-send gate end to end", () => {
 						pi.on("session_before_compact", async (event) => {
 							hookCalls.push(1);
 							if (options.beforeCompact === "cancel") return { cancel: true };
+							if (options.beforeCompact === "nothing") return undefined;
 							const firstKeptEntryId =
 								options.beforeCompact === "non-reducing"
 									? (event.branchEntries.find((entry) => entry.type === "message")?.id ??
@@ -610,20 +687,137 @@ describe("pre-send gate end to end", () => {
 		return { session, modelRegistry, model, hookCalls, failedEvents, compactionEndEvents };
 	}
 
-	function appendHistory(session: AgentSession, model: Model<Api>): string {
-		const firstMessageId = session.sessionManager.appendMessage(userMessage("history to summarize") as Message);
+	function appendHistory(
+		session: AgentSession,
+		model: Model<Api>,
+		timestamp = now,
+		userText = "history to summarize",
+	): string {
+		const firstMessageId = session.sessionManager.appendMessage({ ...userMessage(userText), timestamp } as Message);
 		session.sessionManager.appendMessage({
 			role: "assistant",
 			content: [{ type: "text", text: "prior answer" }],
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+			usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1_000 },
 			stopReason: "stop",
-			timestamp: now,
+			timestamp,
 		} as Message);
 		return firstMessageId;
 	}
+
+	it("declines cache-expiry without an extension summary and never calls the default summariser", async () => {
+		const { session, modelRegistry, model, failedEvents, compactionEndEvents } = await createRecoverySession({
+			beforeCompact: "nothing",
+			maxContextTokens: null,
+			cacheExpiryPreflight: true,
+			cacheExpiryPreflightMinTokens: 1,
+		});
+		try {
+			const largeText = "m".repeat(240_000);
+			appendHistory(session, model, Date.now() - CACHE_TTL_MS - 1, largeText);
+			session.agent.state.messages = [userMessage(largeText)];
+			session.settingsManager.applyOverrides({
+				compaction: { keepRecentTokens: 1, cacheExpiryPreflight: true, cacheExpiryPreflightMinTokens: 1 },
+			});
+			const messagesBefore = session.agent.state.messages;
+			const compactionsBefore = session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "compaction").length;
+			const defaultCompaction = vi.fn();
+			Object.defineProperty(session, "_runDefaultCompaction", { configurable: true, value: defaultCompaction });
+
+			await internals.compactBeforeSubmit.call(session as unknown as SessionInternals);
+
+			const diagnostic = session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic")
+				.map((entry) => (entry as { data: Record<string, unknown> }).data)
+				.find((data) => data.kind === "cache_expiry_preflight");
+			expect(defaultCompaction).not.toHaveBeenCalled();
+			expect(session.agent.state.messages).toBe(messagesBefore);
+			expect(session.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(
+				compactionsBefore,
+			);
+			expect(compactionEndEvents).toMatchObject([
+				{ reason: "cache-expiry", result: undefined, aborted: true, willRetry: false },
+			]);
+			expect(failedEvents).toEqual([]);
+			expect(diagnostic).toMatchObject({
+				fired: false,
+				skippedReason: "no-extension-compactor",
+				tokensAfter: null,
+				savedTokens: null,
+			});
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider(model.provider);
+		}
+	});
+
+	it("uses an extension summary for cache-expiry without calling the default summariser", async () => {
+		const { session, modelRegistry, model } = await createRecoverySession({
+			beforeCompact: "compaction",
+			maxContextTokens: null,
+			cacheExpiryPreflight: true,
+			cacheExpiryPreflightMinTokens: 1,
+		});
+		try {
+			const largeText = "m".repeat(240_000);
+			appendHistory(session, model, Date.now() - CACHE_TTL_MS - 1, largeText);
+			session.agent.state.messages = [userMessage(largeText)];
+			session.settingsManager.applyOverrides({
+				compaction: { keepRecentTokens: 1, cacheExpiryPreflight: true, cacheExpiryPreflightMinTokens: 1 },
+			});
+			const defaultCompaction = vi.fn();
+			Object.defineProperty(session, "_runDefaultCompaction", { configurable: true, value: defaultCompaction });
+
+			const compacted = await internals.compactBeforeSubmit.call(session as unknown as SessionInternals);
+
+			const diagnostic = session.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "pi.session_diagnostic")
+				.map((entry) => (entry as { data: Record<string, unknown> }).data)
+				.find((data) => data.kind === "cache_expiry_preflight");
+			expect(defaultCompaction).not.toHaveBeenCalled();
+			expect(compacted).toBe(session.agent.state.messages);
+			expect(session.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
+			expect(diagnostic).toMatchObject({
+				fired: true,
+				skippedReason: null,
+				tokensAfter: expect.any(Number),
+				savedTokens: expect.any(Number),
+			});
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider(model.provider);
+		}
+	});
+
+	it("still uses the default summariser for threshold compaction without an extension handler", async () => {
+		const { session, modelRegistry, model } = await createRecoverySession({ maxContextTokens: null });
+		try {
+			const firstKeptEntryId = appendHistory(session, model, now, "m".repeat(240_000));
+			session.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+			const defaultCompaction = vi.fn().mockResolvedValue({
+				summary: "default threshold summary",
+				firstKeptEntryId,
+				tokensBefore: 60_000,
+				usage: undefined,
+				details: undefined,
+			});
+			Object.defineProperty(session, "_runDefaultCompaction", { configurable: true, value: defaultCompaction });
+
+			await internals._runAutoCompaction.call(session as unknown as SessionInternals, "threshold", false);
+
+			expect(defaultCompaction).toHaveBeenCalledOnce();
+			expect(session.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(true);
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider(model.provider);
+		}
+	});
 
 	it("emits stable model identity and window fields for a discovered model", async () => {
 		const { session, modelRegistry, model } = await createRecoverySession();

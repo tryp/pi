@@ -440,6 +440,12 @@ export class AgentSession {
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	private _overflowRecoveryOutcome: "none" | "attempting" | "compacted" | "no-op" | "cancelled" | "failed" = "none";
+	private _cacheExpiryPreflightOutcome:
+		| "compacted"
+		| "declined-no-extension-compactor"
+		| "cancelled"
+		| "failed"
+		| undefined = undefined;
 	/**
 	 * Message count at the last pre-send compaction, so a request that already
 	 * compacted does not compact again until new messages arrive.
@@ -1680,6 +1686,7 @@ export class AgentSession {
 			| "compaction-disabled"
 			| "compacting"
 			| "already-compacted"
+			| "no-extension-compactor"
 			| null = null;
 		if (!cacheExpiryPreflight) skippedReason = "setting-disabled";
 		else if (idleMs === null) skippedReason = "no-prior-request";
@@ -1688,17 +1695,25 @@ export class AgentSession {
 		else if (!settings.enabled) skippedReason = "compaction-disabled";
 		else if (this.isCompacting) skippedReason = "compacting";
 		else if (messages.length === this._lastPreSendCompactionLength) skippedReason = "already-compacted";
+		else if (!this._extensionRunner.hasHandlers("session_before_compact")) {
+			skippedReason = "no-extension-compactor";
+		}
 
 		let fired = false;
 		let tokensAfter: number | null = null;
 		let savedTokens: number | null = null;
 		if (skippedReason === null) {
-			fired = true;
+			this._cacheExpiryPreflightOutcome = undefined;
 			// This is deliberately a distinct reason: it is neither threshold recovery
 			// nor a caller compaction that should schedule a continuation.
 			await this._runAutoCompaction("cache-expiry", false);
+			if (this._cacheExpiryPreflightOutcome === "declined-no-extension-compactor") {
+				skippedReason = "no-extension-compactor";
+			} else {
+				fired = true;
+			}
 			const compacted = this.agent.state.messages;
-			if (compacted !== messages) {
+			if (fired && compacted !== messages) {
 				this._lastPreSendCompactionLength = compacted.length;
 				tokensAfter = estimateProviderContextTokens(
 					compacted,
@@ -3469,6 +3484,7 @@ export class AgentSession {
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (extensionResult?.cancel) {
+					if (reason === "cache-expiry") this._cacheExpiryPreflightOutcome = "cancelled";
 					if (isGuardRecovery) {
 						this._overflowRecoveryOutcome = "cancelled";
 						this._appendDiagnostic({ kind: "context_guard_recovery", outcome: "cancelled", reason });
@@ -3493,6 +3509,18 @@ export class AgentSession {
 					extensionCompaction = extensionResult.compaction;
 					fromExtension = true;
 				}
+			}
+
+			if (reason === "cache-expiry" && !extensionCompaction) {
+				this._cacheExpiryPreflightOutcome = "declined-no-extension-compactor";
+				this._emit({
+					type: "compaction_end",
+					reason,
+					result: undefined,
+					aborted: true,
+					willRetry: false,
+				});
+				return false;
 			}
 
 			let summary: string;
@@ -3528,6 +3556,7 @@ export class AgentSession {
 			}
 
 			if (this._autoCompactionAbortController.signal.aborted) {
+				if (reason === "cache-expiry") this._cacheExpiryPreflightOutcome = "cancelled";
 				if (isGuardRecovery) {
 					this._overflowRecoveryOutcome = "cancelled";
 					this._appendDiagnostic({ kind: "context_guard_recovery", outcome: "cancelled", reason });
@@ -3583,6 +3612,7 @@ export class AgentSession {
 				details,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			if (reason === "cache-expiry") this._cacheExpiryPreflightOutcome = "compacted";
 			if (isGuardRecovery) {
 				this._overflowRecoveryOutcome = "compacted";
 				this._appendDiagnostic({ kind: "context_guard_recovery", outcome: "compacted", reason, tokensBefore });
@@ -3611,6 +3641,7 @@ export class AgentSession {
 			}
 			return false;
 		} catch (error) {
+			if (reason === "cache-expiry") this._cacheExpiryPreflightOutcome = "failed";
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			if (started || isGuardRecovery) {
 				const formattedErrorMessage = isGuardRecovery
