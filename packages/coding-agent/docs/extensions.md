@@ -1453,6 +1453,50 @@ pi.sendMessage({
   - `"followUp"` - Waits for agent to finish. Delivered only when agent has no more tool calls.
   - `"nextTurn"` - Queued for next user prompt. Does not interrupt or trigger anything.
 - `triggerTurn: true` - If agent is idle, trigger an LLM response immediately. Only applies to `"steer"` and `"followUp"` modes (ignored for `"nextTurn"`).
+- `queueKey` - Caller-owned identity for a queued message, so it can be replaced or retracted (`pi.cancelQueuedMessage(queueKey)`). See [queued wake messages](#queued-wake-messages).
+
+#### Queued wake messages
+
+An extension that wakes a sleeping session on its own must be able to take the
+wake back. `sendMessage({ triggerTurn: true })` while the session is settling
+queues the message and starts a turn for it, and
+`pi.cancelQueuedMessage(queueKey)` removes a queued message that is no longer
+true.
+
+A `queueKey` **identifies** a queued message; it does not deduplicate one. The
+queue appends, so sending twice under the same key leaves two messages and (once
+delivered) two turns. Retract first, then send:
+
+```typescript
+const WAKE_QUEUE_KEY = "my-extension:wake";
+
+// One wake in flight: retract whatever the last snapshot queued.
+pi.cancelQueuedMessage(WAKE_QUEUE_KEY);
+pi.sendMessage(
+  { customType: "my-extension", content: summary, display: true },
+  { deliverAs: "followUp", triggerTurn: true, queueKey: WAKE_QUEUE_KEY },
+);
+
+// And retract it when the work it described finished or was acknowledged.
+pi.cancelQueuedMessage(WAKE_QUEUE_KEY); // false when it was already delivered
+```
+
+Three rules keep this safe:
+
+- Cancel before sending, and treat a `false` return as "already delivered",
+  not as an error.
+- A wake that has been overtaken is stale even if it is still true: when the
+  session starts a new request, a queued "nothing has happened for four
+  minutes" summary is no longer the news it was queued to deliver.
+- Decide when to send from the model's own activity, not only from a timer.
+  `ctx.isIdle()` is the cheap event probe; a wake sent to a session that is
+  already running a request only adds a message, while a wake that arrives one
+  interval after the last request is what keeps the prompt cache warm (see
+  `CACHE_TTL_MS`, 5 minutes; the wake interval documented here is 4 minutes).
+
+`pi.appendEntry()` records a durable, model-invisible entry (for example one row
+per wake decision), which is what makes a quiet waker distinguishable from a
+broken one after the fact.
 
 ### pi.sendUserMessage(content, options?)
 
