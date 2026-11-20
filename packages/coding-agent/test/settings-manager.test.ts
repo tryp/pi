@@ -635,8 +635,13 @@ describe("SettingsManager", () => {
 			expect(manager.getCompactionReserveTokens()).toBe(DEFAULT_COMPACTION_SETTINGS.reserveTokens);
 			expect(settings.triggerFraction).toBe(DEFAULT_COMPACTION_SETTINGS.triggerFraction);
 			expect(settings.borderlineFraction).toBe(DEFAULT_COMPACTION_SETTINGS.borderlineFraction);
-			expect(settings.cacheExpiryPreflight).toBe(false);
+			expect(settings.cacheExpiryPreflight).toBe(true);
 			expect(settings.cacheExpiryPreflightMinTokens).toBe(60_000);
+		});
+
+		it("respects an explicit cache-expiry preflight opt-out", () => {
+			const manager = SettingsManager.inMemory({ compaction: { cacheExpiryPreflight: false } });
+			expect(manager.getCompactionSettings().cacheExpiryPreflight).toBe(false);
 		});
 
 		it("returns configured cache-expiry preflight settings", () => {
@@ -654,7 +659,7 @@ describe("SettingsManager", () => {
 				compaction: { cacheExpiryPreflight: "yes", cacheExpiryPreflightMinTokens: -1 } as never,
 			});
 			expect(manager.getCompactionSettings()).toMatchObject({
-				cacheExpiryPreflight: false,
+				cacheExpiryPreflight: true,
 				cacheExpiryPreflightMinTokens: 60_000,
 			});
 			expect(manager.drainErrors().some((entry) => entry.error.message.includes("cacheExpiryPreflight"))).toBe(true);

@@ -142,7 +142,14 @@ export interface CompactionSettings {
 	maxContextFraction?: number;
 	triggerFraction?: number;
 	borderlineFraction?: number;
+	/**
+	 * Run a cache-expiry preflight before submit. Default: true; it is inert unless
+	 * an extension supplies the compaction payload (for example pi-vcc with
+	 * `overrideDefaultCompaction`), so core's LLM summarizer is never used on this
+	 * path. Set false to disable.
+	 */
 	cacheExpiryPreflight?: boolean;
+	/** Minimum estimated context tokens for the preflight. Default: 60,000. */
 	cacheExpiryPreflightMinTokens?: number;
 	triggerFractions?: Record<string, number>;
 }
@@ -155,7 +162,7 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	maxContextFraction: undefined,
 	triggerFraction: 0.88,
 	borderlineFraction: 0.9,
-	cacheExpiryPreflight: false,
+	cacheExpiryPreflight: true,
 	cacheExpiryPreflightMinTokens: 60_000,
 	triggerFractions: {},
 };

@@ -831,7 +831,7 @@ it("activates SDK telemetry by default and writes paired private local records u
 				type: "custom",
 				customType: "pi.session_diagnostic",
 				parentId: leafBefore,
-				data: { kind: "cache_expiry_preflight", fired: false, skippedReason: "setting-disabled" },
+				data: { kind: "cache_expiry_preflight", fired: false, skippedReason: "no-prior-request" },
 			});
 			expect(session.sessionManager.getLeafId()).toBe(addedEntries[0]!.id);
 			const ids = observer.observeRequest({

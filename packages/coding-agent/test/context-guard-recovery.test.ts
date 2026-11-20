@@ -140,7 +140,7 @@ function fakeSession(options: {
 				maxContextTokens: options.maxContextTokens,
 				reserveTokens: 16_384,
 				keepRecentTokens: 1,
-				cacheExpiryPreflight: options.cacheExpiryPreflight ?? false,
+				cacheExpiryPreflight: options.cacheExpiryPreflight ?? true,
 				cacheExpiryPreflightMinTokens: options.cacheExpiryPreflightMinTokens ?? 60_000,
 			}),
 		},
@@ -371,7 +371,6 @@ describe("pre-send compaction gate", () => {
 		const calls: Array<[string, boolean]> = [];
 		const { session, diagnostics, emitted, failedEvents } = fakeSession({
 			messages,
-			cacheExpiryPreflight: true,
 			priorRequestTimestamp: Date.now() - CACHE_TTL_MS,
 			compactionCalls: calls,
 		});
@@ -457,7 +456,11 @@ describe("pre-send compaction gate", () => {
 			reason: "below-min-tokens",
 		},
 		{ label: "no prior request", options: { priorRequestTimestamp: null }, reason: "no-prior-request" },
-		{ label: "setting disabled", options: { priorRequestTimestamp: now - CACHE_TTL_MS }, reason: "setting-disabled" },
+		{
+			label: "setting disabled",
+			options: { priorRequestTimestamp: now - CACHE_TTL_MS, cacheExpiryPreflight: false },
+			reason: "setting-disabled",
+		},
 		{
 			label: "compaction disabled",
 			options: { priorRequestTimestamp: Date.now() - CACHE_TTL_MS, enabled: false },
@@ -626,7 +629,7 @@ describe("pre-send gate end to end", () => {
 				...(options.maxContextTokens === null ? {} : { maxContextTokens: options.maxContextTokens ?? 20_000 }),
 				keepRecentTokens: 20_000,
 				cacheExpiryPreflightMinTokens: options.cacheExpiryPreflightMinTokens ?? 60_000,
-				cacheExpiryPreflight: options.cacheExpiryPreflight ?? false,
+				cacheExpiryPreflight: options.cacheExpiryPreflight ?? true,
 			},
 		});
 		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));

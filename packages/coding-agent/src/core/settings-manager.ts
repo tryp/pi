@@ -51,9 +51,14 @@ export interface CompactionSettings {
 	maxContextFraction?: number;
 	/** Fraction of trigger at which pre-send compaction begins. Default: DEFAULT_COMPACTION_SETTINGS.borderlineFraction. */
 	borderlineFraction?: number;
-	/** Precompact before submit after prompt-cache expiry. Opt in only with an algorithmic/cheap compactor such as pi-vcc; core LLM summarization can cost as much as the re-prefill it avoids. Default: false. */
+	/**
+	 * Run a cache-expiry preflight before submit. Default: true; it only fires
+	 * when an extension supplies the compaction payload (for example pi-vcc with
+	 * `overrideDefaultCompaction`), so it is inert without an algorithmic compactor
+	 * and core's LLM summarizer is unreachable from this path. Set false to disable.
+	 */
 	cacheExpiryPreflight?: boolean;
-	/** Minimum estimated context tokens for cache-expiry preflight. Default: 60000. */
+	/** Minimum estimated context tokens for the preflight. Default: 60,000. */
 	cacheExpiryPreflightMinTokens?: number;
 	triggerFractions?: Record<string, number>; // provider/model-id overrides
 }
