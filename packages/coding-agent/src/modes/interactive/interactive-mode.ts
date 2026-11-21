@@ -163,6 +163,12 @@ import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
 import { shareSession } from "./session-share.ts";
 import {
+	appendShutdownInitiation,
+	appendSignalShutdownInitiation,
+	captureShutdownCallerStack,
+	type ShutdownInitiation,
+} from "./shutdown-telemetry.ts";
+import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
 	getEditorTheme,
@@ -526,6 +532,7 @@ export class InteractiveMode {
 
 	// Shutdown state
 	private shutdownRequested = false;
+	private pendingShutdownRequest?: { requestedAt: string; callerStack?: string };
 
 	// Extension UI state
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
@@ -1975,10 +1982,7 @@ export class InteractiveMode {
 				},
 			},
 			shutdownHandler: () => {
-				this.shutdownRequested = true;
-				if (this.session.isIdle) {
-					void this.shutdown();
-				}
+				this.requestExtensionShutdown("extension_api", true);
 			},
 			onError: (error) => {
 				this.showExtensionError(error.extensionPath, error.error, error.stack);
@@ -2110,7 +2114,7 @@ export class InteractiveMode {
 			},
 			hasPendingMessages: () => this.session.pendingMessageCount > 0,
 			shutdown: () => {
-				this.shutdownRequested = true;
+				this.requestExtensionShutdown("extension_shortcut", false);
 			},
 			reload: () => this.session.reload(),
 			getContextUsage: () => this.session.getContextUsage(),
@@ -3121,7 +3125,7 @@ export class InteractiveMode {
 			}
 			if (text === "/quit") {
 				this.editor.setText("");
-				await this.shutdown();
+				await this.shutdown({ reason: "quit_command", entryPoint: "slash_quit" });
 				return;
 			}
 
@@ -4014,7 +4018,7 @@ export class InteractiveMode {
 	private handleCtrlC(): void {
 		const now = Date.now();
 		if (now - this.lastSigintTime < 500) {
-			void this.shutdown();
+			void this.shutdown({ reason: "user_input", entryPoint: "double_ctrl_c" });
 		} else {
 			this.clearEditor();
 			this.lastSigintTime = now;
@@ -4023,7 +4027,7 @@ export class InteractiveMode {
 
 	private handleCtrlD(): void {
 		// Only called when editor is empty (enforced by CustomEditor)
-		void this.shutdown();
+		void this.shutdown({ reason: "user_input", entryPoint: "ctrl_d" });
 	}
 
 	/**
@@ -4033,8 +4037,21 @@ export class InteractiveMode {
 	 */
 	private isShuttingDown = false;
 
-	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
+	private async shutdown(
+		options: ShutdownInitiation & { fromSignal?: boolean; telemetryRecorded?: boolean } = {
+			reason: "unknown",
+			entryPoint: "shutdown",
+		},
+	): Promise<void> {
 		if (this.isShuttingDown) return;
+		if (!options.telemetryRecorded) {
+			appendShutdownInitiation(this.sessionManager, {
+				reason: options.reason,
+				entryPoint: options.entryPoint,
+				requestedAt: options.requestedAt,
+				callerStack: options.callerStack,
+			});
+		}
 		this.isShuttingDown = true;
 		// Keep signal handlers registered until terminal cleanup has completed.
 		// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP
@@ -4075,6 +4092,10 @@ export class InteractiveMode {
 	}
 
 	private emergencyTerminalExit(): never {
+		appendShutdownInitiation(this.sessionManager, {
+			reason: "terminal_error",
+			entryPoint: "emergency_terminal_exit",
+		});
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
 		killTrackedDetachedChildren();
@@ -4095,6 +4116,11 @@ export class InteractiveMode {
 	 * paste / Kitty / modifyOtherKeys sequences.
 	 */
 	private uncaughtCrash(error: Error): never {
+		appendShutdownInitiation(this.sessionManager, {
+			reason: "uncaught_exception",
+			entryPoint: "uncaught_crash",
+			callerStack: error.stack?.split("\n").slice(0, 12).join("\n"),
+		});
 		if (this.isShuttingDown) {
 			process.exit(1);
 		}
@@ -4114,11 +4140,34 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Check if shutdown was requested and perform shutdown if so.
+	 * Retain the extension caller before a deferred shutdown loses its stack.
 	 */
+	private requestExtensionShutdown(entryPoint: string, shutdownIfIdle: boolean): void {
+		if (this.shutdownRequested) return;
+		const request = { requestedAt: new Date().toISOString(), callerStack: captureShutdownCallerStack() };
+		this.shutdownRequested = true;
+		this.pendingShutdownRequest = request;
+		if (shutdownIfIdle && this.session.isIdle) {
+			void this.shutdown({ reason: "extension", entryPoint, ...request });
+		} else {
+			appendShutdownInitiation(this.sessionManager, {
+				reason: "extension",
+				entryPoint: `${entryPoint}_request`,
+				...request,
+			});
+		}
+	}
+
+	/** Check if shutdown was requested and perform it after the agent settles. */
 	private async checkShutdownRequested(): Promise<void> {
 		if (!this.shutdownRequested) return;
-		await this.shutdown();
+		const request = this.pendingShutdownRequest;
+		await this.shutdown({
+			reason: "extension",
+			entryPoint: "agent_settled",
+			requestedAt: request?.requestedAt,
+			callerStack: request?.callerStack,
+		});
 	}
 
 	private registerSignalHandlers(): void {
@@ -4135,8 +4184,14 @@ export class InteractiveMode {
 				// first, then attempts terminal restore. A genuinely dead terminal
 				// surfaces as an EIO on the restore writes, which the stdout/stderr
 				// error handler converts into emergencyTerminalExit (see #4144, #5080).
+				appendSignalShutdownInitiation(this.sessionManager, signal);
 				killTrackedDetachedChildren();
-				void this.shutdown({ fromSignal: true });
+				void this.shutdown({
+					reason: "signal",
+					entryPoint: signal.toLowerCase(),
+					fromSignal: true,
+					telemetryRecorded: true,
+				});
 			};
 			process.prependListener(signal, handler);
 			this.signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -5457,7 +5512,7 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				},
 				() => {
-					void this.shutdown();
+					void this.shutdown({ reason: "user_input", entryPoint: "session_selector_quit" });
 				},
 				() => this.ui.requestRender(),
 				{
