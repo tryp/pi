@@ -1,9 +1,11 @@
+import process from "node:process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import {
 	appendShutdownInitiation,
 	appendSignalShutdownInitiation,
 	captureShutdownCallerStack,
+	captureSignalProcessSnapshot,
 } from "../src/modes/interactive/shutdown-telemetry.ts";
 
 type ShutdownContext = {
@@ -136,13 +138,57 @@ describe("InteractiveMode shutdown telemetry", () => {
 		expect(shutdown).toHaveBeenCalledWith({ reason: "user_input", entryPoint: "ctrl_d" });
 	});
 
-	it("records the signal name in a signal shutdown entry", () => {
+	it("records a bounded process snapshot in a signal shutdown entry", () => {
 		const writer = { appendCustomEntry: vi.fn() };
-		appendSignalShutdownInitiation(writer, "SIGTERM");
+		appendSignalShutdownInitiation(writer, "SIGTERM", fakePsRunner("123\n", "10 123 1 pi --interactive\n"));
 		expect(writer.appendCustomEntry).toHaveBeenCalledWith("pi.shutdown_initiation", {
 			reason: "signal",
 			entryPoint: "sigterm",
+			processSnapshot: expect.objectContaining({ selfPgid: 123, included: 1 }),
 		});
+	});
+
+	it("includes every process-group mate and caps additional source-path rows at forty", () => {
+		const groupRows = Array.from({ length: 45 }, (_, index) => `${100 + index} 123 1 mate-${index}`).join("\n");
+		const pathRows = Array.from(
+			{ length: 45 },
+			(_, index) => `${200 + index} ${300 + index} 1 /home/dev/src/wt/${index}`,
+		).join("\n");
+		const snapshot = captureSignalProcessSnapshot(fakePsRunner("123\n", `${groupRows}\n${pathRows}\n`));
+		expect(snapshot).toMatchObject({ selfPgid: 123, totalLines: 90, included: 85, truncated: true });
+		if ("processes" in snapshot) {
+			expect(snapshot.processes.filter((row) => row.pgid === 123)).toHaveLength(45);
+			expect(snapshot.processes.filter((row) => row.args.includes("/home/dev/src"))).toHaveLength(40);
+		}
+	});
+
+	it("truncates process arguments to 240 characters", () => {
+		const snapshot = captureSignalProcessSnapshot(fakePsRunner("123\n", `10 123 1 ${"x".repeat(300)}\n`));
+		if ("processes" in snapshot) expect(snapshot.processes[0].args).toHaveLength(240);
+	});
+
+	it("records ps failure without preventing signal shutdown", async () => {
+		const writer = { appendCustomEntry: vi.fn() };
+		appendSignalShutdownInitiation(writer, "SIGTERM", () => {
+			throw new Error("ps unavailable");
+		});
+		expect(writer.appendCustomEntry).toHaveBeenCalledWith("pi.shutdown_initiation", {
+			reason: "signal",
+			entryPoint: "sigterm",
+			processSnapshot: { error: "ps unavailable" },
+		});
+		const context = createContext(true);
+		await expect(
+			shutdownMethods.shutdown.call(context, { reason: "signal", entryPoint: "sigterm" }),
+		).resolves.toBeUndefined();
+		expect(context.runtimeHost.dispose).toHaveBeenCalledOnce();
+	});
+
+	it("does not add process snapshots to non-signal shutdown entries", async () => {
+		const context = createContext(true);
+		await shutdownMethods.shutdown.call(context, { reason: "user_input", entryPoint: "ctrl_d" });
+		const [, entry] = context.sessionManager.appendCustomEntry.mock.calls[0] as [string, Record<string, unknown>];
+		expect(entry).not.toHaveProperty("processSnapshot");
 	});
 
 	it("continues shutdown when the session entry writer throws", async () => {
@@ -176,3 +222,15 @@ describe("InteractiveMode shutdown telemetry", () => {
 		});
 	});
 });
+
+function fakePsRunner(pgidOutput: string, tableOutput: string) {
+	return (
+		_command: string,
+		args: string[],
+		options: { encoding: "utf8"; env: Record<string, string | undefined> },
+	) => {
+		expect(options.encoding).toBe("utf8");
+		expect(options.env.COLUMNS).toBeUndefined();
+		return { status: 0, stdout: args[0] === "-o" ? pgidOutput : tableOutput };
+	};
+}
