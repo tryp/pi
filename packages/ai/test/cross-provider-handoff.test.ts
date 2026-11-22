@@ -29,6 +29,7 @@ import { completeSimple, getEnvApiKey, getModel } from "../src/compat.ts";
 import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage } from "../src/types.ts";
 import { hasAzureOpenAICredentials } from "./azure-utils.ts";
 import { catalogDrift } from "./catalog-utils.ts";
+import { liveProviderDescribe } from "./support/live-provider.ts";
 import { hasCloudflareAiGatewayCredentials, hasCloudflareWorkersAICredentials } from "./cloudflare-utils.ts";
 import { resolveApiKey } from "./oauth.ts";
 
@@ -362,7 +363,10 @@ describe("Cross-Provider Handoff fixture table", () => {
 	});
 });
 
-describe.skipIf(!hasAnyApiKey())("Cross-Provider Handoff", () => {
+// Generating fixtures calls real provider APIs, so it is opt-in as well as
+// credential-gated. The catalog-drift table above stays in the default run: it
+// is pure data and catches the failure that actually recurs (retired model ids).
+liveProviderDescribe.skipIf(!hasAnyApiKey())("Cross-Provider Handoff", () => {
 	let contexts: Record<string, CachedContext>;
 	let availablePairs: ProviderModelPair[];
 

@@ -8,6 +8,7 @@ import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-u
 import { hasBedrockCredentials } from "./bedrock-utils.ts";
 import { hasCloudflareAiGatewayCredentials, hasCloudflareWorkersAICredentials } from "./cloudflare-utils.ts";
 import { resolveApiKey } from "./oauth.ts";
+import { liveProviderDescribe } from "./support/live-provider.ts";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
 const oauthTokens = await Promise.all([
@@ -468,7 +469,7 @@ describe("AI Providers Empty Message Tests", () => {
 	});
 
 	describe.skipIf(!process.env.XIAOMI_API_KEY)("Xiaomi MiMo (API billing) Provider Empty Messages", () => {
-		const llm = getModel("xiaomi", "mimo-v2.5-pro");
+		const llm = getModel("xiaomi", "mimo-v2.6-pro");
 
 		it("should handle empty content array", { retry: 3, timeout: 30000 }, async () => {
 			await testEmptyMessage(llm);
@@ -490,7 +491,7 @@ describe("AI Providers Empty Message Tests", () => {
 	describe.skipIf(!process.env.XIAOMI_TOKEN_PLAN_CN_API_KEY)(
 		"Xiaomi MiMo Token Plan (CN) Provider Empty Messages",
 		() => {
-			const llm = getModel("xiaomi-token-plan-cn", "mimo-v2.5-pro");
+			const llm = getModel("xiaomi-token-plan-cn", "mimo-v2.6-pro");
 
 			it("should handle empty content array", { retry: 3, timeout: 30000 }, async () => {
 				await testEmptyMessage(llm);
@@ -513,7 +514,7 @@ describe("AI Providers Empty Message Tests", () => {
 	describe.skipIf(!process.env.XIAOMI_TOKEN_PLAN_AMS_API_KEY)(
 		"Xiaomi MiMo Token Plan (AMS) Provider Empty Messages",
 		() => {
-			const llm = getModel("xiaomi-token-plan-ams", "mimo-v2.5-pro");
+			const llm = getModel("xiaomi-token-plan-ams", "mimo-v2.6-pro");
 
 			it("should handle empty content array", { retry: 3, timeout: 30000 }, async () => {
 				await testEmptyMessage(llm);
@@ -536,7 +537,7 @@ describe("AI Providers Empty Message Tests", () => {
 	describe.skipIf(!process.env.XIAOMI_TOKEN_PLAN_SGP_API_KEY)(
 		"Xiaomi MiMo Token Plan (SGP) Provider Empty Messages",
 		() => {
-			const llm = getModel("xiaomi-token-plan-sgp", "mimo-v2.5-pro");
+			const llm = getModel("xiaomi-token-plan-sgp", "mimo-v2.6-pro");
 
 			it("should handle empty content array", { retry: 3, timeout: 30000 }, async () => {
 				await testEmptyMessage(llm);
@@ -680,7 +681,7 @@ describe("AI Providers Empty Message Tests", () => {
 	// OAuth-based providers (credentials from ~/.pi/agent/oauth.json)
 	// =========================================================================
 
-	describe("Anthropic OAuth Provider Empty Messages", () => {
+	liveProviderDescribe("Anthropic OAuth Provider Empty Messages", () => {
 		const llm = getModel("anthropic", "claude-haiku-4-5");
 
 		it.skipIf(!anthropicOAuthToken)("should handle empty content array", { retry: 3, timeout: 30000 }, async () => {
@@ -708,7 +709,7 @@ describe("AI Providers Empty Message Tests", () => {
 		);
 	});
 
-	describe("GitHub Copilot Provider Empty Messages", () => {
+	liveProviderDescribe("GitHub Copilot Provider Empty Messages", () => {
 		it.skipIf(!githubCopilotToken)(
 			"claude-haiku-4.5 - should handle empty content array",
 			{ retry: 3, timeout: 30000 },
@@ -782,7 +783,7 @@ describe("AI Providers Empty Message Tests", () => {
 		);
 	});
 
-	describe("OpenAI Codex Provider Empty Messages", () => {
+	liveProviderDescribe("OpenAI Codex Provider Empty Messages", () => {
 		it.skipIf(!openaiCodexToken)(
 			"gpt-5.5 - should handle empty content array",
 			{ retry: 3, timeout: 30000 },
