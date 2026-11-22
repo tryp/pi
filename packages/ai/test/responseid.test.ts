@@ -3,6 +3,7 @@ import { complete, getModel } from "../src/compat.ts";
 import type { Api, Context, Model, StreamOptions } from "../src/types.ts";
 import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-utils.ts";
 import { resolveApiKey } from "./oauth.ts";
+import { liveProviderDescribe } from "./support/live-provider.ts";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -23,7 +24,7 @@ async function expectResponseId<TApi extends Api>(model: Model<TApi>, options: S
 }
 
 describe("responseId E2E Tests", () => {
-	describe.skipIf(!process.env.GEMINI_API_KEY)("Google Provider", () => {
+	liveProviderDescribe.skipIf(!process.env.GEMINI_API_KEY)("Google Provider", () => {
 		const llm = getModel("google", "gemini-2.5-flash");
 
 		it("should expose responseId", { retry: 3, timeout: 30000 }, async () => {
@@ -31,7 +32,7 @@ describe("responseId E2E Tests", () => {
 		});
 	});
 
-	describe("Google Vertex Provider", () => {
+	liveProviderDescribe("Google Vertex Provider", () => {
 		const vertexProject = process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
 		const vertexLocation = process.env.GOOGLE_CLOUD_LOCATION;
 		const vertexApiKey = process.env.GOOGLE_CLOUD_API_KEY;
@@ -48,7 +49,7 @@ describe("responseId E2E Tests", () => {
 		});
 	});
 
-	describe.skipIf(!process.env.OPENAI_API_KEY)("OpenAI Completions Provider", () => {
+	liveProviderDescribe.skipIf(!process.env.OPENAI_API_KEY)("OpenAI Completions Provider", () => {
 		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini");
 		void _compat;
 		const llm: Model<"openai-completions"> = {
@@ -61,7 +62,7 @@ describe("responseId E2E Tests", () => {
 		});
 	});
 
-	describe.skipIf(!process.env.OPENAI_API_KEY)("OpenAI Responses Provider", () => {
+	liveProviderDescribe.skipIf(!process.env.OPENAI_API_KEY)("OpenAI Responses Provider", () => {
 		const llm = getModel("openai", "gpt-5-mini");
 
 		it("should expose responseId", { retry: 3, timeout: 30000 }, async () => {
@@ -69,7 +70,7 @@ describe("responseId E2E Tests", () => {
 		});
 	});
 
-	describe.skipIf(!process.env.ANTHROPIC_API_KEY)("Anthropic Provider", () => {
+	liveProviderDescribe.skipIf(!process.env.ANTHROPIC_API_KEY)("Anthropic Provider", () => {
 		const llm = getModel("anthropic", "claude-sonnet-4-5");
 
 		it("should expose responseId", { retry: 3, timeout: 30000 }, async () => {
@@ -77,7 +78,7 @@ describe("responseId E2E Tests", () => {
 		});
 	});
 
-	describe.skipIf(!hasAzureOpenAICredentials())("Azure OpenAI Responses Provider", () => {
+	liveProviderDescribe.skipIf(!hasAzureOpenAICredentials())("Azure OpenAI Responses Provider", () => {
 		const llm = getModel("azure-openai-responses", "gpt-4o-mini");
 		const azureDeploymentName = resolveAzureDeploymentName(llm.id);
 		const azureOptions = azureDeploymentName ? { azureDeploymentName } : {};
@@ -87,7 +88,7 @@ describe("responseId E2E Tests", () => {
 		});
 	});
 
-	describe.skipIf(!process.env.MISTRAL_API_KEY)("Mistral Provider", () => {
+	liveProviderDescribe.skipIf(!process.env.MISTRAL_API_KEY)("Mistral Provider", () => {
 		const llm = getModel("mistral", "devstral-medium-latest");
 
 		it("should expose responseId", { retry: 3, timeout: 30000 }, async () => {
@@ -95,7 +96,7 @@ describe("responseId E2E Tests", () => {
 		});
 	});
 
-	describe("GitHub Copilot Provider", () => {
+	liveProviderDescribe("GitHub Copilot Provider", () => {
 		it.skipIf(!githubCopilotToken)("OpenAI path should expose responseId", { retry: 3, timeout: 30000 }, async () => {
 			const llm = getModel("github-copilot", "gpt-5.3-codex");
 			await expectResponseId(llm, { apiKey: githubCopilotToken });
@@ -111,7 +112,7 @@ describe("responseId E2E Tests", () => {
 		);
 	});
 
-	describe("OpenAI Codex Provider", () => {
+	liveProviderDescribe("OpenAI Codex Provider", () => {
 		it.skipIf(!openaiCodexToken)("should expose responseId", { retry: 3, timeout: 30000 }, async () => {
 			const llm = getModel("openai-codex", "gpt-5.5");
 			await expectResponseId(llm, { apiKey: openaiCodexToken });

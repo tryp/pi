@@ -4,6 +4,7 @@ import { type BuiltinProvider, complete, getModels, getProviders } from "../src/
 import { getEnvApiKey } from "../src/env-api-keys.ts";
 import type { Api, KnownProvider, Model, ProviderStreamOptions, Tool } from "../src/types.ts";
 import { resolveApiKey } from "./oauth.ts";
+import { liveProviderDescribe } from "./support/live-provider.ts";
 
 const githubCopilotToken = await resolveApiKey("github-copilot");
 
@@ -131,7 +132,7 @@ describe("Anthropic Messages eager tool input streaming E2E", () => {
 		expect(anthropicMessagesCases.map((testCase) => testCase.name).sort()).toEqual(expectedModels.sort());
 	});
 
-	describe("generated compatibility settings", () => {
+	liveProviderDescribe("generated compatibility settings", () => {
 		for (const testCase of generatedCompatCases) {
 			it.skipIf(!testCase.apiKey)(`${testCase.name} accepts configured tool streaming`, { retry: 2 }, async () => {
 				await expectToolEnabledRequestAccepted(testCase.model, testCase.apiKey);
@@ -139,7 +140,7 @@ describe("Anthropic Messages eager tool input streaming E2E", () => {
 		}
 	});
 
-	describe("forced eager_input_streaming probe", () => {
+	liveProviderDescribe("forced eager_input_streaming probe", () => {
 		for (const testCase of forcedEagerProbeCases) {
 			const model = withEagerToolInputStreaming(testCase.model);
 

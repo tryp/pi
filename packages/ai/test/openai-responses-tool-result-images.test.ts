@@ -8,6 +8,7 @@ import type { Api, Context, Model, StreamOptions, Tool, ToolResultMessage } from
 import { complete, getModel } from "../src/compat.ts";
 import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-utils.ts";
 import { resolveApiKey } from "./oauth.ts";
+import { liveProviderDescribe } from "./support/live-provider.ts";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -144,7 +145,7 @@ async function verifyToolResultImagesStayInFunctionCallOutput<TApi extends Api>(
 }
 
 describe("Responses API tool result images", () => {
-	describe.skipIf(!process.env.OPENAI_API_KEY)("OpenAI Responses Provider (gpt-5-mini)", () => {
+	liveProviderDescribe.skipIf(!process.env.OPENAI_API_KEY)("OpenAI Responses Provider (gpt-5-mini)", () => {
 		const model = getModel("openai", "gpt-5-mini");
 
 		it("should send tool result images in function_call_output", { retry: 3, timeout: 30000 }, async () => {
@@ -152,7 +153,7 @@ describe("Responses API tool result images", () => {
 		});
 	});
 
-	describe.skipIf(!hasAzureOpenAICredentials())("Azure OpenAI Responses Provider (gpt-4o-mini)", () => {
+	liveProviderDescribe.skipIf(!hasAzureOpenAICredentials())("Azure OpenAI Responses Provider (gpt-4o-mini)", () => {
 		const model = getModel("azure-openai-responses", "gpt-4o-mini");
 		const azureDeploymentName = resolveAzureDeploymentName(model.id);
 		const azureOptions = azureDeploymentName ? { azureDeploymentName } : {};
@@ -162,7 +163,7 @@ describe("Responses API tool result images", () => {
 		});
 	});
 
-	describe("GitHub Copilot Responses Provider (gpt-5-mini)", () => {
+	liveProviderDescribe("GitHub Copilot Responses Provider (gpt-5-mini)", () => {
 		const model = getModel("github-copilot", "gpt-5-mini");
 
 		it.skipIf(!githubCopilotToken)(
@@ -177,7 +178,7 @@ describe("Responses API tool result images", () => {
 		);
 	});
 
-	describe("OpenAI Codex Responses Provider (gpt-5.5)", () => {
+	liveProviderDescribe("OpenAI Codex Responses Provider (gpt-5.5)", () => {
 		const model = getModel("openai-codex", "gpt-5.5");
 
 		it.skipIf(!openaiCodexToken)(

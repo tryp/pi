@@ -3,6 +3,7 @@ import { type BuiltinProvider, complete, getModels, getProviders } from "../src/
 import { getEnvApiKey } from "../src/env-api-keys.ts";
 import type { Api, KnownProvider, Model, ProviderStreamOptions } from "../src/types.ts";
 import { resolveApiKey } from "./oauth.ts";
+import { liveProviderDescribe } from "./support/live-provider.ts";
 
 const githubCopilotToken = await resolveApiKey("github-copilot");
 
@@ -115,7 +116,7 @@ describe("Anthropic Messages long cache retention E2E", () => {
 		expect(anthropicMessagesCases.map((testCase) => testCase.name).sort()).toEqual(expectedModels.sort());
 	});
 
-	describe("forced long cache retention probe", () => {
+	liveProviderDescribe("forced long cache retention probe", () => {
 		for (const testCase of probeCases) {
 			const model = withLongCacheRetention(testCase.model);
 
