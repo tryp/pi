@@ -61,11 +61,24 @@ describe("TUI full redraw scrollback handling", () => {
 		await terminal.waitForRender();
 
 		const emitted = terminal.takeWrites();
-		assert.ok(emitted.includes("\x1b[2J"), "full redraw should clear the visible screen");
+		assert.ok(
+			emitted.includes(`\x1b[10;1H${"\r\n".repeat(10)}`),
+			"full redraw should scroll the departing viewport into history before rendering replacement content",
+		);
+		assert.ok(!emitted.includes("\x1b[2J"), "full redraw must not erase visible output");
 		assert.ok(!emitted.includes("\x1b[3J"), "full redraw must not erase terminal scrollback");
 		assert.ok(
 			terminal.getScrollBuffer().some((line) => line.includes("before-0")),
-			"scrollback from before the redraw should remain available",
+			"older scrollback from before the redraw should remain available",
+		);
+		const archivedRows = terminal
+			.getScrollBuffer()
+			.map((line) => line.match(/before-\d+/)?.[0])
+			.filter((line): line is string => line !== undefined);
+		assert.deepStrictEqual(
+			archivedRows,
+			Array.from({ length: 30 }, (_, index) => `before-${index}`),
+			"the prior history and departing viewport must remain in order before replacement content",
 		);
 		assert.ok(
 			terminal.getViewport().some((line) => line.includes("after-5")),
@@ -75,6 +88,14 @@ describe("TUI full redraw scrollback handling", () => {
 			terminal.getViewport().every((line) => !line.includes("before-")),
 			"the old transcript should not remain in the visible viewport",
 		);
+
+		terminal.takeWrites();
+		content.setLines(["after-0", "after-1", "edited-2", "after-3", "after-4", "after-5"]);
+		tui.requestRender();
+		await terminal.waitForRender();
+		const editWrites = terminal.takeWrites();
+		assert.ok(!editWrites.includes("\x1b[2J"), "the next in-place edit must not clear the viewport");
+		assert.ok(terminal.getViewport()[2]?.includes("edited-2"), "the next edit must land on its expected row");
 
 		tui.stop();
 	});
