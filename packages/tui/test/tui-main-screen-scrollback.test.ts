@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import type { Component, TUI } from "../src/tui.ts";
+import type { Component, TUI, TuiFullRenderEvent } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -44,6 +44,8 @@ describe("TUI full redraw scrollback handling", () => {
 		const terminal = new RecordingTerminal(40, 10);
 		const tui: TUI = new TuiMainScreen(terminal);
 		const content = new MutableLines(createLines("before"));
+		const fullRenderEvents: TuiFullRenderEvent[] = [];
+		tui.onFullRender = (event) => fullRenderEvents.push(event);
 		tui.addChild(content);
 		tui.start();
 		await terminal.waitForRender();
@@ -80,6 +82,18 @@ describe("TUI full redraw scrollback handling", () => {
 			Array.from({ length: 30 }, (_, index) => `before-${index}`),
 			"the prior history and departing viewport must remain in order before replacement content",
 		);
+		assert.deepStrictEqual(fullRenderEvents, [
+			{
+				reason: "firstChanged < viewportTop (0 < 20)",
+				clearScrollback: false,
+				previousWidth: 40,
+				width: 40,
+				previousHeight: 10,
+				height: 10,
+				tmux: fullRenderEvents[0].tmux,
+			},
+		]);
+		assert.equal(typeof fullRenderEvents[0].tmux, "boolean");
 		assert.ok(
 			terminal.getViewport().some((line) => line.includes("after-5")),
 			"the newest line should be visible after the redraw",
@@ -117,22 +131,38 @@ describe("TUI full redraw scrollback handling", () => {
 		tui.stop();
 	});
 
-	it("discards the scrollback when the terminal width changes", async () => {
+	it("preserves scrollback when the terminal width changes", async () => {
 		const terminal = new RecordingTerminal(40, 10);
 		const tui = new TuiMainScreen(terminal);
+		const fullRenderEvents: TuiFullRenderEvent[] = [];
+		tui.onFullRender = (event) => fullRenderEvents.push(event);
 		tui.addChild(new MutableLines(createLines("history")));
 		tui.start();
 		await terminal.waitForRender();
 		terminal.takeWrites();
 
-		// Width changes re-wrap the stored lines, which makes them unreadable, so this
-		// is the one resize path that must still discard the scrollback. The emitted
-		// bytes are the evidence: VirtualTerminal does not model ESC[3J, so its scroll
-		// buffer holds the same lines whether or not the sequence was sent.
+		// This supersedes cf46eb07b's width contract: tmux reflows saved history
+		// (100 x 100-char lines: 200 rows at width 80, 100 at width 110). ED3 avoided
+		// one duplicated viewport but erased all history, a worse trade than preserving it.
+		// The full document is still redrawn, so a real history-limit may evict old lines.
 		terminal.resize(30, 10);
 		await terminal.waitForRender();
 
-		assert.ok(terminal.takeWrites().includes("\x1b[3J"), "width resize must erase the scrollback");
+		const emitted = terminal.takeWrites();
+		assert.ok(!emitted.includes("\x1b[3J"), "width resize must not erase the scrollback");
+		assert.ok(emitted.includes(`\x1b[10;1H${"\r\n".repeat(10)}`), "width resize must archive the departing viewport");
+		assert.ok(terminal.getScrollBuffer().some((line) => line.includes("history-0")));
+		assert.deepStrictEqual(fullRenderEvents, [
+			{
+				reason: "terminal width changed (40 -> 30)",
+				clearScrollback: false,
+				previousWidth: 40,
+				width: 30,
+				previousHeight: 10,
+				height: 10,
+				tmux: fullRenderEvents[0].tmux,
+			},
+		]);
 		tui.stop();
 	});
 });

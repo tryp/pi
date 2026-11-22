@@ -278,7 +278,10 @@ describe("TUI Kitty image cleanup", () => {
 			await terminal.waitForRender();
 
 			assert.ok(tui.fullRedraws > redrawsBeforeImage, "unsafe image pre-clear should force a full redraw");
-			assert.ok(terminal.getWrites().includes("\x1b[2;1H\r\n\r\n"), "fallback should archive the visible rows before redrawing");
+			assert.ok(
+				terminal.getWrites().includes("\x1b[2;1H\r\n\r\n"),
+				"fallback should archive the visible rows before redrawing",
+			);
 			assert.ok(!terminal.getWrites().includes("\x1b[2J"), "fallback must preserve the visible rows in scrollback");
 
 			tui.stop();
@@ -448,10 +451,10 @@ describe("TUI Kitty image cleanup", () => {
 
 		const writes = terminal.getWrites();
 		const deleteIndex = writes.indexOf(deleteKittyImage(77));
-		const clearIndex = writes.indexOf("\x1b[2J");
+		const archiveIndex = writes.indexOf("\x1b[10;1H");
 		assert.ok(deleteIndex >= 0, "previous image should be deleted during full redraw");
-		assert.ok(clearIndex >= 0, "full redraw should clear the screen");
-		assert.ok(deleteIndex < clearIndex, "old image should be deleted before the screen is cleared");
+		assert.ok(archiveIndex >= 0, "full redraw should archive the departing viewport");
+		assert.ok(deleteIndex < archiveIndex, "old image should be deleted before viewport archival");
 
 		tui.stop();
 	});

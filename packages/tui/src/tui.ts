@@ -288,11 +288,22 @@ export interface TuiStopOptions {
 	preserveScreen?: boolean;
 }
 
+export interface TuiFullRenderEvent {
+	reason: string;
+	clearScrollback: boolean;
+	previousWidth: number;
+	width: number;
+	previousHeight: number;
+	height: number;
+	tmux: boolean;
+}
+
 export interface TUI extends Component {
 	readonly mode: TuiMode;
 	children: Component[];
 	terminal: Terminal;
 	onDebug?: () => void;
+	onFullRender?: (event: TuiFullRenderEvent) => void;
 	readonly fullRedraws: number;
 	addChild(component: Component): void;
 	removeChild(component: Component): void;
@@ -336,6 +347,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	public onDebug?: () => void;
+	public onFullRender?: (event: TuiFullRenderEvent) => void;
 	private renderRequested = false;
 	private immediateRenderScheduled = false;
 	private renderTimer: NodeJS.Timeout | undefined;

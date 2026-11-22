@@ -41,6 +41,7 @@ import {
 	TruncatedText,
 	type TUI,
 	TuiAltScreen,
+	type TuiFullRenderEvent,
 	TuiMainScreen,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -605,6 +606,8 @@ export class InteractiveMode {
 			onRightClickPaste: this.onRightClickPaste,
 			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 		});
+		this.renderer.onFullRender = (event: TuiFullRenderEvent) =>
+			this.sessionManager.appendCustomEntry("pi.tui_full_render", event);
 		this.ui = createInteractiveTuiReference(() => this.renderer);
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
@@ -873,6 +876,7 @@ export class InteractiveMode {
 		const showHardwareCursor = previousUi.getShowHardwareCursor();
 		const clearOnShrink = previousUi.getClearOnShrink();
 		const onDebug = previousUi.onDebug;
+		const onFullRender = previousUi.onFullRender;
 		if (previousUi instanceof TuiMainScreen) {
 			this.mainScreenRenderState = previousUi.captureRenderState();
 		}
@@ -892,6 +896,7 @@ export class InteractiveMode {
 		});
 		nextUi.setClearOnShrink(clearOnShrink);
 		nextUi.onDebug = onDebug;
+		nextUi.onFullRender = onFullRender;
 		if (nextUi instanceof TuiMainScreen && this.mainScreenRenderState) {
 			nextUi.restoreRenderState(this.mainScreenRenderState);
 		}

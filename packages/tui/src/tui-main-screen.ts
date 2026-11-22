@@ -274,20 +274,28 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		// Archive the departing viewport and render all new lines. ED2 erases the visible
 		// screen in tmux copy mode, so scroll one screenful into history before replacement.
-		const fullRender = (clear: boolean, clearScrollback = false): void => {
+		const fullRender = (clear: boolean, reason: string): void => {
 			this.fullRedrawCount += 1;
+			if (clear) {
+				this.onFullRender?.({
+					reason,
+					clearScrollback: false,
+					previousWidth: this.previousWidth,
+					width,
+					previousHeight: this.previousHeight,
+					height,
+					tmux: process.env.TMUX !== undefined || process.env.TERM?.startsWith("tmux") === true,
+				});
+			}
 			const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
 			output.append("\x1b[?2026h"); // Begin synchronized output
 			if (clear) {
 				output.append(this.deleteKittyImages(this.previousKittyImageIds));
-				if (clearScrollback) {
-					output.append("\x1b[2J\x1b[H\x1b[3J");
-				} else {
-					// One viewport is enough: older lines are already in scrollback.
-					output.append(`\x1b[${height};1H`);
-					output.append("\r\n".repeat(height));
-					output.append("\x1b[H");
-				}
+				// One viewport is enough: older lines are already in scrollback. Width
+				// changes reflow saved history in tmux, so never erase all history with ED3.
+				output.append(`\x1b[${height};1H`);
+				output.append("\r\n".repeat(height));
+				output.append("\x1b[H");
 			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) output.append("\r\n");
@@ -337,7 +345,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// First render - just output everything without clearing (assumes clean screen)
 		if (this.previousLines.length === 0 && !widthChanged && !heightChanged) {
 			logRedraw("first render");
-			fullRender(false);
+			fullRender(false, "first render");
 			return;
 		}
 
@@ -345,7 +353,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (widthChanged) {
 			const reason = `terminal width changed (${this.previousWidth} -> ${width})`;
 			logRedraw(reason);
-			fullRender(true, true);
+			fullRender(true, reason);
 			return;
 		}
 
@@ -355,7 +363,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (heightChanged && !isTermuxSession()) {
 			const reason = `terminal height changed (${this.previousHeight} -> ${height})`;
 			logRedraw(reason);
-			fullRender(true);
+			fullRender(true, reason);
 			return;
 		}
 
@@ -365,7 +373,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (this.getClearOnShrink() && newLines.length < this.maxLinesRendered && !this.hasOverlayEntries) {
 			const reason = `clearOnShrink (maxLinesRendered=${this.maxLinesRendered})`;
 			logRedraw(reason);
-			fullRender(true);
+			fullRender(true, reason);
 			return;
 		}
 
@@ -417,7 +425,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				if (targetRow < prevViewportTop) {
 					const reason = `deleted lines moved viewport up (${targetRow} < ${prevViewportTop})`;
 					logRedraw(reason);
-					fullRender(true);
+					fullRender(true, reason);
 					return;
 				}
 				const lineDiff = computeLineDiff(targetRow);
@@ -429,7 +437,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				if (extraLines > height) {
 					const reason = `extraLines > height (${extraLines} > ${height})`;
 					logRedraw(reason);
-					fullRender(true);
+					fullRender(true, reason);
 					return;
 				}
 				const clearStartOffset = newLines.length === 0 ? 0 : 1;
@@ -463,7 +471,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (firstChanged < prevViewportTop) {
 			const reason = `firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`;
 			logRedraw(reason);
-			fullRender(true);
+			fullRender(true, reason);
 			return;
 		}
 
@@ -510,7 +518,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				if (imageStartScreenRow < 0 || imageStartScreenRow + imageReservedRows > height) {
 					const reason = `kitty image pre-clear would scroll (${imageStartScreenRow} + ${imageReservedRows} > ${height})`;
 					logRedraw(reason);
-					fullRender(true);
+					fullRender(true, reason);
 					return;
 				}
 
