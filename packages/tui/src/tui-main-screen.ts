@@ -280,9 +280,17 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			output.append("\x1b[?2026h"); // Begin synchronized output
 			if (clear) {
 				output.append(this.deleteKittyImages(this.previousKittyImageIds));
-				output.append("\x1b[2J\x1b[H"); // Clear the visible screen and home
 				if (clearScrollback) {
-					output.append("\x1b[3J"); // Width changes make saved wrapped lines unreadable
+					output.append("\x1b[2J\x1b[H"); // Width changes make saved wrapped lines unreadable
+					output.append("\x1b[3J");
+				} else if (this.previousLines.length > 0) {
+					// Scroll the old viewport into history before rendering a replacement.
+					// ED2 while tmux is in copy-mode erases these rows instead of saving them.
+					output.append(`\x1b[${height};1H`);
+					output.append("\r\n".repeat(height));
+					output.append("\x1b[H");
+				} else {
+					output.append("\x1b[H");
 				}
 			}
 			for (let i = 0; i < newLines.length; i++) {

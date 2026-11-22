@@ -61,11 +61,19 @@ describe("TUI full redraw scrollback handling", () => {
 		await terminal.waitForRender();
 
 		const emitted = terminal.takeWrites();
-		assert.ok(emitted.includes("\x1b[2J"), "full redraw should clear the visible screen");
-		assert.ok(!emitted.includes("\x1b[3J"), "full redraw must not erase terminal scrollback");
+		assert.ok(!emitted.includes("\x1b[2J"), "content redraw must not erase the visible viewport");
+		assert.ok(!emitted.includes("\x1b[3J"), "content redraw must not erase terminal scrollback");
+		assert.ok(
+			emitted.includes(`\x1b[10;1H${"\r\n".repeat(10)}\x1b[H`),
+			"scroll the old viewport into history before rendering replacement content",
+		);
 		assert.ok(
 			terminal.getScrollBuffer().some((line) => line.includes("before-0")),
-			"scrollback from before the redraw should remain available",
+			"older scrollback from before the redraw should remain available",
+		);
+		assert.ok(
+			terminal.getScrollBuffer().some((line) => line.includes("before-29")),
+			"the visible rows erased by ED2 must be preserved in scrollback",
 		);
 		assert.ok(
 			terminal.getViewport().some((line) => line.includes("after-5")),

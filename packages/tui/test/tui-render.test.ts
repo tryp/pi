@@ -278,7 +278,11 @@ describe("TUI Kitty image cleanup", () => {
 			await terminal.waitForRender();
 
 			assert.ok(tui.fullRedraws > redrawsBeforeImage, "unsafe image pre-clear should force a full redraw");
-			assert.ok(terminal.getWrites().includes("\x1b[2J"), "fallback should clear and fully redraw");
+			assert.ok(!terminal.getWrites().includes("\x1b[2J"), "fallback must preserve the old viewport");
+			assert.ok(
+				terminal.getWrites().includes("\x1b[2;1H\r\n\r\n\x1b[H"),
+				"fallback should scroll old rows into history before rendering",
+			);
 
 			tui.stop();
 		} finally {
