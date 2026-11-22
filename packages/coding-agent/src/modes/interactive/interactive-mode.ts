@@ -515,6 +515,9 @@ export class InteractiveMode {
 	// Agent subscription unsubscribe function
 	private unsubscribe?: () => void;
 	private signalCleanupHandlers: Array<() => void> = [];
+	private suspendSignalListenerInstalled = false;
+	private suspendInProgress = false;
+	private readonly suspendSignalListener = (): void => this.handleCtrlZ();
 
 	// Track if editor is in bash mode (text starts with !)
 	private isBashMode = false;
@@ -898,7 +901,6 @@ export class InteractiveMode {
 		nextUi.setClearOnShrink(clearOnShrink);
 		nextUi.onDebug = onDebug;
 		nextUi.onFullRender = onFullRender;
-		nextUi.setSuspendSignalHandler(() => this.handleCtrlZ());
 		if (nextUi instanceof TuiMainScreen && this.mainScreenRenderState) {
 			nextUi.restoreRenderState(this.mainScreenRenderState);
 		}
@@ -981,9 +983,9 @@ export class InteractiveMode {
 		this.ui.setFocus(this.editor);
 
 		// An external SIGTSTP (kill -TSTP) restores the terminal like Ctrl+Z (#12272).
-		this.ui.setSuspendSignalHandler(() => this.handleCtrlZ());
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
+		this.installSuspendSignalListener();
 		this.isInitialized = true;
 
 		await this.themeController.applyFromSettings();
@@ -4230,7 +4232,15 @@ export class InteractiveMode {
 		this.signalCleanupHandlers.push(() => process.off("uncaughtException", uncaughtExceptionHandler));
 	}
 
+	private installSuspendSignalListener(): void {
+		if (this.suspendSignalListenerInstalled) return;
+		this.suspendSignalListenerInstalled = true;
+		process.on("SIGTSTP", this.suspendSignalListener);
+	}
+
 	private unregisterSignalHandlers(): void {
+		process.off("SIGTSTP", this.suspendSignalListener);
+		this.suspendSignalListenerInstalled = false;
 		for (const cleanup of this.signalCleanupHandlers) {
 			cleanup();
 		}
@@ -4238,9 +4248,16 @@ export class InteractiveMode {
 	}
 
 	private handleCtrlZ(): void {
+		if (this.suspendInProgress || !this.isInitialized) return;
 		if (process.platform === "win32") {
 			this.showStatus("Suspend to background is not supported on Windows");
 			return;
+		}
+
+		this.suspendInProgress = true;
+		if (this.suspendSignalListenerInstalled) {
+			process.off("SIGTSTP", this.suspendSignalListener);
+			this.suspendSignalListenerInstalled = false;
 		}
 
 		// Keep the event loop alive while suspended. Without this, stopping the TUI
@@ -4257,7 +4274,9 @@ export class InteractiveMode {
 		process.once("SIGCONT", () => {
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
+			this.suspendInProgress = false;
 			this.ui.start();
+			this.installSuspendSignalListener();
 			this.ui.requestRender(true);
 		});
 
@@ -4270,6 +4289,8 @@ export class InteractiveMode {
 		} catch (error) {
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
+			this.suspendInProgress = false;
+			this.installSuspendSignalListener();
 			throw error;
 		}
 	}

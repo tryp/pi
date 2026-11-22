@@ -1,6 +1,5 @@
 import assert from "node:assert";
 import { afterEach, describe, it } from "node:test";
-import type { TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -9,7 +8,7 @@ import { VirtualTerminal } from "./virtual-terminal.ts";
 // after stop() (external editor, interactive command) is suspended with the default action.
 describe("TUI suspend signal handler", () => {
 	const baseline = process.listenerCount("SIGTSTP");
-	let tui: TUI | undefined;
+	let tui: TuiMainScreen | undefined;
 
 	afterEach(() => {
 		tui?.stop();
