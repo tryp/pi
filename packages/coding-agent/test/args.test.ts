@@ -72,6 +72,12 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--check-version flag", () => {
+		test("parses --check-version", () => {
+			expect(parseArgs(["--check-version"]).checkVersion).toBe(true);
+		});
+	});
+
 	describe("--resume flag", () => {
 		test("parses --resume flag", () => {
 			const result = parseArgs(["--resume"]);

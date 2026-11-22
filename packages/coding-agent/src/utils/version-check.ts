@@ -94,8 +94,23 @@ export async function getLatestPiVersion(
 	return (await getLatestPiRelease(currentVersion, options))?.version;
 }
 
-export async function checkForNewPiVersion(currentVersion: string): Promise<LatestPiRelease | undefined> {
-	if (process.env.PI_SKIP_VERSION_CHECK) return undefined;
+export function resolveVersionCheckEnabled(
+	cliFlag: boolean | undefined,
+	env: { PI_SKIP_VERSION_CHECK?: string; PI_OFFLINE?: string; PI_CHECK_VERSION?: string },
+): boolean {
+	if (env.PI_SKIP_VERSION_CHECK || env.PI_OFFLINE) return false;
+	return cliFlag === true || env.PI_CHECK_VERSION === "1";
+}
+
+export function formatForkVersionNotice(version: string): string {
+	return `New upstream version ${version} is available. This local fork does not self-update.`;
+}
+
+export async function checkForNewPiVersion(
+	currentVersion: string,
+	cliFlag = false,
+): Promise<LatestPiRelease | undefined> {
+	if (!resolveVersionCheckEnabled(cliFlag, process.env)) return undefined;
 
 	try {
 		const latestRelease = await getLatestPiRelease(currentVersion);
