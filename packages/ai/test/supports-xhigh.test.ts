@@ -88,10 +88,10 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "high", "max"]);
 	});
 
-	it("includes low/high/max plus off for DeepSeek V4 Flash on opencode-go", () => {
-		const model = getModel("opencode-go", "deepseek-v4-flash");
+	it("includes high and max for DeepSeek V4.1 Flash on opencode-go", () => {
+		const model = getModel("opencode-go", "deepseek-v4.1-flash");
 		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "high", "max"]);
+		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high", "max"]);
 	});
 
 	it("includes only high plus off for OpenCode Go Hy4 preview", () => {
@@ -117,10 +117,10 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toEqual(["low", "high", "max"]);
 	});
 
-	it("includes only low, high, max for Kimi Coding K3", () => {
+	it("includes off, low, high, and max for Kimi Coding K3", () => {
 		const model = getModel("kimi-coding", "k3");
 		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toEqual(["low", "high", "max"]);
+		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "high", "max"]);
 	});
 
 	it("includes only high for OpenCode Grok Build", () => {

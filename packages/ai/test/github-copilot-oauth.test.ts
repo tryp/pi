@@ -146,7 +146,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 		// and the policy filter requires Object.hasOwn(GITHUB_COPILOT_MODELS, id). Without
 		// this guard the next rename would turn the empty-expectation cases into vacuous
 		// passes instead of failures.
-		for (const id of ["claude-sonnet-4.6", "claude-opus-4.7"]) {
+		for (const id of ["claude-sonnet-4.6", "claude-opus-4.8"]) {
 			expect(catalogModel("github-copilot", id), `github-copilot/${id} left the catalog`).toBeDefined();
 		}
 	});
@@ -159,7 +159,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 				capabilities: { supports: { tool_calls: true } },
 			},
 			{
-				id: "claude-opus-4.7",
+				id: "claude-opus-4.8",
 				model_picker_enabled: true,
 				policy: { state: "disabled" },
 				capabilities: { supports: { tool_calls: true } },
@@ -189,7 +189,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 				capabilities: { supports: { tool_calls: true } },
 			},
 			{
-				id: "claude-opus-4.7",
+				id: "claude-opus-4.8",
 				model_picker_enabled: false,
 				policy: { state: "disabled" },
 				capabilities: { supports: { tool_calls: true } },
@@ -339,7 +339,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 							capabilities: { supports: { tool_calls: true } },
 						},
 						{
-							id: "claude-opus-4.7",
+							id: "claude-opus-4.8",
 							model_picker_enabled: true,
 							policy: { state: "unconfigured" },
 							capabilities: { supports: { tool_calls: true } },
@@ -373,7 +373,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 		await loginPromise;
 
 		expect(catalogRequestCount).toBe(1);
-		expect(policyModelIds).toEqual(["claude-opus-4.7"]);
+		expect(policyModelIds).toEqual(["claude-opus-4.8"]);
 	});
 
 	it("retries a throttled policy update after Retry-After", async () => {
@@ -383,7 +383,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 		stubGitHubCopilotLoginFetch({
 			models: () =>
 				jsonResponse({
-					data: [{ id: "claude-opus-4.7", model_picker_enabled: true, policy: { state: "unconfigured" } }],
+					data: [{ id: "claude-opus-4.8", model_picker_enabled: true, policy: { state: "unconfigured" } }],
 				}),
 			policy: () => {
 				policyRequestCount += 1;
@@ -410,7 +410,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 	it("continues policy updates after a transport failure", async () => {
 		vi.useFakeTimers();
 
-		const modelIds = ["claude-sonnet-4.6", "claude-opus-4.7"];
+		const modelIds = ["claude-sonnet-4.6", "claude-opus-4.8"];
 		const policyModelIds: string[] = [];
 		stubGitHubCopilotLoginFetch({
 			models: () =>
@@ -443,7 +443,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 				jsonResponse({
 					data: [
 						{ id: "claude-sonnet-4.6", model_picker_enabled: true, policy: { state: "unconfigured" } },
-						{ id: "claude-opus-4.7", model_picker_enabled: true, policy: { state: "unconfigured" } },
+						{ id: "claude-opus-4.8", model_picker_enabled: true, policy: { state: "unconfigured" } },
 					],
 				}),
 			policy: (modelId) => {

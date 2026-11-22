@@ -76,13 +76,12 @@ describe("builtin providers", () => {
 		// carries it. The subscription-backed kimi-coding provider keeps the implied 0 instead;
 		// that contrast is pinned in the next test.
 		const models = builtinModels();
-		for (const provider of ["moonshotai", "moonshotai-cn"]) {
-			expect(models.getModel(provider, "kimi-k3")?.cost).toEqual({
-				input: 3,
-				output: 15,
-				cacheRead: 0.3,
-				cacheWrite: 3,
-			});
+		const expectedCosts = {
+			moonshotai: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 },
+			"moonshotai-cn": { input: 2.9879, output: 14.9395, cacheRead: 0.2988, cacheWrite: 2.9879 },
+		};
+		for (const [provider, cost] of Object.entries(expectedCosts)) {
+			expect(models.getModel(provider, "kimi-k3")?.cost).toEqual(cost);
 		}
 	});
 
@@ -108,7 +107,14 @@ describe("builtin providers", () => {
 			.getModels("kimi-coding")
 			.map((model) => model.id)
 			.sort();
-		expect(ids).toEqual(["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"]);
+		expect(ids).toEqual([
+			"k3",
+			"k3-256k",
+			"k3.1-pro",
+			"k3.1-pro-highspeed",
+			"kimi-for-coding",
+			"kimi-for-coding-highspeed",
+		]);
 	});
 
 	it("resolves Anthropic bearer auth from env with auth token precedence", async () => {

@@ -37,7 +37,7 @@ describe("Baseten models", () => {
 			cost: {
 				input: 1.4,
 				output: 4.4,
-				cacheRead: 0.3,
+				cacheRead: 0.14,
 				cacheWrite: 0,
 			},
 			compat: {
@@ -54,25 +54,24 @@ describe("Baseten models", () => {
 		});
 	});
 
-	it("models Kimi K2.6 reasoning as an explicit off/on toggle", async () => {
-		const model = getModel("baseten", "moonshotai/Kimi-K2.6");
+	it("models current Kimi K3 reasoning levels and request metadata", async () => {
+		const model = getModel("baseten", "moonshotai/Kimi-K3");
 		let payload: Record<string, unknown> | undefined;
 
 		expect(model.thinkingLevelMap).toEqual({
-			off: "off",
+			off: "none",
 			minimal: null,
-			low: null,
+			low: "low",
 			medium: null,
 			high: "high",
 			xhigh: null,
-			max: null,
+			max: "max",
 		});
 		expect(model.compat).toMatchObject({
-			supportsReasoningEffort: false,
-			thinkingFormat: "baseten",
-			chatTemplateArgs: { enable_thinking: { $var: "thinking.enabled" } },
+			supportsReasoningEffort: true,
+			thinkingFormat: "openai",
 		});
-		expect(getSupportedThinkingLevels(model)).toEqual(["off", "high"]);
+		expect(getSupportedThinkingLevels(model)).toEqual(["off", "low", "high", "max"]);
 
 		await streamSimple(
 			model,
@@ -87,8 +86,8 @@ describe("Baseten models", () => {
 			},
 		).result();
 
-		expect(payload?.chat_template_args).toEqual({ enable_thinking: true });
-		expect(payload?.reasoning_effort).toBeUndefined();
+		expect(payload?.reasoning_effort).toBe("high");
+		expect(payload?.chat_template_args).toBeUndefined();
 	});
 
 	it("sends Baseten chat_template_args with reasoning effort", async () => {

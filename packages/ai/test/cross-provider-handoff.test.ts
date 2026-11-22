@@ -71,7 +71,7 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	// GitHub Copilot
 	{ provider: "github-copilot", model: "claude-sonnet-4.6", label: "copilot-claude-sonnet-4.6" },
 	{ provider: "github-copilot", model: "gpt-5.3-codex", label: "copilot-gpt-5.3-codex" },
-	{ provider: "github-copilot", model: "gemini-3.5-flash", label: "copilot-gemini-3.5-flash" },
+	{ provider: "github-copilot", model: "gemini-4-argon", label: "copilot-gemini-4-argon" },
 	{ provider: "github-copilot", model: "grok-4.5", label: "copilot-grok-4.5" },
 	// Amazon Bedrock
 	{
@@ -121,18 +121,19 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	// OpenCode Zen
 	{ provider: "opencode", model: "big-pickle", label: "zen-big-pickle" },
 	{ provider: "opencode", model: "claude-sonnet-4-5", label: "zen-claude-sonnet-4-5" },
-	{ provider: "opencode", model: "gemini-3-flash", label: "zen-gemini-3-flash" },
-	{ provider: "opencode", model: "exo-free", label: "zen-exo-free" },
+	{ provider: "opencode", model: "gemini-3.5-flash", label: "zen-gemini-3.5-flash" },
+	{ provider: "opencode", model: "deepseek-v4-pro", label: "zen-deepseek-v4-pro" },
 	{ provider: "opencode", model: "gpt-5.2-codex", label: "zen-gpt-5.2-codex" },
-	{ provider: "opencode", model: "nemotron-3-ultra-free", label: "zen-nemotron-3-ultra-free" },
+	{ provider: "opencode", model: "minimax-m3", label: "zen-minimax-m3" },
 	// OpenCode Go
 	{ provider: "opencode-go", model: "kimi-k2.7-code", label: "go-kimi-k2.7-code" },
-	{ provider: "opencode-go", model: "minimax-m2.7", label: "go-minimax-m2.7" },
+	{ provider: "opencode-go", model: "minimax-m3.1-flash", label: "go-minimax-m3.1-flash" },
 	// Xiaomi MiMo
-	{ provider: "xiaomi", model: "mimo-v2.5-pro", label: "xiaomi-mimo-v2.5-pro" },
-	{ provider: "xiaomi-token-plan-cn", model: "mimo-v2.5-pro", label: "xiaomi-token-plan-cn-mimo-v2.5-pro" },
-	{ provider: "xiaomi-token-plan-ams", model: "mimo-v2.5-pro", label: "xiaomi-token-plan-ams-mimo-v2.5-pro" },
-	{ provider: "xiaomi-token-plan-sgp", model: "mimo-v2.5-pro", label: "xiaomi-token-plan-sgp-mimo-v2.5-pro" },
+	{ provider: "xiaomi", model: "mimo-v2.6-pro", label: "xiaomi-mimo-v2.6-pro" },
+	{ provider: "xiaomi-token-plan-cn", model: "mimo-v2.6-pro", label: "xiaomi-token-plan-cn-mimo-v2.6-pro" },
+	{ provider: "xiaomi-token-plan-ams", model: "mimo-v2.6-pro", label: "xiaomi-token-plan-ams-mimo-v2.6-pro" },
+	{ provider: "xiaomi-token-plan-sgp", model: "mimo-v2.6-pro", label: "xiaomi-token-plan-sgp-mimo-v2.6-pro" },
+
 	// Qwen Token Plan
 	{ provider: "qwen-token-plan", model: "qwen3.7-max", label: "qwen-token-plan-qwen3.7-max" },
 	{ provider: "qwen-token-plan-cn", model: "qwen3.7-max", label: "qwen-token-plan-cn-qwen3.7-max" },

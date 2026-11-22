@@ -498,7 +498,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 		// name: a renamed id then fails here, named, instead of reaching the stream as
 		// undefined and surfacing as a 30s timeout on an unrelated code path.
 		const longCacheUnsupported: Array<[BuiltinProvider, string]> = [
-			["opencode", "deepseek-v4-flash"],
+			["cloudflare-workers-ai", "@cf/deepseek-ai/deepseek-v4.1-flash-1017"],
 			["opencode", "deepseek-v4-pro"],
 			["opencode", "kimi-k2.5"],
 			["opencode", "kimi-k2.6"],
