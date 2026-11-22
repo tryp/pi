@@ -66,6 +66,10 @@ describe("builtin providers", () => {
 		expect(getBuiltinModel("anthropic", "claude-haiku-4-5").compat?.supportsStrictTools).toBe(true);
 	});
 
+	it("loads the pinned Xiaomi MiMo price", () => {
+		expect(getBuiltinModel("xiaomi", "mimo-v2.6-flash").cost.input).toBe(0.14);
+	});
+
 	it("uses official Kimi K3 pricing for Moonshot providers", () => {
 		// models.dev publishes kimi-k3's cache_write (3), and the generator prefers the published
 		// price over its KIMI_K3_COST fallback (generate-models.ts:2313), so the official price
